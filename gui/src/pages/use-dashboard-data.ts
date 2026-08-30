@@ -15,6 +15,7 @@ import {
   fetchDashboardModels,
   fetchDashboardMultiAgent,
   fetchDashboardOverview,
+  fetchDashboardQuotaWatch,
   fetchDashboardSettings,
   fetchDashboardSidecars,
   fetchDashboardUsage,
@@ -261,6 +262,13 @@ export function useDashboardData(apiBase: string) {
     `dashboard-multi-agent:${apiBase}`,
     [apiBase],
     (signal) => fetchDashboardMultiAgent(apiBase, signal),
+    { pollMs: 5000, enabled: overviewReady },
+  );
+
+  const quotaWatchPoll = useKeyedClientResource(
+    `dashboard-quota-watch:${apiBase}`,
+    [apiBase],
+    (signal) => fetchDashboardQuotaWatch(apiBase, signal),
     { pollMs: 5000, enabled: overviewReady },
   );
 
@@ -774,6 +782,9 @@ export function useDashboardData(apiBase: string) {
     modelQuery, setModelQuery,
     expandedProviders, setExpandedProviders,
     health, startupHealth, providers, models, settings, sidecar, shadowCall, usage30d,
+    quotaWatch: quotaWatchPoll.data ?? null,
+    quotaWatchLoading: quotaWatchPoll.loading && quotaWatchPoll.data === undefined,
+    refreshQuotaWatch: quotaWatchPoll.refresh,
     usageLoading: usagePoll.loading && !usage30d,
     healthLoading: overviewPoll.loading && !health,
     sidecarSaving, shadowCallSaving, modelsLoading, settingsSaving, syncing,

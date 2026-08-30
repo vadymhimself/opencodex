@@ -335,6 +335,89 @@ describe("adapter reasoning and usage details", () => {
     ]);
   });
 
+  test("Anthropic caches long history before a moved volatile system tail", async () => {
+    const adapter = createAnthropicAdapter({ ...provider, adapter: "anthropic", baseUrl: "https://api.anthropic.com" });
+    const history = "prior work ".repeat(60_000);
+    const build = async (env: string, current?: string) => {
+      const request = await adapter.buildRequest({
+        modelId: "claude-opus-5",
+        context: {
+          systemPrompt: ["You are Claude Code.", "CLAUDE.md contents", `env: modified=${env} files`],
+          messages: [
+            { role: "user", content: history },
+            ...(current ? [{ role: "user" as const, content: current }] : []),
+          ],
+        },
+        stream: true,
+        options: {},
+      });
+      return JSON.parse(request.body) as {
+        cache_control?: unknown;
+        system?: Array<Record<string, unknown>>;
+        messages: Array<{ role: string; content: unknown }>;
+      };
+    };
+
+    const first = await build("3");
+    const second = await build("4", "next turn");
+
+    expect(first.cache_control).toBeUndefined();
+    expect(first.system).toEqual([
+      { type: "text", text: "You are Claude Code." },
+      { type: "text", text: "CLAUDE.md contents", cache_control: { type: "ephemeral" } },
+    ]);
+    // The long history remains an identical cache-marked prefix as environment state changes.
+    expect(second.system).toEqual(first.system);
+    expect(second.messages[0]).toEqual(first.messages[0]);
+    expect(second.messages[0].content).toEqual([
+      { type: "text", text: history, cache_control: { type: "ephemeral" } },
+    ]);
+    expect(second.messages.at(-1)).toEqual({ role: "system", content: "env: modified=4 files" });
+  });
+
+  test("Anthropic leaves the volatile tail top-level when cache retention is off", async () => {
+    const adapter = createAnthropicAdapter(
+      { ...provider, adapter: "anthropic", baseUrl: "https://api.anthropic.com" },
+      "none",
+    );
+    const request = await adapter.buildRequest({
+      modelId: "claude-opus-5",
+      context: {
+        systemPrompt: ["You are Claude Code.", "CLAUDE.md contents", "env: modified=3 files"],
+        messages: [{ role: "user", content: "hi" }],
+      },
+      stream: true,
+      options: {},
+    });
+    const body = JSON.parse(request.body) as { system?: Array<Record<string, unknown>>; messages: Array<{ role: string }> };
+
+    expect(body.system).toEqual([
+      { type: "text", text: "You are Claude Code." },
+      { type: "text", text: "CLAUDE.md contents" },
+      { type: "text", text: "env: modified=3 files" },
+    ]);
+    expect(body.messages).toEqual([{ role: "user", content: "hi" }]);
+  });
+
+  test("Anthropic keeps unsupported Fable and Mythos system tails top-level", async () => {
+    const adapter = createAnthropicAdapter({ ...provider, adapter: "anthropic", baseUrl: "https://api.anthropic.com" });
+    for (const modelId of ["claude-fable-4", "claude-mythos-4"]) {
+      const request = await adapter.buildRequest({
+        modelId,
+        context: {
+          systemPrompt: ["You are Claude Code.", "CLAUDE.md contents", "env: modified=3 files"],
+          messages: [{ role: "user", content: "hi" }],
+        },
+        stream: true,
+        options: {},
+      });
+      const body = JSON.parse(request.body) as { system?: Array<Record<string, unknown>>; messages: Array<{ role: string }> };
+
+      expect(body.system?.at(-1)).toEqual({ type: "text", text: "env: modified=3 files" });
+      expect(body.messages).toEqual([{ role: "user", content: "hi" }]);
+    }
+  });
+
   test("Anthropic cache marker ignores the appended tool nudge", async () => {
     const adapter = createAnthropicAdapter({ ...provider, adapter: "anthropic", baseUrl: "https://api.anthropic.com" });
     const request = await adapter.buildRequest({

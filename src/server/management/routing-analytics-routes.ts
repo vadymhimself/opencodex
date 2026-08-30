@@ -8,6 +8,7 @@
 import {
   ANALYTICS_API_DEFAULT_ROWS,
   ANALYTICS_MAX_ROWS,
+  computeQuotaObservability,
   computeRoutingAnalytics,
 } from "../../routing/analytics";
 import { jsonResponse } from "../auth-cors";
@@ -24,6 +25,11 @@ function parseQueryInt(raw: string | null): number | undefined | "invalid" {
 export async function handleRoutingAnalyticsRoutes(ctx: ManagementContext): Promise<Response | null> {
   const { url, req, config } = ctx;
   if (url.pathname !== "/api/routing-analytics" || req.method !== "GET") return null;
+
+  const view = url.searchParams.get("view")?.trim() || "overview";
+  if (view !== "overview" && view !== "quota") {
+    return jsonResponse({ error: { code: "invalid_view", message: "view must be overview or quota" } }, 400, req, config);
+  }
 
   const fromParsed = parseQueryInt(url.searchParams.get("from"));
   if (fromParsed === "invalid") {
@@ -62,13 +68,17 @@ export async function handleRoutingAnalyticsRoutes(ctx: ManagementContext): Prom
     );
   }
 
-  const result = await computeRoutingAnalytics({
+  const filters = {
     provider: url.searchParams.get("provider")?.trim() || undefined,
     model: url.searchParams.get("model")?.trim() || undefined,
     profileId: url.searchParams.get("profileId")?.trim() || undefined,
     surface: url.searchParams.get("surface")?.trim() || undefined,
+    conversationId: url.searchParams.get("conversationId")?.trim() || undefined,
     from,
     to,
-  }, { maxRows });
+  };
+  const result = view === "quota"
+    ? await computeQuotaObservability(filters, { maxRows })
+    : await computeRoutingAnalytics(filters, { maxRows });
   return jsonResponse(result, 200, req, config);
 }

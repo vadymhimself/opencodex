@@ -560,8 +560,42 @@ const EXPLICIT_THINKING_DISABLE_FAMILY_MINIMUMS: Record<string, readonly [major:
   sonnet: [5, 0],
 };
 
+const MID_CONVERSATION_SYSTEM_FAMILY_MINIMUMS: Record<string, readonly [major: number, minor: number]> = {
+  opus: [4, 8],
+  fable: [5, 0],
+  mythos: [5, 0],
+};
+
 function supportsExplicitThinkingDisable(modelId: string): boolean {
   return meetsFamilyMinimum(modelId, EXPLICIT_THINKING_DISABLE_FAMILY_MINIMUMS);
+}
+
+function supportsMidConversationSystemMessages(modelId: string): boolean {
+  return meetsFamilyMinimum(modelId, MID_CONVERSATION_SYSTEM_FAMILY_MINIMUMS);
+}
+
+/**
+ * Claude Code's final caller system segment is live environment state. On models with
+ * mid-conversation system messages, keep it system-authoritative but move it after the
+ * conversation cache prefix. Generated system nudges that followed it move with it so
+ * their instruction order remains intact.
+ */
+function moveVolatileSystemTailAfterMessages(
+  body: Record<string, unknown>,
+  callerSystemSegments: number,
+  isOAuth: boolean,
+): boolean {
+  const system = body.system as Array<Record<string, unknown>> | undefined;
+  const messages = body.messages as Array<Record<string, unknown>> | undefined;
+  const tailIndex = (isOAuth ? 1 : 0) + callerSystemSegments - 1;
+  if (!system || !messages || callerSystemSegments < 2 || tailIndex < 0 || tailIndex >= system.length) return false;
+
+  const tail = system.slice(tailIndex);
+  if (tail.some(block => block.type !== "text" || typeof block.text !== "string")) return false;
+
+  system.splice(tailIndex);
+  messages.push({ role: "system", content: tail.map(block => block.text as string).join("\n\n") });
+  return true;
 }
 
 /** `output_config.effort` accepts low|medium|high|xhigh|max — "minimal" is rejected with a 400. */
@@ -1029,11 +1063,16 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
       // follows the moving final block across turns. Keep one breakpoint slot free for it.
       const cc = resolveCacheControl(cacheRetention);
       const volatileCallerSystemTail = usesNativeAnthropicEndpoint(provider) && callerSystemSegments >= 2;
+      const movedVolatileSystemTail = !!cc
+        && volatileCallerSystemTail
+        && supportsMidConversationSystemMessages(parsed.modelId)
+        && moveVolatileSystemTailAfterMessages(body, callerSystemSegments, isOAuth);
       const automaticPromptCaching = cc && usesNativeAnthropicEndpoint(provider) && !volatileCallerSystemTail;
       if (automaticPromptCaching) body.cache_control = cc;
-      // A cache point after Claude Code's volatile environment tail rewrites the entire history
-      // suffix every turn. Cache only tools and the stable system prefix in that shape.
-      const explicitLimit = volatileCallerSystemTail
+      // Old models cannot carry a system message after the conversation, so their volatile
+      // tail must remain top-level and no history marker may follow it. Supported models move
+      // that tail after messages, allowing normal explicit history checkpoints before it.
+      const explicitLimit = volatileCallerSystemTail && !movedVolatileSystemTail
         ? (tools && tools.length > 0 ? 2 : 1)
         : automaticPromptCaching ? MAX_CACHE_BREAKPOINTS - 1 : MAX_CACHE_BREAKPOINTS;
       // The final caller system segment is volatile; generated nudges are not caller segments.

@@ -11,6 +11,7 @@ import {
   type ModelInfo,
   type ProjectCodexConfigGroup,
   type ProviderInfo,
+  type QuotaWatchData,
   type SettingsData,
   type ShadowCallData,
   type SidecarData,
@@ -131,6 +132,11 @@ export async function fetchDashboardModels(apiBase: string, signal: AbortSignal)
   // Throw on non-OK / empty so client-resource retains the prior snapshot instead of
   // treating an HTTP error as a successful empty list.
   return requireJson<ModelInfo[]>(response);
+}
+
+export async function fetchDashboardQuotaWatch(apiBase: string, signal: AbortSignal): Promise<QuotaWatchData> {
+  const response = await fetch(`${apiBase}/api/routing-analytics?view=quota`, { signal });
+  return requireJson<QuotaWatchData>(response);
 }
 
 export async function fetchDashboardUsage(apiBase: string, signal: AbortSignal): Promise<UsageSummary30d> {

@@ -1,4 +1,5 @@
 import MemoryObservabilityCard from "../components/MemoryObservabilityCard";
+import { DashboardQuotaObservability } from "./dashboard-quota-observability";
 import type { useDashboardData } from "./use-dashboard-data";
 import {
   DashboardEffortCapPanel,
@@ -18,6 +19,7 @@ export function DashboardOverviewPanels(props: Dash) {
         <DashboardMaintenancePanel d={props} />
       </div>
       <DashboardSidecarPanels d={props} />
+      <DashboardQuotaObservability d={props} />
       <MemoryObservabilityCard apiBase={props.apiBase} />
     </>
   );

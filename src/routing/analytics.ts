@@ -18,12 +18,14 @@ import { openRequestHistoryIndex, requestHistoryDb } from "./history/indexer";
 export const ANALYTICS_MAX_ROWS = 50_000;
 /** Default row cap for the management API (full cap remains available via `limit`). */
 export const ANALYTICS_API_DEFAULT_ROWS = 5_000;
+export const QUOTA_OBSERVABILITY_WINDOW_MS = 10 * 60_000;
 
 export interface RoutingAnalyticsFilters {
   provider?: string;
   model?: string;
   profileId?: string;
   surface?: string;
+  conversationId?: string;
   from?: number;
   to?: number;
 }
@@ -52,6 +54,41 @@ export interface AnalyticsProfileRow {
   failures: number;
   fallbacks: number;
   successRate: number | null;
+}
+
+export interface QuotaObservabilityProviderModel {
+  provider: string;
+  model: string;
+}
+
+export interface QuotaObservabilityAlerts {
+  rawInput: QuotaObservabilityProviderModel[];
+  cacheWrite: QuotaObservabilityProviderModel[];
+  cacheRead: QuotaObservabilityProviderModel[];
+  retry: QuotaObservabilityProviderModel[];
+}
+
+export interface QuotaObservabilityResult {
+  generatedAt: number;
+  windowStartedAt: number;
+  windowEndedAt: number;
+  totalRequests: number;
+  requestRatePerMinute: number;
+  lastActivityAt: number | null;
+  rawInputTokens: number;
+  cacheReadInputTokens: number;
+  cacheCreationInputTokens: number;
+  cacheUtilization: number | null;
+  physicalSends: number;
+  retrySends: number;
+  coverage: {
+    rawInput: number | null;
+    cacheRead: number | null;
+    cacheCreation: number | null;
+    sends: number | null;
+  };
+  historyTruncated: boolean;
+  alerts: QuotaObservabilityAlerts;
 }
 
 export interface RoutingAnalyticsResult {
@@ -91,6 +128,8 @@ export interface RoutingAnalyticsResult {
 }
 
 interface ScannedRow {
+  requestId: string;
+  timestamp: number;
   provider: string;
   model: string;
   apiKeyId?: string | null;
@@ -171,17 +210,17 @@ function successCostUsd(
   return estimate ? estimate.cost.total : null;
 }
 
-export async function computeRoutingAnalytics(
+interface AnalyticsRows {
+  scanned: ScannedRow[];
+  historyTruncated: boolean;
+}
+
+async function readAnalyticsRows(
   filters: RoutingAnalyticsFilters,
-  options: { maxRows?: number } = {},
-): Promise<RoutingAnalyticsResult> {
+  maxRows: number,
+): Promise<AnalyticsRows> {
   await openRequestHistoryIndex();
   const handle = requestHistoryDb();
-  const maxRows = Math.min(
-    Math.max(1, Math.trunc(options.maxRows ?? ANALYTICS_MAX_ROWS)),
-    ANALYTICS_MAX_ROWS,
-  );
-
   const where: string[] = [];
   const values: Array<string | number> = [];
   const add = (clause: string, value: string | number) => {
@@ -192,22 +231,31 @@ export async function computeRoutingAnalytics(
   if (filters.model !== undefined) add("model = ?", filters.model);
   if (filters.profileId !== undefined) add("profile_id = ?", filters.profileId);
   if (filters.surface !== undefined) add("surface = ?", filters.surface);
+  if (filters.conversationId !== undefined) add("conversation_id = ?", filters.conversationId);
   if (filters.from !== undefined) add("timestamp >= ?", filters.from);
   if (filters.to !== undefined) add("timestamp <= ?", filters.to);
   const whereSql = where.length > 0 ? ` WHERE ${where.join(" AND ")}` : "";
-
   const rows = handle.query(
-    `SELECT provider, model, api_key_id AS apiKeyId, profile_id AS profileId,
-            profile_revision AS profileRevision, status,
+    `SELECT request_id AS requestId, timestamp, provider, model, api_key_id AS apiKeyId,
+            profile_id AS profileId, profile_revision AS profileRevision, status,
             duration_ms AS durationMs, first_output_ms AS firstOutputMs,
             close_reason AS closeReason, terminal_status AS terminalStatus,
             usage_status AS usageStatus, usage_json AS usageJson,
             attempt_count AS attemptCount, fallback, row_json AS rowJson
-     FROM requests${whereSql} ORDER BY timestamp DESC LIMIT ?`,
+     FROM requests${whereSql} ORDER BY timestamp DESC, request_id DESC LIMIT ?`,
   ).all(...values, maxRows + 1) as ScannedRow[];
+  return { scanned: rows.slice(0, maxRows), historyTruncated: rows.length > maxRows };
+}
 
-  const scanned = rows.slice(0, maxRows);
-  const historyTruncated = rows.length > maxRows;
+export async function computeRoutingAnalytics(
+  filters: RoutingAnalyticsFilters,
+  options: { maxRows?: number } = {},
+): Promise<RoutingAnalyticsResult> {
+  const maxRows = Math.min(
+    Math.max(1, Math.trunc(options.maxRows ?? ANALYTICS_MAX_ROWS)),
+    ANALYTICS_MAX_ROWS,
+  );
+  const { scanned, historyTruncated } = await readAnalyticsRows(filters, maxRows);
 
   let successes = 0;
   let failures = 0;
@@ -375,5 +423,200 @@ export async function computeRoutingAnalytics(
     priceCoverage: successes > 0 ? costCount / successes : null,
     breakdown,
     profileBreakdown,
+  };
+}
+
+type QuotaUsage = {
+  inputTokens: number;
+  cacheReadInputTokens?: number;
+  cacheCreationInputTokens?: number;
+};
+
+function nonNegativeNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function quotaUsage(value: unknown): QuotaUsage | null {
+  if (!value || typeof value !== "object") return null;
+  const usage = value as Record<string, unknown>;
+  const inputTokens = nonNegativeNumber(usage.inputTokens);
+  if (inputTokens === undefined) return null;
+  const cacheReadInputTokens = nonNegativeNumber(usage.cacheReadInputTokens);
+  const cacheCreationInputTokens = nonNegativeNumber(usage.cacheCreationInputTokens);
+  return {
+    inputTokens,
+    ...(cacheReadInputTokens !== undefined ? { cacheReadInputTokens } : {}),
+    ...(cacheCreationInputTokens !== undefined ? { cacheCreationInputTokens } : {}),
+  };
+}
+
+function mergeAttemptQuotaUsage(entry: PersistedUsageEntry): QuotaUsage | null {
+  const rootUsage = quotaUsage(entry.usage);
+  if (rootUsage) return rootUsage;
+  if (!Array.isArray(entry.attempts) || entry.attempts.length === 0) return null;
+  const usages = entry.attempts.map(attempt => quotaUsage(attempt?.usage));
+  if (usages.some(usage => !usage)) return null;
+  const knownUsages = usages as QuotaUsage[];
+  const sum = (key: keyof QuotaUsage): number | undefined => {
+    const values = knownUsages.map(usage => usage[key]);
+    return values.every((value): value is number => value !== undefined)
+      ? values.reduce((total, value) => total + value, 0)
+      : undefined;
+  };
+  const inputTokens = sum("inputTokens");
+  if (inputTokens === undefined) return null;
+  const cacheReadInputTokens = sum("cacheReadInputTokens");
+  const cacheCreationInputTokens = sum("cacheCreationInputTokens");
+  return {
+    inputTokens,
+    ...(cacheReadInputTokens !== undefined ? { cacheReadInputTokens } : {}),
+    ...(cacheCreationInputTokens !== undefined ? { cacheCreationInputTokens } : {}),
+  };
+}
+
+function quotaSends(entry: PersistedUsageEntry): { sends: number; recovery: boolean } | null {
+  if (!Array.isArray(entry.attempts)) return null;
+  let sends = 0;
+  let recovery = false;
+  for (const attempt of entry.attempts) {
+    const sendCount = nonNegativeNumber(attempt?.sendCount);
+    if (sendCount === undefined) return null;
+    sends += sendCount;
+    if (Array.isArray(attempt.recoveryKinds) && attempt.recoveryKinds.length > 0) recovery = true;
+  }
+  return { sends, recovery };
+}
+
+function providerModels(values: Set<string>): QuotaObservabilityProviderModel[] {
+  return [...values].map(value => {
+    const [provider, model] = value.split("\0");
+    return { provider: provider ?? "", model: model ?? "" };
+  }).sort((a, b) => a.provider.localeCompare(b.provider) || a.model.localeCompare(b.model));
+}
+
+export async function computeQuotaObservability(
+  filters: RoutingAnalyticsFilters,
+  options: { maxRows?: number; now?: number } = {},
+): Promise<QuotaObservabilityResult> {
+  const generatedAt = Math.trunc(options.now ?? Date.now());
+  const windowEndedAt = filters.to ?? generatedAt;
+  const windowStartedAt = Math.max(windowEndedAt - QUOTA_OBSERVABILITY_WINDOW_MS, filters.from ?? Number.NEGATIVE_INFINITY);
+  const maxRows = Math.min(
+    Math.max(1, Math.trunc(options.maxRows ?? ANALYTICS_API_DEFAULT_ROWS)),
+    ANALYTICS_MAX_ROWS,
+  );
+  const { scanned, historyTruncated } = await readAnalyticsRows({
+    ...filters,
+    from: windowStartedAt,
+    to: windowEndedAt,
+  }, maxRows);
+  const chronological = [...scanned].sort((a, b) => a.timestamp - b.timestamp || a.requestId.localeCompare(b.requestId));
+  const rawInputAlerts = new Set<string>();
+  const cacheWriteAlerts = new Set<string>();
+  const cacheReadAlerts = new Set<string>();
+  const retryAlerts = new Set<string>();
+  const priorCacheRead = new Set<string>();
+  const cacheReadsByProviderModel = new Map<string, number[]>();
+  let rawInputTokens = 0;
+  let cacheReadInputTokens = 0;
+  let cacheCreationInputTokens = 0;
+  let rawInputKnown = 0;
+  let cacheReadKnown = 0;
+  let cacheCreationKnown = 0;
+  let sendsKnown = 0;
+  let physicalSends = 0;
+  let retrySends = 0;
+  let lastActivityAt: number | null = null;
+  let previousHighRaw: { key: string } | null = null;
+
+  for (const row of chronological) {
+    lastActivityAt = row.timestamp;
+    const entry = parseEntry(row.rowJson);
+    const key = `${row.provider}\0${row.model}`;
+    const usage = entry ? mergeAttemptQuotaUsage(entry) : null;
+    const cacheRead = usage?.cacheReadInputTokens;
+    const cacheCreation = usage?.cacheCreationInputTokens;
+    const rawInput = usage && cacheRead !== undefined && cacheCreation !== undefined
+      ? usage.inputTokens - cacheRead - cacheCreation
+      : undefined;
+
+    if (rawInput !== undefined) {
+      rawInputKnown += 1;
+      rawInputTokens += rawInput;
+      if (rawInput > 100_000) {
+        if (previousHighRaw) {
+          rawInputAlerts.add(previousHighRaw.key);
+          rawInputAlerts.add(key);
+        }
+        previousHighRaw = { key };
+      } else {
+        previousHighRaw = null;
+      }
+    } else {
+      previousHighRaw = null;
+    }
+
+    if (cacheCreation !== undefined) {
+      cacheCreationKnown += 1;
+      cacheCreationInputTokens += cacheCreation;
+      if (cacheCreation > 10_000 && priorCacheRead.has(key)) cacheWriteAlerts.add(key);
+    }
+    if (cacheRead !== undefined) {
+      cacheReadKnown += 1;
+      cacheReadInputTokens += cacheRead;
+      if (cacheRead > 0) priorCacheRead.add(key);
+    }
+
+    const sends = entry ? quotaSends(entry) : null;
+    if (sends) {
+      sendsKnown += 1;
+      physicalSends += sends.sends;
+      retrySends += Math.max(0, sends.sends - 1);
+      if (sends.sends > 1 || sends.recovery) retryAlerts.add(key);
+      if (sends.sends > 0 && cacheRead !== undefined) {
+        const reads = cacheReadsByProviderModel.get(key) ?? [];
+        reads.push(cacheRead);
+        cacheReadsByProviderModel.set(key, reads);
+      }
+    }
+  }
+
+  for (const [key, reads] of cacheReadsByProviderModel) {
+    if (reads.length < 6) continue;
+    const previous = reads.slice(-6, -3);
+    const newest = reads.slice(-3);
+    if (previous.every(read => read > 0) && newest.every(read => read === 0)) cacheReadAlerts.add(key);
+  }
+
+  const totalRequests = scanned.length;
+  const durationMinutes = Math.max(1, windowEndedAt - windowStartedAt) / 60_000;
+  return {
+    generatedAt,
+    windowStartedAt,
+    windowEndedAt,
+    totalRequests,
+    requestRatePerMinute: totalRequests / durationMinutes,
+    lastActivityAt,
+    rawInputTokens,
+    cacheReadInputTokens,
+    cacheCreationInputTokens,
+    cacheUtilization: cacheReadInputTokens + cacheCreationInputTokens > 0
+      ? cacheReadInputTokens / (cacheReadInputTokens + cacheCreationInputTokens)
+      : null,
+    physicalSends,
+    retrySends,
+    coverage: {
+      rawInput: totalRequests > 0 ? rawInputKnown / totalRequests : null,
+      cacheRead: totalRequests > 0 ? cacheReadKnown / totalRequests : null,
+      cacheCreation: totalRequests > 0 ? cacheCreationKnown / totalRequests : null,
+      sends: totalRequests > 0 ? sendsKnown / totalRequests : null,
+    },
+    historyTruncated,
+    alerts: {
+      rawInput: providerModels(rawInputAlerts),
+      cacheWrite: providerModels(cacheWriteAlerts),
+      cacheRead: providerModels(cacheReadAlerts),
+      retry: providerModels(retryAlerts),
+    },
   };
 }

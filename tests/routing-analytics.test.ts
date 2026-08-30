@@ -11,7 +11,7 @@ import {
   type PersistedUsageEntry,
 } from "../src/usage/log";
 import { closeRequestHistoryIndex } from "../src/routing/history/indexer";
-import { computeRoutingAnalytics } from "../src/routing/analytics";
+import { computeQuotaObservability, computeRoutingAnalytics } from "../src/routing/analytics";
 import type { OcxConfig } from "../src/types";
 
 let testDir = "";
@@ -258,6 +258,7 @@ describe("routing analytics (RI-03)", () => {
       { query: "to=xyz", code: "invalid_to" },
       { query: "from=10&to=5", code: "invalid_range" },
       { query: "limit=0", code: "invalid_limit" },
+      { query: "view=unknown", code: "invalid_view" },
     ] as const;
     for (const { query, code } of cases) {
       const req = new ManagementRequest(`http://localhost/api/routing-analytics?${query}`, { method: "GET" });
@@ -267,5 +268,90 @@ describe("routing analytics (RI-03)", () => {
       const body = await response!.json() as { error?: { code?: string } };
       expect(body.error?.code).toBe(code);
     }
+  });
+
+  test("quota watch detects cache, raw input, and physical send regressions", async () => {
+    const now = 1_000_000;
+    const usage = (inputTokens: number, cacheReadInputTokens: number, cacheCreationInputTokens: number) => ({
+      inputTokens,
+      outputTokens: 0,
+      totalTokens: inputTokens,
+      cacheReadInputTokens,
+      cacheCreationInputTokens,
+    });
+    const attempt = (sendCount = 1, recoveryKinds: string[] = []) => ({
+      ordinal: 1,
+      provider: "a",
+      model: "m1",
+      adapter: "openai-chat",
+      status: 200,
+      durationMs: 1,
+      sendCount,
+      recoveryKinds,
+      usageStatus: "reported" as const,
+    });
+    const append = (requestId: string, timestamp: number, provider: string, model: string, requestUsage: ReturnType<typeof usage> | undefined, sendCount = 1, recoveryKinds: string[] = []) => {
+      appendUsageEntry(entry(requestId, {
+        timestamp,
+        status: 200,
+        durationMs: 1,
+        provider,
+        model,
+        ...(requestUsage ? { usage: requestUsage } : {}),
+        attempts: [{ ...attempt(sendCount, recoveryKinds), provider, model }],
+      }));
+    };
+
+    append("raw-1", now - 59_000, "raw", "m", usage(120_001, 1, 0));
+    append("unknown", now - 58_000, "raw", "m", undefined);
+    append("raw-2", now - 57_000, "raw", "m", usage(120_001, 1, 0));
+    append("raw-3", now - 56_000, "raw", "m", usage(120_001, 1, 0));
+    append("warmup-write", now - 55_000, "cache", "m", usage(20_000, 0, 20_000));
+    append("warmup-read", now - 54_000, "cache", "m", usage(20_000, 10, 0));
+    append("bad-write", now - 53_000, "cache", "m", usage(20_000, 10, 20_000));
+    for (let index = 0; index < 6; index++) {
+      append(`read-${index}`, now - 40_000 + index, "reads", "m", usage(100, index < 3 ? 10 : 0, 0));
+    }
+    append("retry", now - 30_000, "retry", "m", usage(100, 0, 0), 2, ["transient-5xx"]);
+
+    const result = await computeQuotaObservability({}, { now });
+    expect(result.totalRequests).toBe(14);
+    expect(result.requestRatePerMinute).toBe(1.4);
+    expect(result.alerts.rawInput).toEqual([{ provider: "raw", model: "m" }]);
+    expect(result.alerts.cacheWrite).toEqual([{ provider: "cache", model: "m" }]);
+    expect(result.alerts.cacheRead).toEqual([{ provider: "reads", model: "m" }]);
+    expect(result.alerts.retry).toEqual([{ provider: "retry", model: "m" }]);
+    expect(result.physicalSends).toBe(15);
+    expect(result.retrySends).toBe(1);
+    expect(result.coverage.rawInput).toBe(13 / 14);
+  });
+
+  test("quota watch filters conversation and exposes no durable row data", async () => {
+    const now = Date.now();
+    appendUsageEntry(entry("private-request", {
+      timestamp: now - 1,
+      status: 200,
+      durationMs: 1,
+      conversationId: "private-conversation",
+      usage: { inputTokens: 10, outputTokens: 0, totalTokens: 10, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+      attempts: [{ ordinal: 1, provider: "a", model: "m1", adapter: "openai-chat", status: 200, durationMs: 1, sendCount: 1, recoveryKinds: [], usageStatus: "reported" }],
+    }));
+    appendUsageEntry(entry("other-request", {
+      timestamp: now - 1,
+      status: 200,
+      durationMs: 1,
+      conversationId: "other-conversation",
+    }));
+
+    const result = await computeQuotaObservability({ conversationId: "private-conversation" }, { now });
+    expect(result.totalRequests).toBe(1);
+    const req = new ManagementRequest("http://localhost/api/routing-analytics?view=quota&conversationId=private-conversation", { method: "GET" });
+    const response = await handleManagementAPI(req, new URL(req.url), config(), { refreshCodexCatalog: async () => {} });
+    expect(response!.status).toBe(200);
+    const text = await response!.text();
+    expect(JSON.parse(text).totalRequests).toBe(1);
+    expect(text).not.toContain("private-request");
+    expect(text).not.toContain("private-conversation");
+    expect(text).not.toContain("other-request");
   });
 });

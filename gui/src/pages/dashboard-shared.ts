@@ -121,6 +121,29 @@ export interface SidecarPatch {
 }
 export interface ShadowCallData { enabled: boolean; model: string; sourceModels?: string[] }
 export interface UsageSummary30d { summary: { requests: number; totalTokens: number; coverageRatio: number } }
+export interface QuotaWatchProviderModel { provider: string; model: string }
+export interface QuotaWatchData {
+  generatedAt: number;
+  windowStartedAt: number;
+  windowEndedAt: number;
+  totalRequests: number;
+  requestRatePerMinute: number;
+  lastActivityAt: number | null;
+  rawInputTokens: number;
+  cacheReadInputTokens: number;
+  cacheCreationInputTokens: number;
+  cacheUtilization: number | null;
+  physicalSends: number;
+  retrySends: number;
+  coverage: { rawInput: number | null; cacheRead: number | null; cacheCreation: number | null; sends: number | null };
+  historyTruncated: boolean;
+  alerts: {
+    rawInput: QuotaWatchProviderModel[];
+    cacheWrite: QuotaWatchProviderModel[];
+    cacheRead: QuotaWatchProviderModel[];
+    retry: QuotaWatchProviderModel[];
+  };
+}
 export type UpdateChannel = "latest" | "preview";
 export type Installer = "npm" | "bun" | "source";
 export type UpdateJobStatus = "running" | "restarting" | "succeeded" | "failed";

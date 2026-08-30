@@ -56,6 +56,24 @@ test("Dashboard usage polling cannot delay core health and settings", async () =
   expect(hook).not.toMatch(/usageSummary30dResourceKey\(apiBase\)[\s\S]*pollMs: 60_000/);
 });
 
+test("Dashboard quota watch has its own five-second poll and alert panel", async () => {
+  const core = await Bun.file(new URL("../src/pages/dashboard-core-poll.ts", import.meta.url)).text();
+  const hook = await Bun.file(new URL("../src/pages/use-dashboard-data.ts", import.meta.url)).text();
+  const panel = await Bun.file(new URL("../src/pages/dashboard-quota-observability.tsx", import.meta.url)).text();
+  const overview = await Bun.file(new URL("../src/pages/dashboard-overview-panels.tsx", import.meta.url)).text();
+  const quotaStart = core.indexOf("export async function fetchDashboardQuotaWatch");
+  const overviewStart = core.indexOf("export async function fetchDashboardOverview");
+  expect(quotaStart).toBeGreaterThan(-1);
+  expect(core.slice(quotaStart, overviewStart)).toContain("/api/routing-analytics?view=quota");
+  expect(core.slice(overviewStart)).not.toContain("routing-analytics?view=quota");
+  expect(hook).toContain("dashboard-quota-watch:${apiBase}");
+  expect(hook).toContain("fetchDashboardQuotaWatch(apiBase, signal)");
+  expect(hook).toMatch(/dashboard-quota-watch:\$\{apiBase\}[\s\S]{0,240}pollMs: 5000/);
+  expect(panel).toContain('role="alert"');
+  expect(panel).toContain("refreshQuotaWatch");
+  expect(overview).toContain("<DashboardQuotaObservability d={props} />");
+});
+
 test("Dashboard interactive controls load independently of health/providers", async () => {
   const core = await Bun.file(new URL("../src/pages/dashboard-core-poll.ts", import.meta.url)).text();
   const sidecarsFnStart = core.indexOf("export async function fetchDashboardSidecars");
