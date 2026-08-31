@@ -10,6 +10,9 @@ import { useDataSurface } from "../data-surface";
 import { DataSurfaceSkeleton } from "../components/data-surface";
 import { SectionTabs } from "../components/section-tabs";
 import { sectionAnchorId } from "../section-anchors";
+import { fetchRoutingAnalytics } from "./dashboard-core-poll";
+import { UsageQuotaObservability } from "./dashboard-quota-observability";
+import type { RoutingAnalyticsResult } from "./dashboard-shared";
 
 type Range = "all" | "30d" | "7d";
 type UsageSurface = "all" | "codex" | "claude" | "grok";
@@ -392,6 +395,7 @@ function UsageHeatmapPanel({
     if (!element) return;
     const pinRight = () => { element.scrollLeft = element.scrollWidth; };
     pinRight();
+    if (typeof ResizeObserver === "undefined") return;
     const observer = new ResizeObserver(pinRight);
     observer.observe(element);
     return () => observer.disconnect();
@@ -659,6 +663,9 @@ function UsageWorkspaceBody({
   modelQuery,
   onModelQuery,
   sortedProviders,
+  quotaData,
+  quotaLoading,
+  quotaError,
   range,
   locale,
   t,
@@ -671,11 +678,19 @@ function UsageWorkspaceBody({
   modelQuery: string;
   onModelQuery: (query: string) => void;
   sortedProviders: UsageProvider[];
+  quotaData: RoutingAnalyticsResult | null;
+  quotaLoading: boolean;
+  quotaError: boolean;
   range: Range;
   locale: Locale;
   t: TFn;
 }) {
-  const empty = !!data && data.summary.requests === 0;
+  const empty = !!data
+    && !!quotaData
+    && !quotaLoading
+    && !quotaError
+    && data.summary.requests === 0
+    && quotaData.totalRequests === 0;
   const sections = [
     {
       id: "overview",
@@ -687,6 +702,20 @@ function UsageWorkspaceBody({
           <UsageHeatmapPanel range={range} heatmap={heatmap} weekBars={weekBars} locale={locale} t={t} />
         </>
       ) : null,
+    },
+    {
+      id: "quota",
+      label: t("usage.quota.title"),
+      meta: quotaData ? `${quotaData.redAlerts.length}` : "—",
+      body: (
+        <UsageQuotaObservability
+          data={quotaData}
+          loading={quotaLoading}
+          error={quotaError}
+          locale={locale}
+          t={t}
+        />
+      ),
     },
     {
       id: "models",
@@ -760,13 +789,16 @@ export default function Usage({ apiBase }: { apiBase: string }) {
   const [surface, setSurface] = useState<UsageSurface>("all");
   const [modelQuery, setModelQuery] = useState("");
 
+  const queryWindow = useCallback(() => ({ range, surface }), [range, surface]);
+
   const loadUsage = useCallback(async (signal: AbortSignal): Promise<UsageResponse> => {
-    const response = await fetch(`${apiBase}/api/usage?range=${range}&surface=${surface}`, { signal });
+    const query = queryWindow();
+    const response = await fetch(`${apiBase}/api/usage?range=${query.range}&surface=${query.surface}`, { signal });
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`.trim());
     const next = await response.json() as UsageResponse;
-    writeHeldUsage(apiBase, range, surface, next);
+    writeHeldUsage(apiBase, query.range, query.surface, next);
     return next;
-  }, [apiBase, range, surface]);
+  }, [apiBase, queryWindow]);
 
   const resourceKey = usageCacheKey(apiBase, range, surface);
   const cached = readHeldUsage(apiBase, range, surface);
@@ -780,6 +812,25 @@ export default function Usage({ apiBase }: { apiBase: string }) {
   );
   const { state } = resource;
   const data = state.data ?? cached ?? null;
+
+  const loadQuota = useCallback(
+    (signal: AbortSignal) => {
+      const query = queryWindow();
+      return fetchRoutingAnalytics(apiBase, signal, {
+        range: query.range,
+        ...(query.surface !== "all" ? { surface: query.surface } : {}),
+        limit: 50_000,
+      });
+    },
+    [apiBase, queryWindow],
+  );
+  const quotaResource = useDataSurface<RoutingAnalyticsResult>(
+    `usage-routing-analytics:${apiBase}:${range}:${surface}`,
+    [apiBase, range, surface],
+    loadQuota,
+    { isEmpty: () => false, deadlineMs: 60_000 },
+  );
+  const quotaData = quotaResource.state.data ?? null;
 
   const heatmap = useMemo(() => buildHeatmap(data?.days ?? []), [data?.days]);
   const weekBars = useMemo(() => lastSevenDays(data?.days ?? []), [data?.days]);
@@ -809,51 +860,51 @@ export default function Usage({ apiBase }: { apiBase: string }) {
       </div>
       <p className="page-sub">{t("usage.subtitle")}</p>
 
-      {state.showSkeleton && !data ? (
+      {state.showSkeleton && !data && (
         <DataSurfaceSkeleton label={t("usage.loading")} rows={5} />
-      ) : state.kind === "failed-cold" ? (
+      )}
+      {state.kind === "failed-cold" ? (
         <Notice tone="err">
           {state.error instanceof Error ? `${t("usage.loadError")} ${state.error.message}` : t("usage.loadError")}{" "}
           <button type="button" className="btn btn-ghost btn-sm" onClick={() => resource.refresh()}>
             {t("common.retry")}
           </button>
         </Notice>
-      ) : (
-        <>
-          {state.showError && <Notice tone="err">{t("usage.loadError")}</Notice>}
-          {data?.historyTruncated && (
-            // Naming the loaded window is the point: without it, `30d` and "Available history"
-            // look identical on a busy installation even though both may cover far less than
-            // they claim (#1497). `warn` rather than `ok` because a total that silently omits
-            // in-range rows is a caveat, not a status update.
-            <Notice tone="warn">
-              {(() => {
-                // Both bounds must be renderable before the detailed wording is used: an older
-                // proxy omits the fields entirely, and a hand-edited row can carry a timestamp
-                // outside Date's range. Either way the generic string is the honest fallback.
-                const start = renderableInstant(data.snapshotWindowStart);
-                const end = renderableInstant(data.snapshotWindowEnd);
-                return start !== null && end !== null
-                  ? t("usage.historyTruncatedWindow", { start, end })
-                  : t("usage.historyTruncated");
-              })()}
-            </Notice>
-          )}
-          <UsageWorkspaceBody
-            data={data}
-            heatmap={heatmap}
-            weekBars={weekBars}
-            activeDays={activeDays}
-            filteredModels={filteredModels}
-            modelQuery={modelQuery}
-            onModelQuery={setModelQuery}
-            sortedProviders={sortedProviders}
-            range={range}
-            locale={locale}
-            t={t}
-          />
-        </>
+      ) : state.showError ? <Notice tone="err">{t("usage.loadError")}</Notice> : null}
+      {data?.historyTruncated && (
+        // Naming the loaded window is the point: without it, `30d` and "Available history"
+        // look identical on a busy installation even though both may cover far less than
+        // they claim (#1497). `warn` rather than `ok` because a total that silently omits
+        // in-range rows is a caveat, not a status update.
+        <Notice tone="warn">
+          {(() => {
+            // Both bounds must be renderable before the detailed wording is used: an older
+            // proxy omits the fields entirely, and a hand-edited row can carry a timestamp
+            // outside Date's range. Either way the generic string is the honest fallback.
+            const start = renderableInstant(data.snapshotWindowStart);
+            const end = renderableInstant(data.snapshotWindowEnd);
+            return start !== null && end !== null
+              ? t("usage.historyTruncatedWindow", { start, end })
+              : t("usage.historyTruncated");
+          })()}
+        </Notice>
       )}
+      <UsageWorkspaceBody
+        data={data}
+        heatmap={heatmap}
+        weekBars={weekBars}
+        activeDays={activeDays}
+        filteredModels={filteredModels}
+        modelQuery={modelQuery}
+        onModelQuery={setModelQuery}
+        sortedProviders={sortedProviders}
+        quotaData={quotaData}
+        quotaLoading={quotaResource.state.showSkeleton && !quotaData}
+        quotaError={quotaResource.state.showError}
+        range={range}
+        locale={locale}
+        t={t}
+      />
     </>
   );
 }

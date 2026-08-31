@@ -4,6 +4,13 @@ import { act, createElement } from "react";
 import { clearClientResourceStoresForTests } from "../src/client-resource";
 import { LanguageProvider } from "../src/i18n/provider";
 import Usage from "../src/pages/Usage";
+import { localCalendarRangeStart } from "../src/pages/dashboard-shared";
+
+test("quota windows start at local midnight on the first calendar day", () => {
+  const now = new Date(2026, 7, 31, 15, 48, 15).getTime();
+  expect(localCalendarRangeStart(7, now)).toBe(new Date(2026, 7, 25).getTime());
+  expect(localCalendarRangeStart(30, now)).toBe(new Date(2026, 7, 2).getTime());
+});
 
 test("Usage renders every section in one scrollable column with a sticky strip", async () => {
   const page = await Bun.file(new URL("../src/pages/Usage.tsx", import.meta.url)).text();
@@ -36,6 +43,7 @@ test("Usage workspace sections mount report panels in order", async () => {
   const order = [
     "<UsageSummaryCards",
     "<UsageHeatmapPanel",
+    "<UsageQuotaObservability",
     "<UsageModelsTable",
     "<UsageProvidersTable",
     "<UsageCoveragePanel",
@@ -51,30 +59,34 @@ test("Usage workspace sections mount report panels in order", async () => {
   expect(src).toContain("usw-section");
 });
 
-test("Usage loading and empty states guard the workspace body", async () => {
-  const src = await Bun.file(new URL("../src/pages/Usage.tsx", import.meta.url)).text();
-  expect(src).toContain("state.showSkeleton && !data");
-  expect(src).toContain("DataSurfaceSkeleton");
-  expect(src).toContain('t("usage.loading")');
-  expect(src).toContain('t("usage.empty")');
-  expect(src).toContain("data.summary.requests === 0");
+test("Usage quota observability uses independent durable routing analytics", async () => {
+  const page = await Bun.file(new URL("../src/pages/Usage.tsx", import.meta.url)).text();
+  const quota = await Bun.file(new URL("../src/pages/dashboard-quota-observability.tsx", import.meta.url)).text();
+
+  expect(page).toContain("fetchRoutingAnalytics");
+  expect(page).toContain("usage-routing-analytics:");
+  expect(page).toContain("limit: 50_000");
+  expect(page).toContain("const queryWindow = useCallback");
+  expect(page.match(/const query = queryWindow\(\);/g)?.length).toBe(2);
+  expect(page).toContain("range: query.range");
+  expect(page).not.toContain("const quotaFrom = useMemo");
+  expect(page).not.toContain("quotaEnabled");
+  expect(page).not.toContain("enabled: quotaEnabled");
+  expect(page).toContain('state.kind === "failed-cold"');
+  expect(page).toContain("<UsageQuotaObservability");
+  expect(quota).toContain("physicalBreakdown.map");
+  expect(quota).toContain("redAlerts.map");
+  expect(quota).toContain("row.repeatedSendAttempts");
+  expect(quota).toContain("row.accountRef");
+  expect(quota).toContain('aria-label={t("usage.quota.routes")}');
+  expect(quota).toContain('aria-label={t("usage.quota.alerts")}');
+  expect(quota).not.toContain("identity.slice");
+  expect(quota).toContain("attemptUsage.rawInputShare");
+  expect(quota).toContain("usageCoverage.ratio");
 });
 
-test("usage workspace i18n keys exist in every locale", async () => {
-  const locales = ["en", "de", "fr", "ja", "ko", "ru", "zh", "zh-TW"] as const;
-  for (const locale of locales) {
-    const dict = await Bun.file(new URL(`../src/i18n/${locale}.ts`, import.meta.url)).text();
-    expect(dict).toContain('"usage.workspace.sections":');
-    expect(dict).toContain('"usage.workspace.report":');
-    expect(dict).toContain('"usage.range.available":');
-    expect(dict).toContain('"usage.historyTruncated":');
-    expect(dict).toContain('"usage.historyTruncatedWindow":');
-    expect(dict).toContain('"api.attribution.totalRequestsAvailable":');
-  }
-});
-
-test("Usage renders Available history and a persistent qualification when history is capped", async () => {
-  const globalKeys = ["document", "window", "navigator", "localStorage", "IS_REACT_ACT_ENVIRONMENT"] as const;
+test("Usage quota settles while primary usage remains pending", async () => {
+  const globalKeys = ["document", "window", "navigator", "localStorage", "ResizeObserver", "IS_REACT_ACT_ENVIRONMENT"] as const;
   const previous = Object.fromEntries(globalKeys.map(key => [key, Reflect.get(globalThis, key)]));
   const originalFetch = globalThis.fetch;
   const testWindow = new Window({ url: "http://localhost/" });
@@ -83,6 +95,120 @@ test("Usage renders Available history and a persistent qualification when histor
     window: { configurable: true, value: testWindow },
     navigator: { configurable: true, value: testWindow.navigator },
     localStorage: { configurable: true, value: testWindow.localStorage },
+    ResizeObserver: { configurable: true, value: testWindow.ResizeObserver },
+  });
+  (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  clearClientResourceStoresForTests();
+  globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+    if (String(input).includes("/api/usage?")) {
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new DOMException("The operation was aborted.", "AbortError")), { once: true });
+      });
+    }
+    return Promise.resolve(Response.json({
+      totalRequests: 1,
+      physicalSends: 1,
+      repeatedSendAttempts: 0,
+      recoveryEvents: 0,
+      requestRatePerHour: 1,
+      attemptUsage: {
+        inclusiveInputTokens: 10,
+        rawInputTokens: 1,
+        cacheReadInputTokens: 9,
+        cacheWriteInputTokens: 0,
+        rawInputShare: 0.1,
+        cacheReadShare: 0.9,
+        cacheWriteShare: 0,
+      },
+      physicalUsageCoverage: {
+        totalAttempts: 1,
+        measuredAttempts: 1,
+        reportedAttempts: 1,
+        estimatedAttempts: 0,
+        unreportedAttempts: 0,
+        unsupportedAttempts: 0,
+        ratio: 1,
+        supportedRatio: 1,
+      },
+      physicalBreakdown: [],
+      redAlerts: [],
+      redAlertsPartial: false,
+      sequentialRoutes: 1,
+      warmedRoutes: 1,
+    }));
+  }) as typeof fetch;
+
+  const container = document.createElement("div");
+  document.body.append(container);
+  const { createRoot } = await import("react-dom/client");
+  const root = createRoot(container);
+  try {
+    await act(async () => {
+      root.render(createElement(LanguageProvider, null, createElement(Usage, { apiBase: "http://usage-independent-quota-test" })));
+    });
+    const deadline = Date.now() + 1_000;
+    while (!(container.textContent ?? "").includes("No quota warning occurrences in scanned history.")) {
+      if (Date.now() >= deadline) throw new Error("Quota analytics waited for primary usage");
+      await act(async () => {
+        await new Promise<void>(resolve => testWindow.setTimeout(resolve, 10));
+      });
+    }
+    expect(container.textContent).toContain("Loading usage data…");
+  } finally {
+    await act(async () => { root.unmount(); });
+    container.remove();
+    globalThis.fetch = originalFetch;
+    clearClientResourceStoresForTests();
+    testWindow.close();
+    for (const key of globalKeys) {
+      Object.defineProperty(globalThis, key, { configurable: true, value: previous[key] });
+    }
+  }
+});
+
+test("Usage loading and empty states do not hide quota state", async () => {
+  const src = await Bun.file(new URL("../src/pages/Usage.tsx", import.meta.url)).text();
+  expect(src).toContain("state.showSkeleton && !data &&");
+  expect(src).toContain("DataSurfaceSkeleton");
+  expect(src).toContain('t("usage.loading")');
+  expect(src).toContain('t("usage.empty")');
+  expect(src).toContain("!!quotaData");
+  expect(src).toContain("!quotaLoading");
+  expect(src).toContain("!quotaError");
+  expect(src).toContain("data.summary.requests === 0");
+});
+
+test("usage workspace i18n keys exist in every locale", async () => {
+  const locales = ["en", "de", "fr", "ja", "ko", "ru", "tr", "zh", "zh-TW"] as const;
+  for (const locale of locales) {
+    const dict = await Bun.file(new URL(`../src/i18n/${locale}.ts`, import.meta.url)).text();
+    expect(dict).toContain('"usage.workspace.sections":');
+    expect(dict).toContain('"usage.workspace.report":');
+    expect(dict).toContain('"usage.range.available":');
+    expect(dict).toContain('"usage.historyTruncated":');
+    expect(dict).toContain('"usage.historyTruncatedWindow":');
+    expect(dict).toContain('"usage.quota.title":');
+    expect(dict).toContain('"usage.quota.status.noAttempts":');
+    expect(dict).toContain('"usage.quota.status.unsupportedTelemetry":');
+    expect(dict).toContain('"usage.quota.status.unreportedTelemetry":');
+    expect(dict).toContain('"usage.quota.status.partialTelemetry":');
+    expect(dict).toContain('"usage.quota.alertsPreview":');
+    expect(dict).toContain('"usage.quota.alert.combo-failover":');
+    expect(dict).toContain('"api.attribution.totalRequestsAvailable":');
+  }
+});
+
+test("Usage renders Available history and a persistent qualification when history is capped", async () => {
+  const globalKeys = ["document", "window", "navigator", "localStorage", "ResizeObserver", "IS_REACT_ACT_ENVIRONMENT"] as const;
+  const previous = Object.fromEntries(globalKeys.map(key => [key, Reflect.get(globalThis, key)]));
+  const originalFetch = globalThis.fetch;
+  const testWindow = new Window({ url: "http://localhost/" });
+  Object.defineProperties(globalThis, {
+    document: { configurable: true, value: testWindow.document },
+    window: { configurable: true, value: testWindow },
+    navigator: { configurable: true, value: testWindow.navigator },
+    localStorage: { configurable: true, value: testWindow.localStorage },
+    ResizeObserver: { configurable: true, value: testWindow.ResizeObserver },
   });
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   clearClientResourceStoresForTests();
@@ -161,7 +287,7 @@ test("Usage names the loaded window when history is truncated", async () => {
 });
 
 test("Usage falls back to the generic caveat when a reported bound is unrenderable", async () => {
-  const globalKeys = ["document", "window", "navigator", "localStorage", "IS_REACT_ACT_ENVIRONMENT"] as const;
+  const globalKeys = ["document", "window", "navigator", "localStorage", "ResizeObserver", "IS_REACT_ACT_ENVIRONMENT"] as const;
   const previous = Object.fromEntries(globalKeys.map(key => [key, Reflect.get(globalThis, key)]));
   const originalFetch = globalThis.fetch;
   const testWindow = new Window({ url: "http://localhost/" });
@@ -170,6 +296,7 @@ test("Usage falls back to the generic caveat when a reported bound is unrenderab
     window: { configurable: true, value: testWindow },
     navigator: { configurable: true, value: testWindow.navigator },
     localStorage: { configurable: true, value: testWindow.localStorage },
+    ResizeObserver: { configurable: true, value: testWindow.ResizeObserver },
   });
   (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   clearClientResourceStoresForTests();

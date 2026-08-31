@@ -50,6 +50,8 @@ export type AttemptRecoveryKind =
   | "rate-limit-429"
   | "anthropic-oauth-429"
   | "oauth-account-429"
+  | "codex-account-retry"
+  | "adapter-retry"
   | "image-413"
   | "opaque-blob-rejection"
   | "empty-completion";
@@ -71,6 +73,8 @@ export interface PersistedUsageAttempt {
   firstOutputMs?: number;
   sendCount: number;
   recoveryKinds: AttemptRecoveryKind[];
+  /** Number of recovery sends, including repeated occurrences of the same kind. */
+  recoveryCount?: number;
   usageStatus: UsageStatus;
   /**
    * True when the proxy answered this turn locally and issued no upstream request. It travels on
@@ -141,6 +145,8 @@ export interface PersistedUsageEntry {
   usage?: OcxUsage;
   totalTokens?: number;
   attempts?: PersistedUsageAttempt[];
+  /** True only when combo execution advanced to another configured target. */
+  comboTargetAdvanced?: true;
   // Failure diagnostics (devlog/_plan/260716_claudecode_hardening/030): persisted for
   // status>=400 or non-completed terminals so incidents survive the in-memory ring buffer.
   errorCode?: string;
@@ -261,6 +267,8 @@ const ATTEMPT_RECOVERY_KINDS = new Set<AttemptRecoveryKind>([
   "rate-limit-429",
   "anthropic-oauth-429",
   "oauth-account-429",
+  "codex-account-retry",
+  "adapter-retry",
   "image-413",
   "opaque-blob-rejection",
   "empty-completion",
@@ -380,6 +388,10 @@ function normalizeUsageAttempt(raw: unknown): PersistedUsageAttempt | null {
     && !isNonNegativeFiniteNumber(attempt.firstOutputMs)) return null;
   if ("totalTokens" in attempt
     && !isNonNegativeFiniteNumber(attempt.totalTokens)) return null;
+  if ("recoveryCount" in attempt
+    && (typeof attempt.recoveryCount !== "number"
+      || !Number.isInteger(attempt.recoveryCount)
+      || attempt.recoveryCount < 0)) return null;
   const usage = "usage" in attempt ? normalizeAttemptUsage(attempt.usage) : undefined;
   if ("usage" in attempt && usage === null) return null;
   const tierOutcome = "tierOutcome" in attempt
@@ -405,7 +417,11 @@ function normalizeUsageAttempt(raw: unknown): PersistedUsageAttempt | null {
       : {}),
     sendCount: attempt.sendCount as number,
     recoveryKinds,
+    ...(typeof attempt.recoveryCount === "number"
+      ? { recoveryCount: attempt.recoveryCount }
+      : {}),
     usageStatus: attempt.usageStatus as UsageStatus,
+    ...(attempt.locallyAnswered === true ? { locallyAnswered: true } : {}),
     ...(isCodexUsageAccountLogLabel(attempt.accountLogLabel)
       ? { accountLogLabel: attempt.accountLogLabel }
       : {}),
@@ -455,8 +471,13 @@ export function isValidReasoningWireValue(
 
 function normalizedAttempts(raw: unknown): PersistedUsageAttempt[] {
   if (!Array.isArray(raw)) return [];
+  const seen = new Set<number>();
   return raw.map(normalizeUsageAttempt)
-    .filter((attempt): attempt is PersistedUsageAttempt => attempt !== null);
+    .filter((attempt): attempt is PersistedUsageAttempt => {
+      if (attempt === null || seen.has(attempt.ordinal)) return false;
+      seen.add(attempt.ordinal);
+      return true;
+    });
 }
 
 const MAX_METADATA_STRING_LEN = 64;
@@ -543,6 +564,7 @@ function normalizeUsageEntry(entry: PersistedUsageEntry): PersistedUsageEntry {
     ...(entry.usage ? { usage: normalizeUsageValue(entry.usage) } : {}),
     ...(typeof entry.totalTokens === "number" ? { totalTokens: entry.totalTokens } : {}),
     ...(Array.isArray(entry.attempts) ? { attempts } : {}),
+    ...(entry.comboTargetAdvanced === true ? { comboTargetAdvanced: true } : {}),
     ...(entry.errorCode ? { errorCode: entry.errorCode } : {}),
     ...(entry.terminalStatus ? { terminalStatus: entry.terminalStatus } : {}),
     ...(entry.closeReason ? { closeReason: entry.closeReason } : {}),

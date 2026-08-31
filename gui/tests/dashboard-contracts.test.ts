@@ -1,6 +1,11 @@
 import { expect, test } from "bun:test";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import { en } from "../src/i18n/en";
-import { normalizeInjectionSelection } from "../src/pages/dashboard-core-poll";
+import { interpolate, type TFn } from "../src/i18n/shared";
+import { fetchRoutingAnalytics, normalizeInjectionSelection } from "../src/pages/dashboard-core-poll";
+import { DashboardQuotaObservability, UsageQuotaObservability } from "../src/pages/dashboard-quota-observability";
+import type { RoutingAnalyticsResult } from "../src/pages/dashboard-shared";
 import { PROJECT_CONFIG_DIAGNOSTICS_POLL_MS, beginPollEpoch, beginPollEpochs } from "../src/startup-health-ui";
 
 test("project-config diagnostics poll cadence is owned by the shared constant", () => {
@@ -53,7 +58,337 @@ test("Dashboard usage polling cannot delay core health and settings", async () =
   expect(hook).toContain("fetchDashboardUsage(apiBase, signal)");
   expect(hook).toContain("fetchDashboardSidecars");
   expect(hook).toContain("fetchDashboardOverview");
-  expect(hook).not.toMatch(/usageSummary30dResourceKey\(apiBase\)[\s\S]*pollMs: 60_000/);
+  const usageResourceStart = hook.indexOf("const usagePoll = useKeyedClientResource");
+  const quotaResourceStart = hook.indexOf("const quotaAnalyticsPoll = useKeyedClientResource");
+  expect(usageResourceStart).toBeGreaterThan(-1);
+  expect(quotaResourceStart).toBeGreaterThan(usageResourceStart);
+  expect(hook.slice(usageResourceStart, quotaResourceStart)).not.toContain("pollMs:");
+});
+
+test("Dashboard quota analytics poll is independent of health and settings", async () => {
+  const core = await Bun.file(new URL("../src/pages/dashboard-core-poll.ts", import.meta.url)).text();
+  const hook = await Bun.file(new URL("../src/pages/use-dashboard-data.ts", import.meta.url)).text();
+  const panels = await Bun.file(new URL("../src/pages/dashboard-overview-panels.tsx", import.meta.url)).text();
+  const quota = await Bun.file(new URL("../src/pages/dashboard-quota-observability.tsx", import.meta.url)).text();
+  const overviewStart = core.indexOf("export async function fetchDashboardOverview");
+  const multiStart = core.indexOf("export async function fetchDashboardMultiAgent");
+
+  expect(core).toContain("export async function fetchRoutingAnalytics");
+  expect(core).toContain("data.repeatedSendAttempts");
+  expect(core).toContain("data.sequentialRoutes");
+  expect(core).toContain("data.warmedRoutes");
+  expect(core).toContain("value.repeatedSendAttempts");
+  expect(core).toContain("/api/routing-analytics");
+  expect(core.slice(overviewStart, multiStart)).not.toContain("/api/routing-analytics");
+  expect(hook).toContain("dashboard-routing-analytics:${apiBase}");
+  expect(hook).toContain("quotaAnalyticsPoll");
+  expect(hook).toContain('enabled: selectedSection === "overview"');
+  expect(hook).toContain('range: "30d"');
+  expect(hook).toContain("!quotaAnalyticsPoll.lastAttemptOk");
+  expect(panels).toContain("<DashboardQuotaObservability");
+  expect(quota).toContain("physicalUsageCoverage.ratio");
+  expect(quota).toContain("data.recoveryEvents");
+  expect(quota).toContain("data.repeatedSendAttempts");
+  expect(quota).toContain("data.warmedRoutes < data.sequentialRoutes");
+  expect(quota).toContain("data.redAlerts.slice(0, 3)");
+});
+
+function routingAnalyticsPayload(): RoutingAnalyticsResult {
+  const attemptUsage = {
+    inclusiveInputTokens: 10,
+    rawInputTokens: 4,
+    cacheReadInputTokens: 6,
+    cacheWriteInputTokens: 0,
+    rawInputShare: 0.4,
+    cacheReadShare: 0.6,
+    cacheWriteShare: 0,
+  };
+  const coverage = {
+    totalAttempts: 1,
+    measuredAttempts: 1,
+    reportedAttempts: 1,
+    estimatedAttempts: 0,
+    unreportedAttempts: 0,
+    unsupportedAttempts: 0,
+    ratio: 1,
+    supportedRatio: 1,
+  };
+  return {
+    generatedAt: 1,
+    totalRequests: 1,
+    physicalSends: 2,
+    repeatedSendAttempts: 1,
+    recoveryEvents: 1,
+    requestRatePerHour: 1.5,
+    attemptUsage,
+    physicalUsageCoverage: coverage,
+    physicalBreakdown: [{
+      provider: "anthropic",
+      model: "claude-test",
+      accountRef: "oa-test",
+      requests: 1,
+      physicalAttempts: 1,
+      physicalSends: 2,
+      repeatedSendAttempts: 1,
+      recoveryEvents: 1,
+      comboFailoverRequests: 0,
+      requestRatePerHour: 1.5,
+      attemptUsage: { ...attemptUsage },
+      usageCoverage: { ...coverage },
+    }],
+    redAlerts: [{
+      kind: "recovery",
+      requestId: "request-1",
+      timestamp: 1,
+      conversationId: "conversation-1",
+      provider: "anthropic",
+      model: "claude-test",
+      accountRef: "oa-test",
+      attemptOrdinal: 1,
+      value: 1,
+      previousValue: 0,
+      recoveryKinds: ["network-error"],
+    }],
+    redAlertsPartial: false,
+    sequentialRoutes: 1,
+    warmedRoutes: 1,
+  };
+}
+
+async function fetchRoutingAnalyticsPayload(payload: unknown): Promise<RoutingAnalyticsResult> {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => ({
+    ok: true,
+    status: 200,
+    json: async () => payload,
+  })) as unknown as typeof fetch;
+  try {
+    return await fetchRoutingAnalytics("http://test", new AbortController().signal);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+test("fetchRoutingAnalytics accepts recursively valid HTTP-200 payloads and preserves null shares", async () => {
+  const valid = routingAnalyticsPayload();
+  expect(await fetchRoutingAnalyticsPayload(valid)).toBe(valid);
+
+  const empty: RoutingAnalyticsResult = {
+    ...valid,
+    totalRequests: 0,
+    physicalSends: 0,
+    repeatedSendAttempts: 0,
+    recoveryEvents: 0,
+    requestRatePerHour: null,
+    attemptUsage: {
+      inclusiveInputTokens: 0,
+      rawInputTokens: 0,
+      cacheReadInputTokens: 0,
+      cacheWriteInputTokens: 0,
+      rawInputShare: null,
+      cacheReadShare: null,
+      cacheWriteShare: null,
+    },
+    physicalUsageCoverage: {
+      totalAttempts: 0,
+      measuredAttempts: 0,
+      reportedAttempts: 0,
+      estimatedAttempts: 0,
+      unreportedAttempts: 0,
+      unsupportedAttempts: 0,
+      ratio: null,
+      supportedRatio: null,
+    },
+    physicalBreakdown: [],
+    redAlerts: [],
+    sequentialRoutes: 0,
+    warmedRoutes: 0,
+  };
+  const accepted = await fetchRoutingAnalyticsPayload(empty);
+  expect(accepted).toBe(empty);
+  expect(accepted.attemptUsage.rawInputShare).toBeNull();
+  expect(accepted.physicalUsageCoverage.ratio).toBeNull();
+});
+
+test("fetchRoutingAnalytics rejects malformed HTTP-200 payloads recursively", async () => {
+  const valid = routingAnalyticsPayload();
+  const row = valid.physicalBreakdown[0]!;
+  const alert = valid.redAlerts[0]!;
+  const malformed: Array<[string, unknown]> = [
+    ["NaN scalar", { ...valid, requestRatePerHour: Number.NaN }],
+    ["infinite usage", { ...valid, attemptUsage: { ...valid.attemptUsage, inclusiveInputTokens: Number.POSITIVE_INFINITY } }],
+    ["negative counter", { ...valid, physicalSends: -1 }],
+    ["invalid share", { ...valid, attemptUsage: { ...valid.attemptUsage, rawInputShare: 1.1 } }],
+    ["invalid null share", { ...valid, attemptUsage: { ...valid.attemptUsage, cacheReadShare: null } }],
+    ["coverage counter invariant", {
+      ...valid,
+      physicalUsageCoverage: { ...valid.physicalUsageCoverage, measuredAttempts: 0 },
+    }],
+    ["coverage ratio invariant", {
+      ...valid,
+      physicalUsageCoverage: { ...valid.physicalUsageCoverage, ratio: null },
+    }],
+    ["malformed physical row", {
+      ...valid,
+      physicalBreakdown: [{ ...row, recoveryEvents: -1 }],
+    }],
+    ["malformed row optional", {
+      ...valid,
+      physicalBreakdown: [{ ...row, accountRef: 42 }],
+    }],
+    ["unknown alert kind", {
+      ...valid,
+      redAlerts: [{ ...alert, kind: "unknown-alert" }],
+    }],
+    ["malformed alert optional", {
+      ...valid,
+      redAlerts: [{ ...alert, conversationId: null }],
+    }],
+    ["infinite alert value", {
+      ...valid,
+      redAlerts: [{ ...alert, value: Number.NEGATIVE_INFINITY }],
+    }],
+  ];
+
+  for (const [name, payload] of malformed) {
+    try {
+      await fetchRoutingAnalyticsPayload(payload);
+      throw new Error(`accepted malformed case: ${name}`);
+    } catch (error) {
+      expect(error).toEqual(new Error("invalid routing analytics response"));
+    }
+  }
+});
+
+test("quota state distinguishes physical-attempt telemetry gaps and historical warnings", () => {
+  const t: TFn = (key, vars) => interpolate(en[key], vars);
+  const coverage = {
+    totalAttempts: 1,
+    measuredAttempts: 1,
+    reportedAttempts: 1,
+    estimatedAttempts: 0,
+    unreportedAttempts: 0,
+    unsupportedAttempts: 0,
+    ratio: 1,
+    supportedRatio: 1,
+  };
+  const data: RoutingAnalyticsResult = {
+    generatedAt: Date.UTC(2026, 7, 31, 0, 0),
+    totalRequests: 1,
+    physicalSends: 1,
+    repeatedSendAttempts: 0,
+    recoveryEvents: 0,
+    requestRatePerHour: 1,
+    attemptUsage: {
+      inclusiveInputTokens: 1,
+      rawInputTokens: 1,
+      cacheReadInputTokens: 0,
+      cacheWriteInputTokens: 0,
+      rawInputShare: 1,
+      cacheReadShare: 0,
+      cacheWriteShare: 0,
+    },
+    physicalUsageCoverage: coverage,
+    physicalBreakdown: [],
+    redAlerts: [],
+    redAlertsPartial: false,
+    sequentialRoutes: 1,
+    warmedRoutes: 1,
+  };
+  const render = (next: RoutingAnalyticsResult, error = false) => renderToStaticMarkup(createElement(
+    UsageQuotaObservability,
+    { data: next, loading: false, error, locale: "en", t },
+  ));
+
+  expect(render({
+    ...data,
+    physicalUsageCoverage: { ...coverage, totalAttempts: 0, measuredAttempts: 0, reportedAttempts: 0, ratio: null, supportedRatio: null },
+  })).toContain("none sent an upstream inference");
+  expect(render({
+    ...data,
+    physicalUsageCoverage: { ...coverage, measuredAttempts: 0, reportedAttempts: 0, unsupportedAttempts: 1, ratio: 0, supportedRatio: null },
+  })).toContain("unsupported for 1 physical attempt");
+  expect(render({
+    ...data,
+    physicalUsageCoverage: { ...coverage, measuredAttempts: 0, reportedAttempts: 0, unreportedAttempts: 1, ratio: 0, supportedRatio: 0 },
+  })).toContain("missing for 1 physical attempt");
+  expect(render({
+    ...data,
+    physicalUsageCoverage: {
+      ...coverage,
+      totalAttempts: 3,
+      measuredAttempts: 1,
+      unreportedAttempts: 1,
+      unsupportedAttempts: 1,
+      ratio: 1 / 3,
+      supportedRatio: 1 / 2,
+    },
+  })).toContain("covers 1 of 3 physical attempts (1 unsupported, 1 unreported)");
+
+  const alert = {
+    kind: "repeated-send" as const,
+    requestId: "request-1",
+    timestamp: 1,
+    provider: "anthropic",
+    model: "claude-test",
+    attemptOrdinal: 1,
+    value: 2,
+  };
+  const historical = render({ ...data, redAlerts: [alert] });
+  expect(historical).toContain("1 quota warning occurrence(s) in scanned history");
+  expect(historical).not.toContain("active quota warning");
+
+  const invalidAlertTime = render({
+    ...data,
+    redAlerts: [{ ...alert, timestamp: Number.MAX_SAFE_INTEGER }],
+  });
+  expect(invalidAlertTime).toContain("<td>—</td>");
+  expect(invalidAlertTime).not.toContain("Invalid Date");
+  const invalidStaleTime = render({ ...data, generatedAt: Number.MAX_SAFE_INTEGER }, true);
+  expect(invalidStaleTime).toContain("The latest refresh failed. The values below may be stale.");
+  expect(invalidStaleTime).not.toContain("Invalid Date");
+
+  const partialAlert = render({ ...data, redAlerts: [alert], redAlertsPartial: true });
+  expect(partialAlert).toContain("notice notice-err");
+  expect(partialAlert).toContain("Results are partial because request history or alert output reached its limit.");
+  const alertWithPartialTelemetry = render({
+    ...data,
+    redAlerts: [alert],
+    physicalUsageCoverage: {
+      ...coverage,
+      totalAttempts: 2,
+      unreportedAttempts: 1,
+      ratio: 0.5,
+      supportedRatio: 0.5,
+    },
+  });
+  expect(alertWithPartialTelemetry).toContain("notice notice-err");
+  expect(alertWithPartialTelemetry).toContain("1 quota warning occurrence(s) in scanned history");
+
+  const stale = render(data, true);
+  expect(stale).toContain("Latest refresh failed. Values below are stale from");
+  expect(stale).toContain("2026");
+  expect(stale).toContain("Inclusive input");
+  expect(stale).not.toContain("No quota warning occurrences in scanned history.");
+
+  const warming = render({ ...data, sequentialRoutes: 2, warmedRoutes: 1 });
+  expect(warming).toContain("notice notice-warn");
+  expect(warming).toContain("Route is warming up");
+  expect(render({ ...data, sequentialRoutes: 2, warmedRoutes: 2 })).toContain("notice notice-ok");
+
+  const dashboard = renderToStaticMarkup(createElement(DashboardQuotaObservability, {
+    data: {
+      ...data,
+      redAlerts: Array.from({ length: 4 }, (_, index) => ({ ...alert, requestId: `request-${index + 1}` })),
+    },
+    loading: false,
+    error: false,
+    locale: "en",
+    t,
+  }));
+  expect(dashboard).toContain("Showing 3 of 4 returned warning occurrences.");
+  expect(dashboard).toContain("request-3");
+  expect(dashboard).not.toContain("request-4");
 });
 
 test("Dashboard interactive controls load independently of health/providers", async () => {

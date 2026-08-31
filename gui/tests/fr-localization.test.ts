@@ -127,6 +127,7 @@ const INTENTIONAL_ENGLISH = new Set<TKey>([
   "dash.version",
   "dash.mem.storeTotal",
   "dash.maintenance",
+  "usage.quota.col.session",
   "prov.port",
   "prov.openaiModeDirect",
   "logs.filter.conversation.label",

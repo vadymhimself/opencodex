@@ -121,6 +121,78 @@ export interface SidecarPatch {
 }
 export interface ShadowCallData { enabled: boolean; model: string; sourceModels?: string[] }
 export interface UsageSummary30d { summary: { requests: number; totalTokens: number; coverageRatio: number } }
+
+export interface RoutingAnalyticsUsage {
+  inclusiveInputTokens: number;
+  rawInputTokens: number;
+  cacheReadInputTokens: number;
+  cacheWriteInputTokens: number;
+  rawInputShare: number | null;
+  cacheReadShare: number | null;
+  cacheWriteShare: number | null;
+}
+
+export interface RoutingAnalyticsCoverage {
+  totalAttempts: number;
+  measuredAttempts: number;
+  reportedAttempts: number;
+  estimatedAttempts: number;
+  unreportedAttempts: number;
+  unsupportedAttempts: number;
+  ratio: number | null;
+  supportedRatio: number | null;
+}
+
+export type RoutingAnalyticsAlertKind =
+  | "consecutive-high-raw-input"
+  | "high-cache-write-after-warmup"
+  | "low-cache-read-share-after-warmup"
+  | "falling-cache-read"
+  | "recovery"
+  | "repeated-send"
+  | "combo-failover";
+
+export interface RoutingAnalyticsResult {
+  generatedAt?: number;
+  totalRequests: number;
+  physicalSends: number;
+  repeatedSendAttempts: number;
+  recoveryEvents: number;
+  requestRatePerHour: number | null;
+  attemptUsage: RoutingAnalyticsUsage;
+  physicalUsageCoverage: RoutingAnalyticsCoverage;
+  physicalBreakdown: Array<{
+    provider: string;
+    model: string;
+    accountRef?: string;
+    requests: number;
+    physicalAttempts: number;
+    physicalSends: number;
+    repeatedSendAttempts: number;
+    recoveryEvents: number;
+    comboFailoverRequests: number;
+    requestRatePerHour: number | null;
+    attemptUsage: RoutingAnalyticsUsage;
+    usageCoverage: RoutingAnalyticsCoverage;
+  }>;
+  redAlerts: Array<{
+    kind: RoutingAnalyticsAlertKind;
+    requestId: string;
+    timestamp: number;
+    conversationId?: string;
+    provider: string;
+    model: string;
+    accountRef?: string;
+    attemptOrdinal: number;
+    value?: number;
+    previousValue?: number;
+    recoveryKinds?: string[];
+  }>;
+  redAlertsPartial: boolean;
+  sequentialRoutes: number;
+  warmedRoutes: number;
+}
+
 export type UpdateChannel = "latest" | "preview";
 export type Installer = "npm" | "bun" | "source";
 export type UpdateJobStatus = "running" | "restarting" | "succeeded" | "failed";
@@ -178,6 +250,13 @@ export const UPDATE_CHECK_RETRY_BASE_MS = 800;
 
 export function defaultUpdateChannel(version: string | undefined): UpdateChannel {
   return version?.includes("-preview.") ? "preview" : "latest";
+}
+
+export function localCalendarRangeStart(days: number, now = Date.now()): number {
+  const start = new Date(now);
+  start.setHours(0, 0, 0, 0);
+  start.setDate(start.getDate() - (days - 1));
+  return start.getTime();
 }
 
 export function updateReasonLabel(reason: string | undefined, t: (key: TKey) => string): string {

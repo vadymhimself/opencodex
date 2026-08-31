@@ -117,7 +117,7 @@ describe("day-level estimated cost", () => {
       usageStatus: "reported",
       attempts: [
         { provider: "openai", model: "gpt-5.5", usageStatus: "reported", usage: { inputTokens: 1_000, outputTokens: 100 } },
-        { provider: "openai", model: "gpt-5.5-mini", usageStatus: "reported", usage: { inputTokens: 500, outputTokens: 50 } },
+        { provider: "anthropic", model: "claude-opus-5", usageStatus: "reported", usage: { inputTokens: 500, outputTokens: 50 } },
       ],
     } as Partial<PersistedUsageEntry> & { ts: number })];
     const sum = summarizeUsage(entries, "30d", at);
@@ -1436,11 +1436,14 @@ describe("summarizeUsage", () => {
 
     const sum = summarizeUsage([combo], "30d", FIXED_NOW);
 
-    // Totals should include the priced attempt's cost and count as priced
-    expect(sum.summary.pricedRequests).toBe(1);
-    expect(sum.summary.unpricedRequests).toBe(0);
+    // Logical totals fail closed when any physical attempt is unpriced.
+    expect(sum.summary.pricedRequests).toBe(0);
+    expect(sum.summary.unpricedRequests).toBe(1);
     const expectedCost = (100 * 5 + 10 * 30) / 1e6;
-    expect(sum.summary.estimatedCostUsd).toBeCloseTo(expectedCost, 9);
+    expect(sum.summary.estimatedCostUsd).toBe(0);
+    expect(sum.days.at(-1)?.estimatedCostUsd).toBe(0);
+    expect(sum.days.at(-1)?.models.find(model => model.model === "gpt-5.5")?.estimatedCostUsd)
+      .toBeCloseTo(expectedCost, 9);
 
     // Model breakdown
     const gptModel = sum.models.find(m => m.model === "gpt-5.5");

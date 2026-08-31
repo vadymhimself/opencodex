@@ -2,7 +2,7 @@ import { baseProviderLabel } from "../providers/label";
 import { canonicalAntigravityUsageModel } from "../providers/antigravity-models";
 import { usageDisplayTotalTokens } from "./totals";
 import { isCodexUsageAccountLogLabel, type PersistedUsageEntry, type UsageStatus } from "./log";
-import { type AttemptCostEstimate, type CostEstimate, estimateAttemptCost, estimateRequestCost, serviceTierContext, type ServiceTierContext } from "./cost";
+import { type AttemptCostEstimate, type CostEstimate, estimateAttemptCost, estimateComboCost, estimateRequestCost, serviceTierContext, type ServiceTierContext } from "./cost";
 
 /**
  * Canonical range members. The warm-up loop in the management usage route
@@ -49,7 +49,7 @@ export interface UsageDay {
   measuredRequests: number;
   reportedRequests: number;
   totalTokens: number;
-  /** Display-time estimated cost for this local day, summed from its model rows. */
+  /** Display-time estimated cost for this local day from fully priced requests. */
   estimatedCostUsd: number;
   models: UsageDayModel[];
 }
@@ -207,15 +207,14 @@ export function computeEntryCost(entry: PersistedUsageEntry): EntryCostInfo {
     const attemptEstimates = entry.attempts.map(attempt =>
       estimateAttemptCost(attempt, undefined, tier)
     );
-    let costTotal = 0;
-    let isPriced = false;
-    for (const est of attemptEstimates) {
-      if (est) {
-        costTotal += est.cost.total;
-        isPriced = true;
-      }
-    }
-    return { tier, estimate: null, attemptEstimates, costTotal, isPriced };
+    const estimate = estimateComboCost(entry.attempts, undefined, tier);
+    return {
+      tier,
+      estimate: null,
+      attemptEstimates,
+      costTotal: estimate?.cost.total ?? 0,
+      isPriced: estimate !== null,
+    };
   }
   const estimate = estimateRequestCost({
     provider: entry.provider,
@@ -572,28 +571,26 @@ function buildDayGrid(range: UsageRange, since: number | null, now: number, entr
     day.totalTokens += usageDisplayTotalTokens(entry.usage, entry.totalTokens) ?? 0;
     for (const attribution of usageAttributions(entry)) bumpDayModel(key, attribution);
     const costInfo = costMap.get(entry);
-    if (costInfo?.isPriced) {
-      if (entry.attempts?.length && costInfo.attemptEstimates) {
-        for (let i = 0; i < entry.attempts.length; i++) {
-          const attempt = entry.attempts[i];
-          const attemptEst = costInfo.attemptEstimates[i];
-          if (attemptEst) {
-            const aProviderKey = baseProviderLabel(attempt.provider);
-            const aIdentity = usageModelIdentity(attempt.provider, attempt.model);
-            const aKey = usageModelKey(aProviderKey, aIdentity.model);
-            const m = dayModels.get(key)?.get(aKey);
-            if (m) m.estimatedCostUsd = (m.estimatedCostUsd ?? 0) + attemptEst.cost.total;
-          }
+    if (entry.attempts?.length && costInfo?.attemptEstimates) {
+      for (let i = 0; i < entry.attempts.length; i++) {
+        const attempt = entry.attempts[i];
+        const attemptEst = costInfo.attemptEstimates[i];
+        if (attemptEst) {
+          const aProviderKey = baseProviderLabel(attempt.provider);
+          const aIdentity = usageModelIdentity(attempt.provider, attempt.model);
+          const aKey = usageModelKey(aProviderKey, aIdentity.model);
+          const m = dayModels.get(key)?.get(aKey);
+          if (m) m.estimatedCostUsd = (m.estimatedCostUsd ?? 0) + attemptEst.cost.total;
         }
-      } else if (costInfo.estimate) {
-        const providerKey = baseProviderLabel(entry.provider);
-        const identity = usageModelIdentity(entry.provider, entry.model, entry.resolvedModel);
-        const mKey = usageModelKey(providerKey, identity.model);
-        const m = dayModels.get(key)?.get(mKey);
-        if (m) m.estimatedCostUsd = (m.estimatedCostUsd ?? 0) + costInfo.estimate.cost.total;
       }
-      day.estimatedCostUsd += costInfo.costTotal;
+    } else if (costInfo?.estimate) {
+      const providerKey = baseProviderLabel(entry.provider);
+      const identity = usageModelIdentity(entry.provider, entry.model, entry.resolvedModel);
+      const mKey = usageModelKey(providerKey, identity.model);
+      const m = dayModels.get(key)?.get(mKey);
+      if (m) m.estimatedCostUsd = (m.estimatedCostUsd ?? 0) + costInfo.estimate.cost.total;
     }
+    if (costInfo?.isPriced) day.estimatedCostUsd += costInfo.costTotal;
   }
   void since;
   const out = [...grid.values()].sort((a, b) => a.date.localeCompare(b.date));

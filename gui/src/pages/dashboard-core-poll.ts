@@ -11,6 +11,7 @@ import {
   type ModelInfo,
   type ProjectCodexConfigGroup,
   type ProviderInfo,
+  type RoutingAnalyticsResult,
   type SettingsData,
   type ShadowCallData,
   type SidecarData,
@@ -139,6 +140,163 @@ export async function fetchDashboardUsage(apiBase: string, signal: AbortSignal):
   // it cannot delay health/provider/settings commits, and a failed refresh retains
   // the last good usage snapshot.
   return requireJson<UsageSummary30d>(response);
+}
+
+type UnknownRecord = Record<string, unknown>;
+
+const ROUTING_ANALYTICS_ALERT_KINDS = new Set([
+  "consecutive-high-raw-input",
+  "high-cache-write-after-warmup",
+  "low-cache-read-share-after-warmup",
+  "falling-cache-read",
+  "recovery",
+  "repeated-send",
+  "combo-failover",
+]);
+
+function isRecord(value: unknown): value is UnknownRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function isOptionalString(value: unknown): value is string | undefined {
+  return value === undefined || isNonEmptyString(value);
+}
+
+function isCounter(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isNonNegativeFinite(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+function isRatio(value: unknown): value is number | null {
+  return value === null || (isNonNegativeFinite(value) && value <= 1);
+}
+
+function approximatelyEqual(left: number, right: number): boolean {
+  return Math.abs(left - right) <= Number.EPSILON * 8 * Math.max(1, Math.abs(left), Math.abs(right));
+}
+
+function ratioMatches(value: unknown, numerator: number, denominator: number): boolean {
+  return denominator === 0
+    ? value === null
+    : typeof value === "number" && isRatio(value) && approximatelyEqual(value, numerator / denominator);
+}
+
+function isRoutingAnalyticsUsage(value: unknown): value is RoutingAnalyticsResult["attemptUsage"] {
+  if (!isRecord(value)
+    || !isNonNegativeFinite(value.inclusiveInputTokens)
+    || !isNonNegativeFinite(value.rawInputTokens)
+    || !isNonNegativeFinite(value.cacheReadInputTokens)
+    || !isNonNegativeFinite(value.cacheWriteInputTokens)) return false;
+  const decomposed = value.rawInputTokens + value.cacheReadInputTokens + value.cacheWriteInputTokens;
+  return approximatelyEqual(value.inclusiveInputTokens, decomposed)
+    && ratioMatches(value.rawInputShare, value.rawInputTokens, value.inclusiveInputTokens)
+    && ratioMatches(value.cacheReadShare, value.cacheReadInputTokens, value.inclusiveInputTokens)
+    && ratioMatches(value.cacheWriteShare, value.cacheWriteInputTokens, value.inclusiveInputTokens);
+}
+
+function isRoutingAnalyticsCoverage(value: unknown): value is RoutingAnalyticsResult["physicalUsageCoverage"] {
+  if (!isRecord(value)
+    || !isCounter(value.totalAttempts)
+    || !isCounter(value.measuredAttempts)
+    || !isCounter(value.reportedAttempts)
+    || !isCounter(value.estimatedAttempts)
+    || !isCounter(value.unreportedAttempts)
+    || !isCounter(value.unsupportedAttempts)) return false;
+  const measured = value.reportedAttempts + value.estimatedAttempts;
+  const supported = value.totalAttempts - value.unsupportedAttempts;
+  return value.measuredAttempts === measured
+    && value.totalAttempts === measured + value.unreportedAttempts + value.unsupportedAttempts
+    && ratioMatches(value.ratio, measured, value.totalAttempts)
+    && ratioMatches(value.supportedRatio, measured, supported);
+}
+
+function isRoutingAnalyticsBreakdownRow(
+  value: unknown,
+): value is RoutingAnalyticsResult["physicalBreakdown"][number] {
+  if (!isRecord(value)
+    || !isNonEmptyString(value.provider)
+    || !isNonEmptyString(value.model)
+    || !isOptionalString(value.accountRef)
+    || !isCounter(value.requests)
+    || !isCounter(value.physicalAttempts)
+    || !isCounter(value.physicalSends)
+    || !isCounter(value.repeatedSendAttempts)
+    || !isCounter(value.recoveryEvents)
+    || !isCounter(value.comboFailoverRequests)
+    || !(value.requestRatePerHour === null || isNonNegativeFinite(value.requestRatePerHour))
+    || !isRoutingAnalyticsUsage(value.attemptUsage)
+    || !isRoutingAnalyticsCoverage(value.usageCoverage)) return false;
+  return value.requests <= value.physicalAttempts
+    && value.repeatedSendAttempts <= value.physicalAttempts
+    && value.comboFailoverRequests <= value.requests
+    && value.usageCoverage.totalAttempts === value.physicalAttempts;
+}
+
+function isRoutingAnalyticsAlert(value: unknown): value is RoutingAnalyticsResult["redAlerts"][number] {
+  if (!isRecord(value)
+    || typeof value.kind !== "string"
+    || !ROUTING_ANALYTICS_ALERT_KINDS.has(value.kind)
+    || !isNonEmptyString(value.requestId)
+    || !isNonNegativeFinite(value.timestamp)
+    || !isOptionalString(value.conversationId)
+    || !isNonEmptyString(value.provider)
+    || !isNonEmptyString(value.model)
+    || !isOptionalString(value.accountRef)
+    || !isCounter(value.attemptOrdinal) || value.attemptOrdinal < 1
+    || !(value.previousValue === undefined || isNonNegativeFinite(value.previousValue))
+    || !(value.recoveryKinds === undefined
+      || (Array.isArray(value.recoveryKinds) && value.recoveryKinds.every(isNonEmptyString)))) return false;
+  return value.value === undefined
+    || (value.kind === "low-cache-read-share-after-warmup"
+      ? typeof value.value === "number" && isRatio(value.value)
+      : isNonNegativeFinite(value.value));
+}
+
+function isRoutingAnalyticsResult(value: unknown): value is RoutingAnalyticsResult {
+  if (!isRecord(value)) return false;
+  const data = value;
+  return (data.generatedAt === undefined || isNonNegativeFinite(data.generatedAt))
+    && isCounter(data.totalRequests)
+    && isCounter(data.physicalSends)
+    && isCounter(data.repeatedSendAttempts)
+    && isCounter(data.recoveryEvents)
+    && (data.requestRatePerHour === null || isNonNegativeFinite(data.requestRatePerHour))
+    && isRoutingAnalyticsUsage(data.attemptUsage)
+    && isRoutingAnalyticsCoverage(data.physicalUsageCoverage)
+    && Array.isArray(data.physicalBreakdown)
+    && data.physicalBreakdown.every(isRoutingAnalyticsBreakdownRow)
+    && Array.isArray(data.redAlerts)
+    && data.redAlerts.every(isRoutingAnalyticsAlert)
+    && typeof data.redAlertsPartial === "boolean"
+    && isCounter(data.sequentialRoutes)
+    && isCounter(data.warmedRoutes)
+    && data.warmedRoutes <= data.sequentialRoutes
+    && data.repeatedSendAttempts <= data.physicalUsageCoverage.totalAttempts;
+}
+
+export async function fetchRoutingAnalytics(
+  apiBase: string,
+  signal: AbortSignal,
+  filters: { from?: number; range?: "today" | "7d" | "30d" | "all"; surface?: string; limit?: number } = {},
+): Promise<RoutingAnalyticsResult> {
+  const query = new URLSearchParams();
+  if (filters.from !== undefined) query.set("from", String(filters.from));
+  if (filters.range) query.set("range", filters.range);
+  if (filters.surface) query.set("surface", filters.surface);
+  if (filters.limit !== undefined) query.set("limit", String(filters.limit));
+  const suffix = query.size > 0 ? `?${query}` : "";
+  const data = await requireJson<unknown>(
+    await fetch(`${apiBase}/api/routing-analytics${suffix}`, { signal }),
+  );
+  if (!isRoutingAnalyticsResult(data)) throw new Error("invalid routing analytics response");
+  return data;
 }
 
 /** Web-search / vision sidecar + shadow-call — config reads, typically sub-10ms. */

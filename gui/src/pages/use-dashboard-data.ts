@@ -19,6 +19,7 @@ import {
   fetchDashboardSidecars,
   fetchDashboardUsage,
   fetchProjectConfigDiagnostics,
+  fetchRoutingAnalytics,
   fetchStartupHealth,
   normalizeInjectionSelection,
   type DashboardEpochRefs,
@@ -271,6 +272,16 @@ export function useDashboardData(apiBase: string) {
     // 30d usage is documented ~5s cold; this shared key has four subscribers, so
     // every one of them carries the same raised deadline (mount-order independent).
     { enabled: overviewReady, deadlineMs: 60_000 },
+  );
+
+  const quotaAnalyticsPoll = useKeyedClientResource(
+    `dashboard-routing-analytics:${apiBase}`,
+    [apiBase, selectedSection],
+    (signal) => fetchRoutingAnalytics(apiBase, signal, {
+      range: "30d",
+      limit: 5_000,
+    }),
+    { enabled: selectedSection === "overview", pollMs: 60_000, deadlineMs: 60_000 },
   );
 
   const diagnosticsPoll = useKeyedClientResource(
@@ -774,6 +785,9 @@ export function useDashboardData(apiBase: string) {
     modelQuery, setModelQuery,
     expandedProviders, setExpandedProviders,
     health, startupHealth, providers, models, settings, sidecar, shadowCall, usage30d,
+    quotaAnalytics: quotaAnalyticsPoll.data ?? null,
+    quotaAnalyticsLoading: quotaAnalyticsPoll.loading && quotaAnalyticsPoll.data === undefined,
+    quotaAnalyticsError: quotaAnalyticsPoll.error !== undefined && !quotaAnalyticsPoll.lastAttemptOk,
     usageLoading: usagePoll.loading && !usage30d,
     healthLoading: overviewPoll.loading && !health,
     sidecarSaving, shadowCallSaving, modelsLoading, settingsSaving, syncing,

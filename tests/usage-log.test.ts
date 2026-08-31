@@ -53,6 +53,25 @@ describe("usage log", () => {
     expect(normalized.attempts).toEqual([]);
   });
 
+  test("preserves only literal-true combo target advances", () => {
+    const entry: PersistedUsageEntry = {
+      requestId: "ocx-combo-target-advance",
+      timestamp: 1,
+      provider: "combo",
+      model: "combo/test",
+      status: 200,
+      durationMs: 1,
+      usageStatus: "unreported",
+      comboTargetAdvanced: true,
+    };
+
+    expect(normalizeUsageEntryForTest(entry).comboTargetAdvanced).toBe(true);
+    expect(normalizeUsageEntryForTest({
+      ...entry,
+      comboTargetAdvanced: false,
+    } as unknown as PersistedUsageEntry).comboTargetAdvanced).toBeUndefined();
+  });
+
   test("preserves only valid non-PII Codex account log labels", () => {
     const normalized = normalizeUsageEntryForTest({
       requestId: "ocx-account-label",

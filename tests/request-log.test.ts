@@ -22,6 +22,7 @@ import {
   recordFirstOutput,
   requestLogEntryFromPersistedUsage,
   sealRequestAttemptIdentity,
+  transitionRequestAttempt,
   type RequestLogContext,
 } from "../src/server/request-log";
 import { handleResponses } from "../src/server/responses";
@@ -355,49 +356,144 @@ describe("request log metadata", () => {
     }
   });
 
-  test("records ordered attempts with sealed identity, fresh estimates, and deduplicated recoveries", () => {
+  test("keeps sent attempt identity immutable and splits physical account changes", () => {
     const a = beginRequestAttempt(1, "provisional-a", "model-a", "openai-chat");
+    sealRequestAttemptIdentity(a, "chatgpt-pabcdef", "openai-responses", "pabcdef");
+    expect(a).toMatchObject({
+      provider: "chatgpt-pabcdef",
+      accountLogLabel: "pabcdef",
+      adapter: "openai-responses",
+    });
     noteAttemptSend(a, 100);
     noteAttemptSend(a, 120, "transient-5xx");
     noteAttemptSend(a, 120, "transient-5xx");
-    sealRequestAttemptIdentity(a, "chatgpt-pabcdef", "openai-responses", "pabcdef");
-    finishRequestAttempt(a, 503, 12);
+    a.usage = { inputTokens: 7, outputTokens: 1 };
+    sealRequestAttemptIdentity(a, "chatgpt-p123456", "openai-chat", "p123456");
+    expect(a).toMatchObject({
+      provider: "chatgpt-pabcdef",
+      accountLogLabel: "pabcdef",
+      adapter: "openai-responses",
+    });
 
-    const b = beginRequestAttempt(2, "prov-b", "model-b", "openai-chat");
+    const logCtx: RequestLogContext = {
+      model: "model-a",
+      provider: "chatgpt-p123456",
+      accountLogLabel: "p123456",
+      attempts: [a],
+      activeAttempt: a,
+      activeAttemptStartedAt: 100,
+      usage: { inputTokens: 7, outputTokens: 1 },
+      usageFromBridge: true,
+    };
+    expect(transitionRequestAttempt(logCtx, {
+      provider: "chatgpt-pabcdef",
+      model: "model-a",
+      adapter: "openai-responses",
+      accountLogLabel: "pabcdef",
+    }, 429, 110)).toBe(a);
+
+    const b = transitionRequestAttempt(logCtx, {
+      provider: "chatgpt-p123456",
+      model: "model-a",
+      adapter: "openai-responses",
+      accountLogLabel: "p123456",
+    }, 429, 112);
+    expect(a).toMatchObject({
+      ordinal: 1,
+      status: 429,
+      durationMs: 12,
+      sendCount: 3,
+      inputTokenEstimate: 120,
+      recoveryKinds: ["transient-5xx"],
+      recoveryCount: 2,
+      usageStatus: "estimated",
+      usage: { inputTokens: 120, outputTokens: 1, estimated: true },
+      totalTokens: 121,
+      errorCode: "rate_limit_exceeded",
+    });
+    expect(b).toMatchObject({
+      ordinal: 2,
+      provider: "chatgpt-p123456",
+      model: "model-a",
+      adapter: "openai-responses",
+      accountLogLabel: "p123456",
+      sendCount: 0,
+    });
+    expect(logCtx).toMatchObject({
+      activeAttempt: b,
+      activeAttemptStartedAt: 112,
+      attempts: [a, b],
+    });
+    expect(logCtx.usage).toBeUndefined();
+    expect(logCtx.usageFromBridge).toBeUndefined();
+
     noteAttemptSend(b, undefined);
     finishRequestAttempt(b, 200, 8, {
       inputTokens: 10,
       outputTokens: 2,
-      cachedInputTokens: 4,
+      cachedInputTokens: 9,
       cacheReadInputTokens: 4,
     });
-
-    expect(a).toMatchObject({
-      ordinal: 1,
-      provider: "chatgpt-pabcdef",
-      accountLogLabel: "pabcdef",
-      adapter: "openai-responses",
-      status: 503,
-      sendCount: 3,
-      inputTokenEstimate: 120,
-      recoveryKinds: ["transient-5xx"],
-      usageStatus: "estimated",
-      usage: { inputTokens: 120, outputTokens: 0, estimated: true },
-      totalTokens: 120,
-      errorCode: "server_is_overloaded",
-    });
-    expect(b).toMatchObject({ status: 200, sendCount: 1, usageStatus: "reported", totalTokens: 12 });
-
     expect(aggregateAttemptUsage([a, b])).toEqual({
       status: "estimated",
-      totalTokens: 132,
+      totalTokens: 133,
       usage: {
         inputTokens: 130,
-        outputTokens: 2,
-        totalTokens: 132,
+        outputTokens: 3,
+        totalTokens: 133,
         cachedInputTokens: 4,
         cacheReadInputTokens: 4,
         estimated: true,
+      },
+    });
+  });
+
+  test("updates provisional attempt identity and clears stale account label", () => {
+    const attempt = beginRequestAttempt(4, "old", "old-model", "openai-chat");
+    attempt.accountLogLabel = "pold";
+    const logCtx: RequestLogContext = {
+      model: "new-model",
+      provider: "new",
+      attempts: [attempt],
+      activeAttempt: attempt,
+      activeAttemptStartedAt: 1,
+    };
+
+    expect(transitionRequestAttempt(logCtx, {
+      provider: "new",
+      model: "new-model",
+      adapter: "anthropic",
+    }, 0, 2)).toBe(attempt);
+    expect(attempt).toMatchObject({
+      ordinal: 4,
+      provider: "new",
+      model: "new-model",
+      adapter: "anthropic",
+      sendCount: 0,
+    });
+    expect(attempt.accountLogLabel).toBeUndefined();
+    expect(logCtx.attempts).toEqual([attempt]);
+  });
+
+  test("keeps context total as one absolute checkpoint across attempts", () => {
+    const first = finishRequestAttempt(
+      beginRequestAttempt(1, "a", "m1", "anthropic"),
+      429,
+      1,
+      { inputTokens: 10, outputTokens: 1, contextTotalTokens: 90 },
+    );
+    const second = finishRequestAttempt(
+      beginRequestAttempt(2, "a", "m1", "anthropic"),
+      200,
+      1,
+      { inputTokens: 12, outputTokens: 2, contextTotalTokens: 80 },
+    );
+
+    expect(aggregateAttemptUsage([first, second])).toMatchObject({
+      usage: {
+        inputTokens: 22,
+        outputTokens: 3,
+        contextTotalTokens: 90,
       },
     });
   });
@@ -505,6 +601,46 @@ describe("request log metadata", () => {
           reasoningWireField: "reasoning_effort",
           reasoningWireValue: "high",
         },
+      ],
+    });
+  });
+
+  test("final non-combo logging aggregates every explicit physical attempt", () => {
+    const entries: RequestLogEntry[] = [];
+    const first = finishRequestAttempt(
+      beginRequestAttempt(1, "a", "model-a", "openai-chat"),
+      503,
+      3,
+      { inputTokens: 4, outputTokens: 1, cacheReadInputTokens: 2 },
+    );
+    const final = beginRequestAttempt(2, "b", "model-b", "openai-chat");
+    noteAttemptSend(final, undefined);
+    const start = Date.now();
+    addFinalRequestLog("policy-parent", start, {
+      model: "policy/fast",
+      provider: "policy",
+      requestedModel: "policy/fast",
+      providerAdapter: "openai-chat",
+      usage: { inputTokens: 10, outputTokens: 2, cachedInputTokens: 7 },
+      attempts: [first, final],
+      activeAttempt: final,
+      activeAttemptStartedAt: start,
+    }, 200, undefined, entry => entries.push(entry));
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      provider: "policy",
+      model: "policy/fast",
+      usageStatus: "reported",
+      usage: {
+        inputTokens: 14,
+        outputTokens: 3,
+        cachedInputTokens: 9,
+        cacheReadInputTokens: 9,
+      },
+      attempts: [
+        { provider: "a", usage: { inputTokens: 4, cacheReadInputTokens: 2 } },
+        { provider: "b", usage: { inputTokens: 10, cachedInputTokens: 7 } },
       ],
     });
   });

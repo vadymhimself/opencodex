@@ -101,7 +101,11 @@ type AttemptRecoveryKind =
   | "key-429"
   | "rate-limit-429"
   | "anthropic-oauth-429"
+  | "oauth-account-429"
+  | "codex-account-retry"
+  | "adapter-retry"
   | "image-413"
+  | "opaque-blob-rejection"
   | "empty-completion";
 
 interface LogAttempt {
@@ -285,7 +289,11 @@ const RECOVERY_KIND_KEYS = {
   "key-429": "logs.detail.attempt.recovery.key429",
   "rate-limit-429": "logs.detail.attempt.recovery.rateLimit429",
   "anthropic-oauth-429": "logs.detail.attempt.recovery.anthropicOauth429",
+  "oauth-account-429": "logs.detail.attempt.recovery.oauthAccount429",
+  "codex-account-retry": "logs.detail.attempt.recovery.codexAccountRetry",
+  "adapter-retry": "logs.detail.attempt.recovery.adapterRetry",
   "image-413": "logs.detail.attempt.recovery.image413",
+  "opaque-blob-rejection": "logs.detail.attempt.recovery.opaqueBlobRejection",
   "empty-completion": "logs.detail.attempt.recovery.emptyCompletion",
 } as const satisfies Record<AttemptRecoveryKind, string>;
 
