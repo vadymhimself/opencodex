@@ -22,6 +22,7 @@ const TERMINAL_EVENTS = new Set([
   "response.completed",
   "response.failed",
   "response.incomplete",
+  "error",
 ]);
 
 /**
@@ -77,13 +78,16 @@ function failedTerminalResponse(
     ? nested as Record<string, unknown>
     : {};
   const nestedError = terminalResponse.error;
-  const error = nestedError && typeof nestedError === "object" && !Array.isArray(nestedError)
-    ? nestedError as Record<string, unknown>
-    : {
-      type: "upstream_error",
-      code: "upstream_server_error",
-      message: logCtx.upstreamError ?? "Provider stream failed before producing output",
-    };
+  const rootError = terminalPayload.error;
+  const error = rootError && typeof rootError === "object" && !Array.isArray(rootError)
+    ? rootError as Record<string, unknown>
+    : nestedError && typeof nestedError === "object" && !Array.isArray(nestedError)
+      ? nestedError as Record<string, unknown>
+      : {
+          type: "upstream_error",
+          code: "upstream_server_error",
+          message: logCtx.upstreamError ?? "Provider stream failed before producing output",
+        };
   const headers = new Headers(response.headers);
   headers.set("content-type", "application/json");
   headers.delete("content-length");
@@ -134,8 +138,10 @@ export async function preflightComboStreamResponse(
     onParsedPayload: payload => {
       if (comboStreamPayloadCommitsOutput(payload)) outputCommitted = true;
       if (!payload || typeof payload !== "object" || Array.isArray(payload)) return;
-      if ((payload as { type?: unknown }).type === "response.failed") {
+      const type = (payload as { type?: unknown }).type;
+      if (type === "response.failed" || type === "error") {
         failedPayload = payload as Record<string, unknown>;
+        if (type === "error") terminalStatus = "failed";
       }
     },
     onTerminal: status => { terminalStatus = status; },

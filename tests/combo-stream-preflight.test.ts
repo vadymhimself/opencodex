@@ -18,6 +18,7 @@ describe("combo stream preflight", () => {
     expect(comboStreamPayloadCommitsOutput({ type: "response.created" })).toBe(false);
     expect(comboStreamPayloadCommitsOutput({ type: "response.heartbeat" })).toBe(false);
     expect(comboStreamPayloadCommitsOutput({ type: "response.failed" })).toBe(false);
+    expect(comboStreamPayloadCommitsOutput({ type: "error" })).toBe(false);
     expect(comboStreamPayloadCommitsOutput({ type: "response.output_text.delta", delta: "x" })).toBe(true);
     expect(comboStreamPayloadCommitsOutput({ type: "response.output_item.added", item: { type: "function_call" } })).toBe(true);
     expect(comboStreamPayloadCommitsOutput({ type: "provider.future_event" })).toBe(true);
@@ -47,6 +48,40 @@ describe("combo stream preflight", () => {
       response: { usage: { input_tokens: 7, output_tokens: 0 } },
     });
     expect(JSON.stringify(body)).not.toContain("provider_trace_id");
+  });
+
+  test("converts a zero-output top-level error into a retryable HTTP failure", async () => {
+    const logCtx: RequestLogContext = { model: "m1", provider: "a" };
+    const result = await preflightComboStreamResponse(sse(
+      { type: "response.created", response: { id: "r1", status: "in_progress" } },
+      {
+        type: "error",
+        error: {
+          type: "invalid_request_error",
+          code: "unsupported_parameter",
+          message: "Unsupported parameter: user",
+        },
+      },
+    ), logCtx);
+
+    expect(result.kind).toBe("failed");
+    expect(result.response.status).toBe(502);
+    const body = await result.response.json();
+    expect(body).toEqual({
+      error: {
+        type: "invalid_request_error",
+        code: "unsupported_parameter",
+        message: "Unsupported parameter: user",
+      },
+      response: {
+        error: {
+          type: "invalid_request_error",
+          code: "unsupported_parameter",
+          message: "Unsupported parameter: user",
+        },
+      },
+    });
+    expect(logCtx.upstreamError).toBe("Unsupported parameter: user");
   });
 
   test("replays buffered bytes unchanged after output commits the target", async () => {
