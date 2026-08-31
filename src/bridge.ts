@@ -97,7 +97,22 @@ function responsesUsage(usage: OcxUsage | undefined): Record<string, unknown> {
   }
   out.input_tokens_details = inputDetails;
   out.output_tokens_details = { reasoning_tokens: usage.reasoningOutputTokens ?? 0 };
+  if (usage.anthropicServerToolUse) {
+    out.anthropic_server_tool_use = usage.anthropicServerToolUse;
+  }
   return out;
+}
+
+function anthropicTerminalMetadata(
+  event: Extract<AdapterEvent, { type: "done" }>,
+): Record<string, unknown> {
+  if (!event.anthropicStopReason) return {};
+  return {
+    _ocx_anthropic_stop_reason: event.anthropicStopReason,
+    ...(event.anthropicStopSequence !== undefined
+      ? { _ocx_anthropic_stop_sequence: event.anthropicStopSequence }
+      : {}),
+  };
 }
 
 function responseError(status: number, type: string, message: string): OcxErrorPayload {
@@ -435,7 +450,15 @@ export function bridgeToResponsesSSE(
       const stallSec = resolveStallTimeoutSec(options?.stallTimeoutSec);
       const maxStallTicks = Math.ceil((stallSec * 1000) / heartbeatMs);
 
-      let currentMsg: { itemId: string; outputIndex: number; text: string; textBytes: number; phase?: OcxMessagePhase } | null = null;
+      let currentMsg: {
+        itemId: string;
+        outputIndex: number;
+        text: string;
+        textBytes: number;
+        citationDeltas: Record<string, unknown>[];
+        citationBytes: number;
+        phase?: OcxMessagePhase;
+      } | null = null;
       let currentReasoning: { itemId: string; outputIndex: number; text: string; textBytes: number } | null = null;
       let currentRawReasoning: { itemId: string; outputIndex: number; text: string; textBytes: number } | null = null;
       // Anthropic extended-thinking round-trip state: the signature signs the CURRENT thinking
@@ -539,7 +562,12 @@ export function bridgeToResponsesSSE(
       let currentToolCall: { itemId: string; outputIndex: number; callId: string; name: string; args: string; argsBytes: number; namespace?: string; freeform?: boolean; toolSearch?: boolean; inputEmitted?: string; codeModeHelperName?: string; providerMetadata?: OcxProviderOpaqueToolCallMetadata } | null = null;
       // Open native web-search cell (between begin and end). Holds the output index allocated on
       // begin so the matching done reuses it; closed as `failed` if the stream terminates early.
-      let currentWebSearch: { itemId: string; eventId: string; outputIndex: number } | null = null;
+      let currentWebSearch: {
+        itemId: string;
+        eventId: string;
+        outputIndex: number;
+        anthropicServerTool?: Record<string, unknown>;
+      } | null = null;
       // Sources from completed web searches, awaiting the next assistant message. Attached as
       // url_citation annotations on that message (the desktop app's Sources chip), then cleared so
       // they bind to exactly one message. Deduped by URL across multiple searches in the turn.
@@ -563,6 +591,31 @@ export function bridgeToResponsesSSE(
         return anns;
       };
 
+      const ensureCurrentMessage = (phase?: OcxMessagePhase) => {
+        if (currentMsg) return currentMsg;
+        const itemId = `msg_${uuid()}`;
+        const item = {
+          type: "message", id: itemId, status: "in_progress", role: "assistant",
+          content: [] as { type: string; text: string; annotations: never[] }[],
+          ...(phase ? { phase } : {}),
+        };
+        emit("response.output_item.added", { output_index: outputIndex, item });
+        emit("response.content_part.added", {
+          item_id: itemId, output_index: outputIndex, content_index: 0,
+          part: { type: "output_text", text: "", annotations: [] },
+        });
+        currentMsg = {
+          itemId,
+          outputIndex,
+          text: "",
+          textBytes: 0,
+          citationDeltas: [],
+          citationBytes: 0,
+          ...(phase ? { phase } : {}),
+        };
+        return currentMsg;
+      };
+
       const closeCurrentMessage = (inferredPhase?: OcxMessagePhase) => {
         if (!currentMsg) return;
         // Chat Completions has no message-phase field. Keep its live item provisional, then
@@ -571,6 +624,15 @@ export function bridgeToResponsesSSE(
         const phase = currentMsg.phase ?? inferredPhase;
         // Bind any pending web-search citations to this assistant message (then they clear).
         const annotations = takeWebAnnotations();
+        const citationMetadata = currentMsg.citationDeltas.length > 0
+          ? { _ocx_anthropic_citation_deltas: currentMsg.citationDeltas }
+          : {};
+        const part = {
+          type: "output_text",
+          text: currentMsg.text,
+          annotations,
+          ...citationMetadata,
+        };
         // Finalize the text part (Responses protocol). Without these .done events Codex never
         // commits the content part and renders the message as truncated / cut off.
         emit("response.output_text.done", {
@@ -578,15 +640,18 @@ export function bridgeToResponsesSSE(
         });
         emit("response.content_part.done", {
           item_id: currentMsg.itemId, output_index: currentMsg.outputIndex, content_index: 0,
-          part: { type: "output_text", text: currentMsg.text, annotations },
+          part,
         });
         const item = {
           type: "message", id: currentMsg.itemId, status: "completed", role: "assistant",
-          content: [{ type: "output_text", text: currentMsg.text, annotations }],
+          content: [part],
           ...(phase ? { phase } : {}),
         };
         emit("response.output_item.done", { output_index: currentMsg.outputIndex, item });
-        retainFinishedItem(item as OutputItem, currentMsg.textBytes + bytesOf(JSON.stringify(annotations)));
+        retainFinishedItem(
+          item as OutputItem,
+          currentMsg.textBytes + bytesOf(JSON.stringify(annotations)) + currentMsg.citationBytes,
+        );
         outputIndex++;
         currentMsg = null;
       };
@@ -742,12 +807,23 @@ export function bridgeToResponsesSSE(
       // leaves a "Searching the web" spinner spinning forever.
       // `sources` rides on the done item (additive field; codex-rs serde ignores unknown fields) so
       // downstream translators (claude outbound) can fill web_search_tool_result content.
-      const closeCurrentWebSearch = (status: "completed" | "failed", queries: string[], sources?: { url: string; title?: string }[]) => {
+      const closeCurrentWebSearch = (
+        status: "completed" | "failed",
+        queries: string[],
+        sources?: { url: string; title?: string }[],
+        anthropicServerToolResult?: Record<string, unknown>,
+      ) => {
         if (!currentWebSearch) return;
         const item = {
           type: "web_search_call", id: currentWebSearch.itemId, status,
           action: webSearchAction(queries),
           ...(sources && sources.length > 0 ? { sources } : {}),
+          ...(currentWebSearch.anthropicServerTool
+            ? { _ocx_anthropic_server_tool: currentWebSearch.anthropicServerTool }
+            : {}),
+          ...(anthropicServerToolResult
+            ? { _ocx_anthropic_server_tool_result: anthropicServerToolResult }
+            : {}),
         };
         emit("response.output_item.done", { output_index: currentWebSearch.outputIndex, item });
         retainFinishedItem(item as OutputItem);
@@ -924,29 +1000,41 @@ export function bridgeToResponsesSSE(
               if (currentMsg && event.phase !== undefined && currentMsg.phase !== event.phase) {
                 closeCurrentMessage("commentary");
               }
-              if (!currentMsg) {
-                const itemId = `msg_${uuid()}`;
-                const item = {
-                  type: "message", id: itemId, status: "in_progress", role: "assistant",
-                  content: [] as { type: string; text: string; annotations: never[] }[],
-                  ...(event.phase ? { phase: event.phase } : {}),
-                };
-                emit("response.output_item.added", { output_index: outputIndex, item });
-                emit("response.content_part.added", {
-                  item_id: itemId, output_index: outputIndex, content_index: 0,
-                  part: { type: "output_text", text: "", annotations: [] },
-                });
-                currentMsg = { itemId, outputIndex, text: "", textBytes: 0, ...(event.phase ? { phase: event.phase } : {}) };
-              }
-              ({ value: currentMsg.text, bytes: currentMsg.textBytes } = appendString(
-                currentMsg.text,
-                currentMsg.textBytes,
+              const message = ensureCurrentMessage(event.phase);
+              ({ value: message.text, bytes: message.textBytes } = appendString(
+                message.text,
+                message.textBytes,
                 event.text,
                 "retained_collectors",
               ));
               emit("response.output_text.delta", {
-                item_id: currentMsg.itemId, output_index: currentMsg.outputIndex,
+                item_id: message.itemId, output_index: message.outputIndex,
                 content_index: 0, delta: event.text,
+              });
+              break;
+            }
+            case "anthropic_citation_delta": {
+              if (currentReasoning) closeCurrentReasoning();
+              if (currentRawReasoning) closeCurrentRawReasoning();
+              flushHiddenRawReasoning();
+              rawReasoningForNextToolCall = "";
+              if (currentToolCall) closeCurrentToolCall();
+              const message = ensureCurrentMessage();
+              const nextDeltas = [
+                ...message.citationDeltas,
+                structuredClone(event.delta),
+              ];
+              const nextBytes = bytesOf(JSON.stringify(nextDeltas));
+              const reservation = budget.reserveTransient(nextBytes, { kind: "retained_collectors" });
+              reservation.commitRetained();
+              budget.releaseRetained(message.citationBytes, { kind: "retained_collectors" });
+              message.citationDeltas = nextDeltas;
+              message.citationBytes = nextBytes;
+              emit("response.anthropic_citation.delta", {
+                item_id: message.itemId,
+                output_index: message.outputIndex,
+                content_index: 0,
+                delta: nextDeltas.at(-1)!,
               });
               break;
             }
@@ -999,12 +1087,18 @@ export function bridgeToResponsesSSE(
               // Signature arrives at the end of the thinking block. With a visible reasoning item
               // open, closeCurrentReasoning attaches the envelope; hidden/suppressed blocks flush
               // an envelope-only reasoning item now.
-              if (!currentReasoning) flushHiddenReasoningEnvelope();
+              if (currentReasoning) closeCurrentReasoning();
+              else flushHiddenReasoningEnvelope();
               break;
             }
             case "redacted_thinking": {
+              // A redacted block is its own Anthropic content block. Flush preceding thinking first,
+              // then retain this block in a separate envelope-only item so wire order survives.
+              if (currentReasoning) closeCurrentReasoning();
+              flushHiddenReasoningEnvelope();
               budget?.chargeRetained(bytesOf(event.data), { kind: "reasoning" });
               pendingRedacted.push(event.data);
+              flushHiddenReasoningEnvelope();
               break;
             }
             case "kiro_redacted_reasoning": {
@@ -1174,7 +1268,14 @@ export function bridgeToResponsesSSE(
                 output_index: outputIndex,
                 item: { type: "web_search_call", id: wsItemId, status: "in_progress" },
               });
-              currentWebSearch = { itemId: wsItemId, eventId: event.id, outputIndex };
+              currentWebSearch = {
+                itemId: wsItemId,
+                eventId: event.id,
+                outputIndex,
+                ...(event.anthropicServerTool
+                  ? { anthropicServerTool: event.anthropicServerTool }
+                  : {}),
+              };
               break;
             }
             case "web_search_call_end": {
@@ -1190,7 +1291,12 @@ export function bridgeToResponsesSSE(
                 currentWebSearch = { itemId: wsItemId2, eventId: event.id, outputIndex };
               }
               const safeSources = safeWebSearchSources(event.sources);
-              closeCurrentWebSearch(event.status ?? "completed", event.queries, safeSources);
+              closeCurrentWebSearch(
+                event.status ?? "completed",
+                event.queries,
+                safeSources,
+                event.anthropicServerToolResult,
+              );
               // Queue this search's sources for the next assistant message (dedup by URL).
               if (safeSources.length > 0) {
                 for (const source of safeSources) {
@@ -1199,6 +1305,24 @@ export function bridgeToResponsesSSE(
                   }
                 }
               }
+              break;
+            }
+            case "anthropic_server_block": {
+              if (currentMsg) closeCurrentMessage("commentary");
+              if (currentReasoning) closeCurrentReasoning();
+              if (currentRawReasoning) closeCurrentRawReasoning();
+              flushHiddenRawReasoning();
+              if (currentToolCall) closeCurrentToolCall();
+              if (currentWebSearch) closeCurrentWebSearch("completed", []);
+              const item = {
+                type: "anthropic_server_block",
+                id: `asb_${uuid()}`,
+                block: event.block,
+              };
+              emit("response.output_item.added", { output_index: outputIndex, item });
+              emit("response.output_item.done", { output_index: outputIndex, item });
+              retainFinishedItem(item as OutputItem);
+              outputIndex++;
               break;
             }
             case "done": {
@@ -1241,6 +1365,7 @@ export function bridgeToResponsesSSE(
                 await awaitThoughtSignatureDurability();
                 const response = {
                   ...responseSnapshot("incomplete", finishedItems, event.endTurn),
+                  ...anthropicTerminalMetadata(event),
                   usage: responsesUsage(event.usage),
                   incomplete_details: {
                     reason: truncationReasonFor(event.stopReason) ?? "content_filter",
@@ -1254,7 +1379,11 @@ export function bridgeToResponsesSSE(
                 reportTerminal("incomplete");
               } else {
                 await awaitThoughtSignatureDurability();
-                const response = { ...responseSnapshot("completed", finishedItems, event.endTurn), usage: responsesUsage(event.usage) };
+                const response = {
+                  ...responseSnapshot("completed", finishedItems, event.endTurn),
+                  ...anthropicTerminalMetadata(event),
+                  usage: responsesUsage(event.usage),
+                };
                 options?.onCompletedResponse?.(response, event.providerState);
                 options?.onUsage?.(event.usage);
                 emit("response.completed", {
@@ -1567,6 +1696,8 @@ function buildResponseJSONWithBudget(
   // to the two reasons that map onto a Responses `incomplete_details`; the raw value is what the
   // truncation guard needs, because adapters disagree on vocabulary (`length`, `refusal`, ...).
   let rawStopReason: string | undefined;
+  let anthropicStopReason: string | undefined;
+  let anthropicStopSequence: string | null | undefined;
   let cleanDone = false;
   // Whether the adapter emitted ANY terminal (done/error/incomplete). Distinct from `cleanDone`,
   // which is only true for a `done` without a stop reason. A buffered turn whose adapter simply
@@ -1577,6 +1708,8 @@ function buildResponseJSONWithBudget(
 
   let currentText = "";
   let currentTextBytes = 0;
+  let currentCitationDeltas: Record<string, unknown>[] = [];
+  let currentCitationBytes = 0;
   let currentTextPhase: OcxMessagePhase | undefined;
   let currentSummaryReasoning = "";
   let currentSummaryReasoningBytes = 0;
@@ -1588,8 +1721,6 @@ function buildResponseJSONWithBudget(
   // Anthropic extended-thinking round-trip (batch): see bridgeToResponsesSSE counterpart.
   let batchSignature: string | undefined;
   let batchSignatureBytes = 0;
-  let batchRedacted: string[] = [];
-  let batchRedactedBytes = 0;
   // Kiro reasoning blob, held until after the trailing flushes so it lands AFTER the assistant
   // message (see the streaming path). Retained because it outlives releaseTranslatedEvent.
   let batchKiroRedacted: string | undefined;
@@ -1602,6 +1733,7 @@ function buildResponseJSONWithBudget(
   let currentToolCallArgsBytes = 0;
   // Web-search citations awaiting the next assistant message (attached as url_citation annotations).
   let pendingWebSources: { url: string; title?: string }[] = [];
+  const pendingAnthropicWebSearchTools = new Map<string, Record<string, unknown>>();
 
   const freeformInput = (
     args: string,
@@ -1616,7 +1748,7 @@ function buildResponseJSONWithBudget(
   };
 
   const flushText = (inferredPhase?: OcxMessagePhase) => {
-    if (!currentText) return;
+    if (!currentText && currentCitationDeltas.length === 0) return;
     const phase = currentTextPhase ?? inferredPhase;
     const sourceBytes = pendingWebSources.reduce((sum, source) => sum + bytesOf(JSON.stringify(source)), 0);
     const annotations = pendingWebSources.map(s => ({
@@ -1625,28 +1757,34 @@ function buildResponseJSONWithBudget(
     pendingWebSources = [];
     const item = {
       type: "message", id: `msg_${uuid()}`, role: "assistant", status: "completed",
-      content: [{ type: "output_text", text: currentText, annotations }],
+      content: [{
+        type: "output_text",
+        text: currentText,
+        annotations,
+        ...(currentCitationDeltas.length > 0
+          ? { _ocx_anthropic_citation_deltas: currentCitationDeltas }
+          : {}),
+      }],
       ...(phase ? { phase } : {}),
     } as OutputItem;
-    pushOutput(item, currentTextBytes);
+    pushOutput(item, currentTextBytes + currentCitationBytes);
     budget?.releaseRetained(sourceBytes, { kind: "tool_search_sources" });
     currentText = "";
     currentTextBytes = 0;
+    currentCitationDeltas = [];
+    currentCitationBytes = 0;
     currentTextPhase = undefined;
   };
   const flushSummaryReasoning = () => {
-    if (!currentSummaryReasoning && !batchSignature && batchRedacted.length === 0) return;
+    if (!currentSummaryReasoning && !batchSignature) return;
     const envelope: ReasoningEnvelope = {};
     if (batchSignature) envelope.sig = batchSignature;
-    if (batchRedacted.length > 0) envelope.red = batchRedacted;
     const hidden = options?.hideThinkingSummary === true;
-    if (hidden && currentSummaryReasoning && (envelope.sig || envelope.red)) envelope.txt = currentSummaryReasoning;
-    const encrypted = envelope.sig || envelope.red || envelope.txt ? encodeReasoningEnvelope(envelope) : undefined;
-    const sourceBytes = currentSummaryReasoningBytes + batchSignatureBytes + batchRedactedBytes;
+    if (hidden && currentSummaryReasoning && envelope.sig) envelope.txt = currentSummaryReasoning;
+    const encrypted = envelope.sig || envelope.txt ? encodeReasoningEnvelope(envelope) : undefined;
+    const sourceBytes = currentSummaryReasoningBytes + batchSignatureBytes;
     batchSignature = undefined;
     batchSignatureBytes = 0;
-    batchRedacted = [];
-    batchRedactedBytes = 0;
     if (hidden && !encrypted) {
       budget?.releaseRetained(sourceBytes, { kind: "reasoning" });
       currentSummaryReasoning = "";
@@ -1753,7 +1891,7 @@ function buildResponseJSONWithBudget(
       case "text_delta":
         // Only flush on an explicit phase change. A later delta that omits `phase` must keep
         // appending under the previously established phase.
-        if (currentText && e.phase !== undefined && currentTextPhase !== e.phase) flushText("commentary");
+        if ((currentText || currentCitationDeltas.length > 0) && e.phase !== undefined && currentTextPhase !== e.phase) flushText("commentary");
         if (currentSummaryReasoning) flushSummaryReasoning();
         if (currentRawReasoning) flushRawReasoning();
         // Empty text deltas (batch chat responses always carry content, often "") must
@@ -1774,8 +1912,22 @@ function buildResponseJSONWithBudget(
           ));
         }
         break;
+      case "anthropic_citation_delta": {
+        if (currentSummaryReasoning) flushSummaryReasoning();
+        if (currentRawReasoning) flushRawReasoning();
+        rawReasoningForNextToolCall = "";
+        if (currentToolCallId) flushToolCall();
+        const nextDeltas = [...currentCitationDeltas, structuredClone(e.delta)];
+        const nextBytes = bytesOf(JSON.stringify(nextDeltas));
+        const reservation = budget?.reserveTransient(nextBytes, { kind: "retained_collectors" });
+        reservation?.commitRetained();
+        budget?.releaseRetained(currentCitationBytes, { kind: "retained_collectors" });
+        currentCitationDeltas = nextDeltas;
+        currentCitationBytes = nextBytes;
+        break;
+      }
       case "thinking_delta":
-        if (currentText) flushText("commentary");
+        if (currentText || currentCitationDeltas.length > 0) flushText("commentary");
         if (currentRawReasoning) flushRawReasoning();
         if (e.thinking.length > 0) rawReasoningForNextToolCall = "";
         if (currentToolCallId) flushToolCall();
@@ -1792,14 +1944,20 @@ function buildResponseJSONWithBudget(
         batchSignature = e.signature;
         flushSummaryReasoning();
         break;
-      case "redacted_thinking":
-        {
-          const dataBytes = bytesOf(e.data);
-          budget?.chargeRetained(dataBytes, { kind: "reasoning" });
-          batchRedactedBytes += dataBytes;
-        }
-        batchRedacted.push(e.data);
+      case "redacted_thinking": {
+        // Redacted thinking is a distinct Anthropic block. Flush preceding thinking, then keep this
+        // payload in its own envelope item so buffered and streaming paths preserve identical order.
+        flushSummaryReasoning();
+        const dataBytes = bytesOf(e.data);
+        budget?.chargeRetained(dataBytes, { kind: "reasoning" });
+        pushOutput({
+          type: "reasoning",
+          id: `rs_${uuid()}`,
+          summary: [],
+          encrypted_content: encodeReasoningEnvelope({ red: [e.data] }),
+        }, dataBytes, "reasoning");
         break;
+      }
       case "kiro_redacted_reasoning":
         // Stash only — pushed after the trailing flushes. One blob per turn, so last wins.
         {
@@ -1811,7 +1969,7 @@ function buildResponseJSONWithBudget(
         batchKiroRedacted = e.data;
         break;
       case "reasoning_raw_delta":
-        if (currentText) flushText("commentary");
+        if (currentText || currentCitationDeltas.length > 0) flushText("commentary");
         if (currentSummaryReasoning) flushSummaryReasoning();
         if (currentToolCallId) flushToolCall();
         {
@@ -1821,7 +1979,7 @@ function buildResponseJSONWithBudget(
         }
         break;
       case "tool_call_start": {
-        if (currentText) flushText("commentary");
+        if (currentText || currentCitationDeltas.length > 0) flushText("commentary");
         if (currentSummaryReasoning) flushSummaryReasoning();
         if (currentRawReasoning) flushRawReasoning();
         if (rawReasoningForNextToolCall) {
@@ -1879,11 +2037,16 @@ function buildResponseJSONWithBudget(
         flushToolCall();
         break;
       case "web_search_call_begin":
-        // Batch/non-streaming output has no in_progress phase to animate — the search cell is a
-        // single finalized item, emitted on `end`. Begin is a no-op here.
+        // Batch output cannot animate in-progress state. Hold canonical Anthropic tool blocks until
+        // matching result so both raw blocks remain adjacent; unmatched pause_turn tools flush below.
+        if (currentText || currentCitationDeltas.length > 0) flushText("commentary");
+        if (currentSummaryReasoning) flushSummaryReasoning();
+        if (currentRawReasoning) flushRawReasoning();
+        flushToolCall();
+        if (e.anthropicServerTool) pendingAnthropicWebSearchTools.set(e.id, e.anthropicServerTool);
         break;
       case "web_search_call_end": {
-        if (currentText) flushText("commentary");
+        if (currentText || currentCitationDeltas.length > 0) flushText("commentary");
         if (currentSummaryReasoning) flushSummaryReasoning();
         if (currentRawReasoning) flushRawReasoning();
         flushToolCall();
@@ -1892,7 +2055,14 @@ function buildResponseJSONWithBudget(
           type: "web_search_call", id: `ws_${uuid()}`, status: e.status ?? "completed",
           action: webSearchAction(e.queries),
           ...(safeSources.length > 0 ? { sources: safeSources } : {}),
+          ...(pendingAnthropicWebSearchTools.get(e.id)
+            ? { _ocx_anthropic_server_tool: pendingAnthropicWebSearchTools.get(e.id) }
+            : {}),
+          ...(e.anthropicServerToolResult
+            ? { _ocx_anthropic_server_tool_result: e.anthropicServerToolResult }
+            : {}),
         });
+        pendingAnthropicWebSearchTools.delete(e.id);
         if (safeSources.length > 0) {
           for (const source of safeSources) {
             if (appendSafeWebSearchSource(pendingWebSources, source)) {
@@ -1902,6 +2072,17 @@ function buildResponseJSONWithBudget(
         }
         break;
       }
+      case "anthropic_server_block":
+        if (currentText || currentCitationDeltas.length > 0) flushText("commentary");
+        if (currentSummaryReasoning) flushSummaryReasoning();
+        if (currentRawReasoning) flushRawReasoning();
+        flushToolCall();
+        pushOutput({
+          type: "anthropic_server_block",
+          id: `asb_${uuid()}`,
+          block: e.block,
+        });
+        break;
       case "error":
         errorEvent = e;
         sawTerminal = true;
@@ -1919,6 +2100,8 @@ function buildResponseJSONWithBudget(
         endTurn = e.endTurn;
         cleanDone = e.stopReason === undefined;
         rawStopReason = e.stopReason;
+        anthropicStopReason = e.anthropicStopReason;
+        anthropicStopSequence = e.anthropicStopSequence;
         if (e.providerState) options?.onProviderState?.(e.providerState);
         // Match streaming: max_tokens and content_filter both terminate as incomplete.
         // Normalize every adapter's truncation vocabulary to the canonical pair, so a raw
@@ -1945,6 +2128,16 @@ function buildResponseJSONWithBudget(
   // fell through to "completed", handing back a function_call whose arguments were half-written
   // JSON, inside a turn also marked completed.
   if (currentToolCallId) flushToolCall(errorEvent || incompleteEvent || !sawTerminal ? "incomplete" : "completed");
+  for (const block of pendingAnthropicWebSearchTools.values()) {
+    pushOutput({
+      type: "web_search_call",
+      id: `ws_${uuid()}`,
+      status: "completed",
+      action: webSearchAction([]),
+      _ocx_anthropic_server_tool: block,
+    });
+  }
+  pendingAnthropicWebSearchTools.clear();
   if (batchKiroRedacted) {
     // pushOutput reserves the item itself and releases the retained raw blob it replaces.
     pushOutput({
@@ -1989,6 +2182,14 @@ function buildResponseJSONWithBudget(
     status,
     model: modelId, output,
     ...(endTurn !== undefined ? { end_turn: endTurn } : {}),
+    ...(anthropicStopReason
+      ? {
+          _ocx_anthropic_stop_reason: anthropicStopReason,
+          ...(anthropicStopSequence !== undefined
+            ? { _ocx_anthropic_stop_sequence: anthropicStopSequence }
+            : {}),
+        }
+      : {}),
     ...(failure ? { error: failure.error, last_error: failure.error } : {}),
     ...(failure && isCyberPolicyCode(failure.error.code)
       ? { retryable: false }

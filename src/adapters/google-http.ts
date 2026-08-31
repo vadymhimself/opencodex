@@ -6,6 +6,7 @@ import {
   abortError,
   cancelResponseBodyBestEffort,
   fetchWithAttemptDeadline,
+  isConnectionResetError,
   retryBackoffDelayMs,
   sleepWithAbort,
 } from "../lib/upstream-retry";
@@ -65,6 +66,7 @@ export async function fetchGoogleWithRetry(
           compatibilityReplayUsed = true;
           activeRequest = { ...activeRequest, body: repairedBody };
           cancelResponseBodyBestEffort(res);
+          ctx.onRetry?.("adapter-retry");
           attempt--; // The changed-request replay is separate from transient retry accounting.
           continue;
         }
@@ -90,6 +92,7 @@ export async function fetchGoogleWithRetry(
         maxDelayMs: GOOGLE_RETRY_MAX_MS,
         headers: res.headers,
       }), ctx.abortSignal);
+      ctx.onRetry?.(res.status === 429 ? "rate-limit-429" : "transient-5xx");
     } catch (err) {
       if (ctx.abortSignal?.aborted) throw err;
       lastError = err;
@@ -98,6 +101,7 @@ export async function fetchGoogleWithRetry(
         baseDelayMs: GOOGLE_RETRY_BASE_MS,
         maxDelayMs: GOOGLE_RETRY_MAX_MS,
       }), ctx.abortSignal);
+      ctx.onRetry?.(isConnectionResetError(err) ? "connection-reset" : "adapter-retry");
     }
   }
   throw lastError ?? new Error(`${label} fetch failed`);

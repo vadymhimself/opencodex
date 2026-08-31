@@ -142,6 +142,23 @@ describe("Responses account usage attribution", () => {
       expect(bearers).toEqual(["Bearer pool-a-access-token", "Bearer pool-b-access-token"]);
       expect(logCtx.accountLogLabel).toBe(fallbackCodexAccountLogLabel("pool-b"));
       expect(logCtx.activeAttempt?.accountLogLabel).toBe(fallbackCodexAccountLogLabel("pool-b"));
+      expect(logCtx.attempts).toEqual([
+        expect.objectContaining({
+          ordinal: 1,
+          provider: expect.stringContaining(fallbackCodexAccountLogLabel("pool-a")),
+          accountLogLabel: fallbackCodexAccountLogLabel("pool-a"),
+          status: 429,
+          sendCount: 1,
+        }),
+        expect.objectContaining({
+          ordinal: 2,
+          provider: expect.stringContaining(fallbackCodexAccountLogLabel("pool-b")),
+          accountLogLabel: fallbackCodexAccountLogLabel("pool-b"),
+          sendCount: 1,
+          recoveryKinds: ["codex-account-retry"],
+          recoveryCount: 1,
+        }),
+      ]);
     });
   });
 });

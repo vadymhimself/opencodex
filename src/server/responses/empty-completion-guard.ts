@@ -129,6 +129,7 @@ export function isContentEvent(event: AdapterEvent): boolean {
     case "tool_call_end":
     case "web_search_call_begin":
     case "web_search_call_end":
+    case "anthropic_server_block":
       return true;
     default:
       return false;
@@ -173,6 +174,14 @@ export function mergeUsage(
   const cacheReadInputTokens = sumOptional("cacheReadInputTokens");
   const cacheCreationInputTokens = sumOptional("cacheCreationInputTokens");
   const reasoningOutputTokens = sumOptional("reasoningOutputTokens");
+  const anthropicServerToolUse: Record<string, number> = {};
+  for (const usage of [first, second]) {
+    for (const [name, value] of Object.entries(usage.anthropicServerToolUse ?? {})) {
+      if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+        anthropicServerToolUse[name] = (anthropicServerToolUse[name] ?? 0) + value;
+      }
+    }
+  }
   const contextTotalTokens = second.contextTotalTokens ?? first.contextTotalTokens;
   const inputTokens = first.inputTokens + second.inputTokens;
   const outputTokens = first.outputTokens + second.outputTokens;
@@ -185,6 +194,7 @@ export function mergeUsage(
     ...(cacheReadInputTokens !== undefined ? { cacheReadInputTokens } : {}),
     ...(cacheCreationInputTokens !== undefined ? { cacheCreationInputTokens } : {}),
     ...(reasoningOutputTokens !== undefined ? { reasoningOutputTokens } : {}),
+    ...(Object.keys(anthropicServerToolUse).length > 0 ? { anthropicServerToolUse } : {}),
     ...(first.estimated || second.estimated ? { estimated: true } : {}),
   };
 }

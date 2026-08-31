@@ -2404,6 +2404,16 @@ describe("server local API auth", () => {
         expect.objectContaining({ status: 400, authKind: "pool", credentialSubstituted: true }),
         expect.objectContaining({ status: 200, authKind: "pool", credentialSubstituted: true }),
       ]);
+      expect(getRequestLogEntries().at(-1)?.attempts).toMatchObject([
+        { ordinal: 1, status: 400, sendCount: 1 },
+        {
+          ordinal: 2,
+          status: 200,
+          sendCount: 1,
+          recoveryKinds: ["codex-account-retry"],
+          recoveryCount: 1,
+        },
+      ]);
     } finally {
       await stopPoolRetryHarness(harness);
     }
@@ -2535,6 +2545,13 @@ describe("server local API auth", () => {
       expect(response.status).toBe(200);
       expect((await response.json() as { id: string }).id).toBe("same-account-success");
       expect(harness.dispatches).toEqual(["acct-pool-a", "acct-pool-a", "acct-pool-a"]);
+      expect(getRequestLogEntries().at(-1)?.attempts).toMatchObject([{
+        ordinal: 1,
+        status: 200,
+        sendCount: 3,
+        recoveryKinds: ["codex-account-retry"],
+        recoveryCount: 2,
+      }]);
     } finally {
       await stopPoolRetryHarness(harness);
     }
@@ -2580,6 +2597,13 @@ describe("server local API auth", () => {
       expect(response.status).toBe(400);
       expect(await response.text()).toBe(body);
       expect(harness.dispatches).toEqual(Array(8).fill("acct-pool-a"));
+      expect(getRequestLogEntries().at(-1)?.attempts).toMatchObject([{
+        ordinal: 1,
+        status: 400,
+        sendCount: 8,
+        recoveryKinds: ["codex-account-retry"],
+        recoveryCount: 7,
+      }]);
     } finally {
       await stopPoolRetryHarness(harness);
     }

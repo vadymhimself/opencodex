@@ -30,6 +30,7 @@ import {
 import { awaitThoughtSignatureDurability, thoughtSignatureReplaySalt } from "../../responses/thought-signature-replay";
 import { buildCompactV1Output, COMPACT_PROMPT, decodeCompactionSummary, extractCompactUserMessages } from "../../responses/compaction";
 import { FORWARD_HEADERS, sanitizeReasoningInputContent } from "../../adapters/openai-responses";
+import { isExactCanonicalAnthropicMessagesUrl, anthropicMessagesUrl, canReplayAnthropicSource } from "../../adapters/anthropic";
 import { XaiToolSchemaCompatibilityError } from "../../adapters/xai-tool-schema";
 import {
   copyPreviousResponseReplayProvenance,
@@ -132,7 +133,7 @@ import {
 import { resolveCopilotApiBaseUrl } from "../../oauth/github-copilot";
 import { buildWebSearchTool, planWebSearch, runWithWebSearch, shouldResolveOpenAiWebSearchSidecar } from "../../web-search";
 import { buildImageTool, buildVideoTool, planImageBridge, planVideoBridge, runWithImageBridge, clampImageMaxRounds, IMAGE_GEN_TOOL_NAME, VIDEO_GEN_TOOL_NAME } from "../../images";
-import { describeImagesInPlace, isModelTextOnly, planVisionSidecar, resolveOpenAiVisionModel, shouldResolveOpenAiVisionSidecar, stripImagesInPlace } from "../../vision";
+import { describeImagesInPlace, isModelTextOnly, messagesHaveImage, planVisionSidecar, resolveOpenAiVisionModel, shouldResolveOpenAiVisionSidecar, stripImagesInPlace } from "../../vision";
 import { createAdapterEventQueue, preflightAdapterEvents, type AdapterEventQueue } from "../../adapters/run-turn-queue";
 import {
   applyCodexAuthContextToProvider,
@@ -221,7 +222,7 @@ import {
   providerModelResponsesUpstreamStreaming,
   type InboundWire,
 } from "../../providers/registry";
-import type { AdapterRequest, ProviderAdapter } from "../../adapters/base";
+import type { AdapterFetchContext, AdapterRequest, AnthropicMessagesSource, ProviderAdapter } from "../../adapters/base";
 import {
   hasKeyPoolFailover,
   rateLimitRetryDelayMs,
@@ -266,6 +267,7 @@ import {
   recordAttemptRequestedEffort,
   requestLogSpeedLabel,
   sealRequestAttemptIdentity,
+  transitionRequestAttempt,
   usageFromResponsesPayload,
   type RequestLogContext,
 } from "../request-log";
@@ -1183,8 +1185,6 @@ async function retryCodexPoolOnAlternateAccount(
     headers: retryHeaders,
     translatorBudget: options.translatorBudget,
   });
-  recordAdapterReasoning(logCtx, request);
-  recordAdapterTier(logCtx, request);
 
   await firstResponse.body?.cancel().catch(() => undefined);
   options.onCodexAuthContextResolved?.(retryAuthCtx);
@@ -1195,12 +1195,14 @@ async function retryCodexPoolOnAlternateAccount(
     config,
   );
   logCtx.accountLogLabel = codexAuthContextLogLabel(retryAuthCtx, config);
-  sealRequestAttemptIdentity(
-    logCtx.activeAttempt,
-    logCtx.provider,
-    retryAdapter.name,
-    logCtx.accountLogLabel,
-  );
+  transitionRequestAttempt(logCtx, {
+    provider: logCtx.provider,
+    model: route.modelId,
+    adapter: retryAdapter.name,
+    accountLogLabel: logCtx.accountLogLabel,
+  }, outcomeStatus);
+  recordAdapterReasoning(logCtx, request);
+  recordAdapterTier(logCtx, request);
 
   const retrySameConfirmedAccount = outcomeStatus === 400
     && ACCOUNT_GATED_NATIVE_OPENAI_MODELS.has(route.modelId)
@@ -1215,7 +1217,6 @@ async function retryCodexPoolOnAlternateAccount(
   let upstreamResponse: Response;
   try {
     while (true) {
-      noteAttemptSend(logCtx.activeAttempt, passthroughEstimate);
       try {
         upstreamResponse = await fetchWithHeaderTimeout(
           request.url,
@@ -1230,6 +1231,11 @@ async function retryCodexPoolOnAlternateAccount(
           providerFetch(route.provider, options.codexWsRuntimeIdentity, {
             providerName: route.providerName,
             modelId: route.modelId,
+            onDispatch: () => noteAttemptSend(
+              logCtx.activeAttempt,
+              passthroughEstimate,
+              "codex-account-retry",
+            ),
           }),
           // Credential-bearing forward send: never follow a redirect into a
           // dead-host rejection after the credential was seen (#914).
@@ -1431,6 +1437,8 @@ export interface HandleResponsesOptions {
    * it. Omitted means a genuine Responses inbound.
    */
   inboundWire?: InboundWire;
+  /** Validated Messages source, consumed only by exact canonical Anthropic adapter builds. */
+  anthropicMessagesSource?: AnthropicMessagesSource;
   /** Internal transport identity for route-scoped upstream compatibility policy. */
   inboundTransport?: "websocket";
   /**
@@ -2295,19 +2303,39 @@ export async function handleComboResponses(
       pick.target.model,
       config.providers[pick.target.provider]!.adapter,
     );
+    childLog.attempts = [attempt];
     childLog.activeAttempt = attempt;
-    let attemptRetained = false;
-    const retainCancelledAttempt = (): void => {
-      if (attemptRetained) return;
+    childLog.activeAttemptStartedAt = started;
+    let attemptsRetained = false;
+    const mergeChildAttempts = (): void => {
+      if (attemptsRetained) return;
+      const sentAttempts = (childLog.attempts ?? []).filter(candidate => candidate.sendCount > 0);
+      if (sentAttempts.length > 0) (logCtx.attempts ??= []).push(...sentAttempts);
+      attemptsRetained = true;
+    };
+    const finishActiveChildAttempt = (
+      status: number,
+      usage = childLog.usage,
+    ): void => {
+      const activeAttempt = childLog.activeAttempt;
+      if (!activeAttempt) return;
       sealRequestAttemptIdentity(
-        attempt,
+        activeAttempt,
         childLog.provider,
-        childLog.providerAdapter ?? attempt.adapter,
+        childLog.providerAdapter ?? activeAttempt.adapter,
         childLog.accountLogLabel,
       );
-      finishRequestAttempt(attempt, 499, Date.now() - started, childLog.usage);
-      (logCtx.attempts ??= []).push(attempt);
-      attemptRetained = true;
+      finishRequestAttempt(
+        activeAttempt,
+        status,
+        Date.now() - (childLog.activeAttemptStartedAt ?? started),
+        usage,
+      );
+    };
+    const retainCancelledAttempt = (): void => {
+      if (attemptsRetained) return;
+      finishActiveChildAttempt(499);
+      mergeChildAttempts();
     };
     let consumedChildFailure: ConsumedComboFailure | undefined;
     let storedPool401ReplayDispatched = false;
@@ -2329,8 +2357,12 @@ export async function handleComboResponses(
         // Attempt-relative TTFT is recorded HERE (not via childLog.firstOutputMs — a later
         // Object.assign(logCtx, childLog) would overwrite the request-relative value).
         onFirstOutput: () => {
-          if (attempt.firstOutputMs === undefined) {
-            attempt.firstOutputMs = Math.max(0, Date.now() - started);
+          const activeAttempt = childLog.activeAttempt;
+          if (activeAttempt && activeAttempt.firstOutputMs === undefined) {
+            activeAttempt.firstOutputMs = Math.max(
+              0,
+              Date.now() - (childLog.activeAttemptStartedAt ?? started),
+            );
           }
           options.onFirstOutput?.();
         },
@@ -2382,14 +2414,7 @@ export async function handleComboResponses(
     }
 
     if (response.ok) {
-      sealRequestAttemptIdentity(
-        attempt,
-        childLog.provider,
-        childLog.providerAdapter ?? attempt.adapter,
-        childLog.accountLogLabel,
-      );
-      (logCtx.attempts ??= []).push(attempt);
-      attemptRetained = true;
+      mergeChildAttempts();
       noteComboSuccess(comboId, combo, pick.target, pick.writerGeneration);
       Object.assign(logCtx, childLog, {
         requestedModel,
@@ -2398,8 +2423,6 @@ export async function handleComboResponses(
         comboId,
         routeDecision: logCtx.routeDecision,
         attempts: logCtx.attempts,
-        activeAttempt: attempt,
-        activeAttemptStartedAt: started,
         resolvedModel: childLog.resolvedModel ?? childLog.model,
       });
       options.onCodexAuthContextResolved?.(resolvedAuth);
@@ -2428,20 +2451,8 @@ export async function handleComboResponses(
       retainCancelledAttempt();
       return clientCancelledResponse();
     }
-    sealRequestAttemptIdentity(
-      attempt,
-      childLog.provider,
-      childLog.providerAdapter ?? attempt.adapter,
-      childLog.accountLogLabel,
-    );
-    finishRequestAttempt(
-      attempt,
-      failure.response.status,
-      Date.now() - started,
-      failure.usage,
-    );
-    (logCtx.attempts ??= []).push(attempt);
-    attemptRetained = true;
+    finishActiveChildAttempt(failure.response.status, failure.usage);
+    mergeChildAttempts();
     lastFailure = failure.response;
     if (storedPool401ReplayDispatched) {
       adoptFailedChildLog(childLog);
@@ -2461,7 +2472,8 @@ export async function handleComboResponses(
       now: Date.now(),
       eligible: payloadEligible,
     });
-    if (!nextPick) adoptFailedChildLog(childLog);
+    if (nextPick) logCtx.comboTargetAdvanced = true;
+    else adoptFailedChildLog(childLog);
     pick = nextPick;
   }
   return lastFailure!;
@@ -3214,7 +3226,7 @@ async function handleResponsesInner(
             return formatErrorResponse(
               429,
               "rate_limit_error",
-              "All Anthropic OAuth accounts are temporarily rate-limited",
+              "All Anthropic OAuth accounts are temporarily rate-limited. If an Agent call pinned this model, retry without the Agent `model` parameter to inherit parent/default routing and configured waterfall fallbacks, or choose a non-Anthropic subagent model.",
               retryAfterSec !== null ? { retryAfter: String(retryAfterSec) } : undefined,
             );
           }
@@ -3352,6 +3364,24 @@ async function handleResponsesInner(
     delete logCtx.accountLogLabel;
   }
   const adapter = resolveAdapter(adapterProvider, config.cacheRetention);
+  let anthropicMessagesSource = options.anthropicMessagesSource;
+  const canReplayCurrentAnthropicSource = (): boolean => adapter.name === "anthropic"
+    && anthropicMessagesSource !== undefined
+    && isExactCanonicalAnthropicMessagesUrl(anthropicMessagesUrl(adapterProvider.baseUrl))
+    && canReplayAnthropicSource(anthropicMessagesSource.body, route.modelId);
+  if (
+    anthropicMessagesSource?.requiresExactReplay
+    && (
+      !canReplayCurrentAnthropicSource()
+      || (isModelTextOnly(adapterProvider, route.modelId) && messagesHaveImage(parsed))
+    )
+  ) {
+    return formatErrorResponse(
+      400,
+      "invalid_request_error",
+      "Anthropic-native tools require exact canonical Anthropic Messages replay for this request.",
+    );
+  }
   bindRouteReasoningReplayScope({
     parsed,
     providerName: route.providerName,
@@ -3452,6 +3482,8 @@ async function handleResponsesInner(
     ? undefined
     : planVisionSidecar(config, route.provider, route.modelId, parsed, openAiSidecar);
   const recordSidecarOutcome = openAiSidecar?.recordOutcome;
+  const textOnlyRoute = isModelTextOnly(route.provider, route.modelId);
+  let visionMutatedRequest = false;
   if (visionPlan) {
     await describeImagesInPlace(
       parsed,
@@ -3461,11 +3493,15 @@ async function handleResponsesInner(
       recordSidecarOutcome,
       translatorBudget,
     );
-  } else if (isModelTextOnly(route.provider, route.modelId)) {
+    visionMutatedRequest = true;
+  } else if (textOnlyRoute) {
     // Sidecar-covered model but NO plan (no forward provider / missing forwarded auth / sidecar
     // disabled): fail closed — never forward raw images to a text-only upstream.
-    stripImagesInPlace(parsed, translatorBudget);
+    visionMutatedRequest = stripImagesInPlace(parsed, translatorBudget);
   }
+  // Vision preprocessing mutates only the translated request. Replaying the untouched source body
+  // would discard captions or fail-closed image stripping and send the original images upstream.
+  if (visionMutatedRequest) anthropicMessagesSource = undefined;
 
   const recordTerminalOutcomes = options.recordTerminalOutcomes !== false;
 
@@ -3867,7 +3903,6 @@ async function handleResponsesInner(
       // Body is a replayable string; nothing has streamed to the client yet.
       upstreamResponse = await fetchWithTransientRetry(
         recovery => {
-          noteAttemptSend(logCtx.activeAttempt, passthroughEstimate, recovery);
           return fetchWithHeaderTimeout(request.url, applyUpstreamRecoveryInit({
             method: request.method,
             headers: request.headers,
@@ -3876,6 +3911,7 @@ async function handleResponsesInner(
             providerFetch(route.provider, options.codexWsRuntimeIdentity, {
               providerName: route.providerName,
               modelId: route.modelId,
+              onDispatch: () => noteAttemptSend(logCtx.activeAttempt, passthroughEstimate, recovery),
             }),
             route.provider.authMode === "forward")
             // Every real attempt response — including an intermediate 5xx the
@@ -3915,8 +3951,6 @@ async function handleResponsesInner(
           translatorBudget,
         });
         refreshRoutedNamespaceToolAliases(request);
-        recordAdapterReasoning(logCtx, request);
-        recordAdapterTier(logCtx, request);
       } catch (err) {
         upstream.abort();
         if (options.abortSignal?.aborted) return { failed: clientCancelledResponse() };
@@ -3929,16 +3963,17 @@ async function handleResponsesInner(
       if (passthroughEstimate !== undefined) logCtx.usageLogInputTokens = passthroughEstimate;
       refreshUndeclaredToolGuard(request);
       logCtx.providerAdapter = retryAdapter.name;
-      sealRequestAttemptIdentity(
-        logCtx.activeAttempt,
-        logCtx.provider,
-        retryAdapter.name,
-        logCtx.accountLogLabel,
-      );
+      transitionRequestAttempt(logCtx, {
+        provider: logCtx.provider,
+        model: route.modelId,
+        adapter: retryAdapter.name,
+        accountLogLabel: logCtx.accountLogLabel,
+      }, upstreamResponse.status);
+      recordAdapterReasoning(logCtx, request);
+      recordAdapterTier(logCtx, request);
       try {
         return await fetchWithTransientRetry(
           innerRecovery => {
-            noteAttemptSend(logCtx.activeAttempt, passthroughEstimate, innerRecovery ?? recovery);
             return fetchWithHeaderTimeout(request.url, applyUpstreamRecoveryInit({
               method: request.method,
               headers: request.headers,
@@ -3947,6 +3982,11 @@ async function handleResponsesInner(
               providerFetch(route.provider, options.codexWsRuntimeIdentity, {
                 providerName: route.providerName,
                 modelId: route.modelId,
+                onDispatch: () => noteAttemptSend(
+                  logCtx.activeAttempt,
+                  passthroughEstimate,
+                  innerRecovery ?? recovery,
+                ),
               }),
               route.provider.authMode === "forward")
               .then(response => {
@@ -4027,7 +4067,6 @@ async function handleResponsesInner(
         recordAdapterReasoning(logCtx, request);
         recordAdapterTier(logCtx, request);
         refreshUndeclaredToolGuard(request);
-        noteAttemptSend(logCtx.activeAttempt, passthroughEstimate, "oauth-401");
         upstreamResponse = await fetchWithHeaderTimeout(
           request.url,
           { method: request.method, headers: request.headers, body: request.body },
@@ -4044,6 +4083,11 @@ async function handleResponsesInner(
             providerFetch(route.provider, options.codexWsRuntimeIdentity, {
               providerName: route.providerName,
               modelId: route.modelId,
+              onDispatch: () => noteAttemptSend(
+                logCtx.activeAttempt,
+                passthroughEstimate,
+                "oauth-401",
+              ),
             }),
             codex401ReplayKind === "stored" ? options.onStoredPool401ReplayDispatched : undefined,
           ),
@@ -4139,7 +4183,6 @@ async function handleResponsesInner(
       try {
         upstreamResponse = await fetchWithTransientRetry(
           recovery => {
-            noteAttemptSend(logCtx.activeAttempt, passthroughEstimate, recovery ?? "oauth-401");
             return fetchWithHeaderTimeout(request.url, applyUpstreamRecoveryInit({
               method: request.method,
               headers: request.headers,
@@ -4148,6 +4191,11 @@ async function handleResponsesInner(
               providerFetch(route.provider, options.codexWsRuntimeIdentity, {
                 providerName: route.providerName,
                 modelId: route.modelId,
+                onDispatch: () => noteAttemptSend(
+                  logCtx.activeAttempt,
+                  passthroughEstimate,
+                  recovery ?? "oauth-401",
+                ),
               }),
               route.provider.authMode === "forward")
               .then(res => {
@@ -4201,7 +4249,6 @@ async function handleResponsesInner(
           recovery => {
             // The first send of every replay is itself a rate-limit retry; inner transient-5xx
             // recoveries keep their own label (recovery is provided for those).
-            noteAttemptSend(logCtx.activeAttempt, passthroughEstimate, recovery ?? "rate-limit-429");
             return fetchWithHeaderTimeout(request.url, applyUpstreamRecoveryInit({
               method: request.method,
               headers: request.headers,
@@ -4210,6 +4257,11 @@ async function handleResponsesInner(
               providerFetch(route.provider, options.codexWsRuntimeIdentity, {
                 providerName: route.providerName,
                 modelId: route.modelId,
+                onDispatch: () => noteAttemptSend(
+                  logCtx.activeAttempt,
+                  passthroughEstimate,
+                  recovery ?? "rate-limit-429",
+                ),
               }),
               route.provider.authMode === "forward")
               .then(res => {
@@ -4877,8 +4929,10 @@ async function handleResponsesInner(
     : undefined;
   const imgPlan = !routedCompaction ? await planImageBridge(config, parsed, route.provider) : undefined;
   const vidPlan = !routedCompaction ? await planVideoBridge(config, parsed, route.provider) : undefined;
-  const canRunWebSearch = !!wsPlan && !adapter.runTurn;
+  const canonicalAnthropicSourceReplay = canReplayCurrentAnthropicSource();
+  const canRunWebSearch = !!wsPlan && !adapter.runTurn && !canonicalAnthropicSourceReplay;
   const rotateSidecarProviderOn429 = async (retryAfter: string | null): Promise<ProviderAdapter | null> => {
+    let accountRotated = false;
     const rotated = rotateProviderTransportOn429(config, route.providerName, route.provider, {
       retryAfter,
       now: Date.now(),
@@ -4905,6 +4959,7 @@ async function handleResponsesInner(
         genericFailoverAccountId = nextAccountId;
         genericFailovers += 1;
         if (!applyFailoverSnapshot(snapshot)) return null;
+        accountRotated = true;
       } catch {
         return null;
       }
@@ -4913,6 +4968,16 @@ async function handleResponsesInner(
       resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire),
       config.cacheRetention,
     );
+    if (accountRotated) {
+      logCtx.providerAdapter = rotatedAdapter.name;
+      transitionRequestAttempt(logCtx, {
+        provider: logCtx.provider,
+        model: route.modelId,
+        adapter: rotatedAdapter.name,
+        accountLogLabel: logCtx.accountLogLabel,
+      }, 429);
+      recordAttemptRequestedEffort(logCtx);
+    }
     bindRouteReasoningReplayScope({
       parsed,
       providerName: route.providerName,
@@ -4929,7 +4994,7 @@ async function handleResponsesInner(
     if (vidPlan) console.warn("[videos] video bridge skipped: web search is active for this turn");
     if (imgPlan) console.warn("[images] image bridge skipped: web search is active for this turn");
   }
-  if ((imgPlan || vidPlan) && (!wsPlan || adapter.runTurn)) {
+  if (!canonicalAnthropicSourceReplay && (imgPlan || vidPlan) && (!wsPlan || adapter.runTurn)) {
     // The image bridge detects a hosted image_generation tool and requires streaming.
     // The video bridge activates from config and injects a tool — it also needs streaming
     // (the loop returns SSE). For video-only (no imgPlan) on a non-streaming request, skip
@@ -4970,7 +5035,7 @@ async function handleResponsesInner(
       && (tc.name === "image_generation" || imgPlan.toolNames.has(tc.name))) {
       parsed.options.toolChoice = { ...tc, name: IMAGE_GEN_TOOL_NAME };
     }
-    const imageProviderFetch = providerFetch(
+    const currentImageProviderFetch = () => providerFetch(
       route.provider,
       options.codexWsRuntimeIdentity,
       { providerName: route.providerName, modelId: route.modelId },
@@ -4991,8 +5056,11 @@ async function handleResponsesInner(
           : clampImageMaxRounds(config.images?.videoMaxRounds ?? 2),
       connectTimeoutMs: config.connectTimeoutMs ?? 200_000,
       stallTimeoutSec: config.stallTimeoutSec,
-      waitForRequestSlot: imageProviderFetch.waitForPacing,
-      fetchImpl: imageProviderFetch.unpacedFetch ?? imageProviderFetch,
+      waitForRequestSlot: signal => currentImageProviderFetch().waitForPacing?.(signal) ?? Promise.resolve(),
+      fetchImpl: ((input: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) => {
+        const current = currentImageProviderFetch();
+        return (current.unpacedFetch ?? current)(input, init);
+      }) as typeof globalThis.fetch,
       onRequestBuilt: request => {
         recordAdapterReasoning(logCtx, request);
         recordAdapterTier(logCtx, request);
@@ -5044,20 +5112,19 @@ async function handleResponsesInner(
   // through web-search instead of being swallowed. runTurn adapters never enter this branch.
   if (canRunWebSearch && wsPlan) {
     parsed.context.tools = [...(parsed.context.tools ?? []), buildWebSearchTool()];
-    // Resolve the mutable route at send time: a 429 rotation replaces route.provider, so retaining
-    // one pre-rotation providerFetch would keep the old credential and transport pin.
-    const routedProviderFetch = ((input: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) =>
-      providerFetch(route.provider, options.codexWsRuntimeIdentity, {
-        providerName: route.providerName,
-        modelId: route.modelId,
-      })(input, init)) as typeof globalThis.fetch;
+    // Resolve the mutable route at every physical send: a 429 rotation replaces route.provider, so
+    // pacing and transport must both use the newly selected credential and provider settings.
+    const currentWebSearchProviderFetch = () => providerFetch(
+      route.provider,
+      options.codexWsRuntimeIdentity,
+      { providerName: route.providerName, modelId: route.modelId },
+    );
     const wsResponse = await runWithWebSearch({
       parsed, adapter,
       incomingMeta: {
         headers: selectedForwardHeaders,
         abortSignal: options.abortSignal,
         translatorBudget,
-        providerFetch: routedProviderFetch,
       },
       backend: wsPlan.backend,
       forwardProvider: wsPlan.forwardSidecar?.provider,
@@ -5071,6 +5138,11 @@ async function handleResponsesInner(
       selectedForwardHeaders: wsPlan.forwardSidecar?.headers ?? selectedForwardHeaders,
       settings: wsPlan.settings,
       maxSearches: wsPlan.maxSearches,
+      fetchImpl: ((input: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) => {
+        const current = currentWebSearchProviderFetch();
+        return (current.unpacedFetch ?? current)(input, init);
+      }) as typeof globalThis.fetch,
+      waitForRequestSlot: signal => currentWebSearchProviderFetch().waitForPacing?.(signal) ?? Promise.resolve(),
       forceEmptyResponseId: true,
       abortSignal: options.abortSignal,
       ...(options.onFirstOutput ? { onFirstOutput: options.onFirstOutput } : {}),
@@ -5151,7 +5223,7 @@ async function handleResponsesInner(
         if (!pacingSlotAcquired) {
           await waitForProviderRequestSlot(route.providerName, route.provider, route.modelId, runTurnAbort.signal);
         }
-        noteAttemptSend(logCtx.activeAttempt, logCtx.usageLogInputTokens, recovery);
+        let dispatchCount = 0;
         const runTurnProviderFetch = providerFetch(
           route.provider,
           options.codexWsRuntimeIdentity,
@@ -5162,6 +5234,14 @@ async function handleResponsesInner(
             // Cursor HTTP/1.1 consumes it for RunSSE; every BidiAppend and redial then waits on
             // the same provider queue through this stateful wrapper.
             pacingSlotAcquired: true,
+            onDispatch: () => {
+              noteAttemptSend(
+                logCtx.activeAttempt,
+                logCtx.usageLogInputTokens,
+                dispatchCount === 0 ? recovery : undefined,
+              );
+              dispatchCount += 1;
+            },
           },
         );
         await runTurnAdapter.runTurn?.(
@@ -5246,7 +5326,15 @@ async function handleResponsesInner(
           codexAuthContext: authCtx,
           forwardHeaders: selectedForwardHeaders,
         });
-        sealRequestAttemptIdentity(logCtx.activeAttempt, logCtx.provider, rotatedAdapter.name, logCtx.accountLogLabel);
+        logCtx.providerAdapter = rotatedAdapter.name;
+        transitionRequestAttempt(logCtx, {
+          provider: logCtx.provider,
+          model: route.modelId,
+          adapter: rotatedAdapter.name,
+          accountLogLabel: logCtx.accountLogLabel,
+        }, status);
+        recordAttemptRequestedEffort(logCtx);
+        recordAdapterTierMetadata(logCtx, rotatedAdapter.tierLogForRunTurn?.(parsed));
         return true;
       } catch {
         return false;
@@ -5513,7 +5601,13 @@ async function handleResponsesInner(
   const remainingTransientSendBudget = (budget: number): number =>
     Math.max(1, budget - transientSendsUsed);
   try {
-    initialRequest = await activeAdapter.buildRequest(parsed, { headers: selectedForwardHeaders, translatorBudget });
+    initialRequest = await activeAdapter.buildRequest(parsed, {
+      headers: selectedForwardHeaders,
+      translatorBudget,
+      ...(activeAdapter.name === "anthropic" && anthropicMessagesSource
+        ? { anthropicMessagesSource }
+        : {}),
+    });
     refreshRoutedNamespaceToolAliases(initialRequest);
     recordAdapterReasoning(logCtx, initialRequest);
     recordAdapterTier(logCtx, initialRequest);
@@ -5547,19 +5641,33 @@ async function handleResponsesInner(
    * is invisible to it and a missed bump would replay a request built with a stale key.
    */
   const invalidateSameTargetRequest = (): void => { transportToken += 1; };
+  let responseRequest: AdapterRequest = builtInitialRequest;
   let upstreamResponse: Response;
+  const adapterFetchContext = (
+    estimate: number | undefined,
+    modelId: string,
+    recovery?: AttemptRecoveryKind,
+  ): Pick<AdapterFetchContext, "executor" | "onRetry"> => {
+    let nextRecovery = recovery;
+    return {
+      executor: providerFetch(route.provider, options.codexWsRuntimeIdentity, {
+        providerName: route.providerName,
+        modelId,
+        onDispatch: () => {
+          noteAttemptSend(logCtx.activeAttempt, estimate, nextRecovery);
+          nextRecovery = undefined;
+        },
+      }),
+      onRetry: retryRecovery => { nextRecovery = retryRecovery; },
+    };
+  };
   try {
     if (activeAdapter.fetchResponse) {
-      noteAttemptSend(logCtx.activeAttempt, inputTokenEstimate);
-      await waitForProviderRequestSlot(route.providerName, route.provider, route.modelId, upstream.signal);
       upstreamResponse = await activeAdapter.fetchResponse(builtInitialRequest, {
         abortSignal: upstream.signal,
         timeoutMs: connectMs,
         stream: parsed.stream,
-        executor: providerFetch(route.provider, options.codexWsRuntimeIdentity, {
-          providerName: route.providerName,
-          modelId: route.modelId,
-        }),
+        ...adapterFetchContext(inputTokenEstimate, route.modelId),
       });
     } else {
       // #1851 scope guard: transient-5xx retry on this generic adapter path is opt-in for
@@ -5575,7 +5683,6 @@ async function handleResponsesInner(
         : fetchWithResetRetry;
       upstreamResponse = await fetchWithRetryPolicy(
         recovery => {
-          noteAttemptSend(logCtx.activeAttempt, inputTokenEstimate, recovery);
           return fetchWithHeaderTimeout(builtInitialRequest.url, applyUpstreamRecoveryInit({
             method: builtInitialRequest.method,
             headers: builtInitialRequest.headers,
@@ -5584,6 +5691,7 @@ async function handleResponsesInner(
             providerFetch(route.provider, options.codexWsRuntimeIdentity, {
               providerName: route.providerName,
               modelId: route.modelId,
+              onDispatch: () => noteAttemptSend(logCtx.activeAttempt, inputTokenEstimate, recovery),
             }));
         },
         {
@@ -5642,9 +5750,10 @@ async function handleResponsesInner(
             headers: selectedForwardHeaders,
             translatorBudget,
             ...(imageTierBias > 0 ? { imageTierBias } : {}),
+            ...(activeAdapter.name === "anthropic" && anthropicMessagesSource
+              ? { anthropicMessagesSource }
+              : {}),
           });
-          recordAdapterReasoning(logCtx, retryRequest);
-          recordAdapterTier(logCtx, retryRequest);
         } catch (err) {
           // A rotated/rebuilt adapter build failure is a request-shaping error, not an
           // upstream connect failure: tear the abort link down and map it as 400 (no 413
@@ -5665,20 +5774,23 @@ async function handleResponsesInner(
         : undefined;
       if (retryEstimate !== undefined) logCtx.usageLogInputTokens = retryEstimate;
       logCtx.providerAdapter = activeAdapter.name;
-      sealRequestAttemptIdentity(logCtx.activeAttempt, logCtx.provider, activeAdapter.name, logCtx.accountLogLabel);
-      noteAttemptSend(logCtx.activeAttempt, retryEstimate, recovery);
+      transitionRequestAttempt(logCtx, {
+        provider: logCtx.provider,
+        model: route.modelId,
+        adapter: activeAdapter.name,
+        accountLogLabel: logCtx.accountLogLabel,
+      }, upstreamResponse.status);
+      recordAdapterReasoning(logCtx, retryRequest);
+      recordAdapterTier(logCtx, retryRequest);
+      responseRequest = retryRequest;
       try {
         try {
           if (activeAdapter.fetchResponse) {
-            await waitForProviderRequestSlot(route.providerName, route.provider, route.modelId, upstream.signal);
             return await activeAdapter.fetchResponse(retryRequest, {
               abortSignal: upstream.signal,
               timeoutMs: connectMs,
               stream: parsed.stream,
-              executor: providerFetch(route.provider, options.codexWsRuntimeIdentity, {
-                providerName: route.providerName,
-                modelId: route.modelId,
-              }),
+              ...adapterFetchContext(retryEstimate, route.modelId, recovery),
             });
           }
           // #2643 review: this leg used to call fetchWithHeaderTimeout directly, so an
@@ -5692,14 +5804,21 @@ async function handleResponsesInner(
             ? fetchWithTransientRetry
             : fetchWithResetRetry;
           return await refetchWithPolicy(
-            recoveryKind => fetchWithHeaderTimeout(retryRequest.url,
-              applyUpstreamRecoveryInit({
-                method: retryRequest.method, headers: retryRequest.headers, body: retryRequest.body,
-              }, recoveryKind), upstream.signal, connectMs, parsed.stream,
-              providerFetch(route.provider, options.codexWsRuntimeIdentity, {
-                providerName: route.providerName,
-                modelId: route.modelId,
-              })),
+            recoveryKind => {
+              return fetchWithHeaderTimeout(retryRequest.url,
+                applyUpstreamRecoveryInit({
+                  method: retryRequest.method, headers: retryRequest.headers, body: retryRequest.body,
+                }, recoveryKind), upstream.signal, connectMs, parsed.stream,
+                providerFetch(route.provider, options.codexWsRuntimeIdentity, {
+                  providerName: route.providerName,
+                  modelId: route.modelId,
+                  onDispatch: () => noteAttemptSend(
+                    logCtx.activeAttempt,
+                    retryEstimate,
+                    recoveryKind ?? recovery,
+                  ),
+                }));
+            },
             {
               abortSignal: upstream.signal,
               label: safeHostLabel(retryRequest.url),
@@ -6046,6 +6165,7 @@ async function handleResponsesInner(
   // so it stays off for the shared openai-chat adapter unless a provider enables it).
   const terminalGuardEnabled = (activeAdapter.name === "anthropic"
       || (activeAdapter.name === "openai-chat" && route.provider.terminalContinuationGuard === true))
+    && !responseRequest.anthropicSourceReplay
     && !options.comboAttempt && !routedCompaction;
   /**
    * One bounded internal re-ask for Anthropic end_turn-without-tool-call turns. Replays the
@@ -6058,6 +6178,7 @@ async function handleResponsesInner(
     initialRecoveryKind?: AttemptRecoveryKind,
   ): AsyncGenerator<AdapterEvent> {
     let response: Response | undefined;
+    let continuationResponseRequest: AdapterRequest | undefined;
     // One-shot recovery label for the next top-of-loop continuation send after a failover rotation.
     let nextContinuationRecoveryKind: AttemptRecoveryKind | undefined = initialRecoveryKind;
     /**
@@ -6078,6 +6199,11 @@ async function handleResponsesInner(
             headers: selectedForwardHeaders,
             translatorBudget,
             ...(imageTierBias > 0 ? { imageTierBias } : {}),
+            ...(activeAdapter.name === "anthropic"
+              && nextParsed === parsed
+              && anthropicMessagesSource
+              ? { anthropicMessagesSource }
+              : {}),
           });
           recordAdapterReasoning(logCtx, continuationRequest);
           recordAdapterTier(logCtx, continuationRequest);
@@ -6102,18 +6228,14 @@ async function handleResponsesInner(
       if (continuationEstimate !== undefined) logCtx.usageLogInputTokens = continuationEstimate;
       // Optional recovery label for same-target / failover continuation sends.
       const replayKind: AttemptRecoveryKind | undefined = recoveryKind;
+      continuationResponseRequest = builtContinuationRequest;
       try {
         if (activeAdapter.fetchResponse) {
-          noteAttemptSend(logCtx.activeAttempt, continuationEstimate, replayKind);
-          await waitForProviderRequestSlot(route.providerName, route.provider, nextParsed.modelId, upstream.signal);
           return await activeAdapter.fetchResponse(builtContinuationRequest, {
             abortSignal: upstream.signal,
             timeoutMs: connectMs,
             stream: nextParsed.stream,
-            executor: providerFetch(route.provider, options.codexWsRuntimeIdentity, {
-              providerName: route.providerName,
-              modelId: nextParsed.modelId,
-            }),
+            ...adapterFetchContext(continuationEstimate, nextParsed.modelId, replayKind),
           });
         }
         // Same #1851 scope guard as the initial send: transient-5xx retry only for direct
@@ -6124,7 +6246,6 @@ async function handleResponsesInner(
           : fetchWithResetRetry;
         return await fetchContinuationWithRetryPolicy(
           recovery => {
-            noteAttemptSend(logCtx.activeAttempt, continuationEstimate, recovery ?? replayKind);
             return fetchWithHeaderTimeout(
               builtContinuationRequest.url,
               applyUpstreamRecoveryInit({
@@ -6138,6 +6259,11 @@ async function handleResponsesInner(
               providerFetch(route.provider, options.codexWsRuntimeIdentity, {
                 providerName: route.providerName,
                 modelId: nextParsed.modelId,
+                onDispatch: () => noteAttemptSend(
+                  logCtx.activeAttempt,
+                  continuationEstimate,
+                  recovery ?? replayKind,
+                ),
               }),
             );
           },
@@ -6279,7 +6405,14 @@ async function handleResponsesInner(
               resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, inboundWire),
               config.cacheRetention,
             );
-            sealRequestAttemptIdentity(logCtx.activeAttempt, logCtx.provider, activeAdapter.name, logCtx.accountLogLabel);
+            logCtx.providerAdapter = activeAdapter.name;
+            transitionRequestAttempt(logCtx, {
+              provider: logCtx.provider,
+              model: route.modelId,
+              adapter: activeAdapter.name,
+              accountLogLabel: logCtx.accountLogLabel,
+            }, response.status);
+            recordAttemptRequestedEffort(logCtx);
             nextContinuationRecoveryKind = "anthropic-oauth-429";
             continue;
           } catch {
@@ -6330,9 +6463,19 @@ async function handleResponsesInner(
       const detachContinuationBodyGuard = cancelBodyOnAbort(response.body, upstream.signal);
       try {
         if (nextParsed.stream) {
-          yield* activeAdapter.parseStream(response, translatorBudget, logCtx.activeTierMetadata);
+          yield* activeAdapter.parseStream(
+            response,
+            translatorBudget,
+            logCtx.activeTierMetadata,
+            continuationResponseRequest,
+          );
         } else if (activeAdapter.parseResponse) {
-          yield* await activeAdapter.parseResponse(response, translatorBudget, logCtx.activeTierMetadata);
+          yield* await activeAdapter.parseResponse(
+            response,
+            translatorBudget,
+            logCtx.activeTierMetadata,
+            continuationResponseRequest,
+          );
         } else {
           yield { type: "error", message: "Provider continuation does not support response parsing" };
         }
@@ -6366,6 +6509,7 @@ async function handleResponsesInner(
       upstreamResponse,
       translatorBudget,
       logCtx.activeTierMetadata,
+      responseRequest,
     );
     const eventStream = terminalGuardEnabled
       ? guardTerminalEventStream({
@@ -6441,6 +6585,7 @@ async function handleResponsesInner(
         upstreamResponse,
         translatorBudget,
         logCtx.activeTierMetadata,
+        responseRequest,
       );
       let guardedEvents: AdapterEvent[];
       if (terminalGuardEnabled) {

@@ -297,6 +297,10 @@ export interface WebSearchLoopDeps {
   streamRoutedModelOutput?: boolean;
   /** One-shot TTFT callback: first non-empty model output observed (WP4). */
   onFirstOutput?: () => void;
+  /** Raw provider transport used after bridge-owned pacing admission. */
+  fetchImpl?: typeof globalThis.fetch;
+  /** Reserve the routed provider's next request-start slot before each physical adapter dispatch. */
+  waitForRequestSlot?: (signal?: AbortSignal) => Promise<void>;
   /** Raw adapter usage at the terminal event, pre wire-normalization (see bridgeToResponsesSSE onUsage). */
   onUsage?: (usage: OcxUsage | undefined) => void;
   /** Observe the exact adapter request selected for each routed-model iteration. */
@@ -323,7 +327,12 @@ export interface WebSearchLoopDeps {
  */
 export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Response> {
   const translatorBudget = deps.incomingMeta.translatorBudget;
-  const routedProviderFetch = deps.incomingMeta.providerFetch ?? globalThis.fetch;
+  const incomingFetch = deps.incomingMeta.providerFetch as (typeof globalThis.fetch & {
+    waitForPacing?: (signal?: AbortSignal) => Promise<void>;
+    unpacedFetch?: typeof globalThis.fetch;
+  }) | undefined;
+  const fetchImpl = deps.fetchImpl ?? incomingFetch?.unpacedFetch ?? incomingFetch ?? globalThis.fetch;
+  const waitForRequestSlot = deps.waitForRequestSlot ?? incomingFetch?.waitForPacing;
   const { parsed, selectedForwardHeaders, forwardProvider, hostedTool, settings, maxSearches, abortSignal, recordSidecarOutcome } = deps;
   const backend = deps.backend ?? "openai";
   const anthropicSidecar = deps.anthropicSidecar;
@@ -408,6 +417,20 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
     // clear() stops only its timer after final headers; the direct turn signal remains attached to
     // the returned response body through AbortSignal.any().
     let headerDeadline = clearableDeadline(connectTimeoutMs, signal);
+    const paceThenResetHeaderDeadline = async (): Promise<void> => {
+      headerDeadline.clear();
+      await waitForRequestSlot?.(signal);
+      headerDeadline = clearableDeadline(connectTimeoutMs, signal);
+    };
+    let firstPacingSlot = true;
+    const reserveDispatchSlot = async (): Promise<void> => {
+      if (firstPacingSlot) {
+        firstPacingSlot = false;
+        await paceThenResetHeaderDeadline();
+      } else {
+        await waitForRequestSlot?.(headerDeadline.signal);
+      }
+    };
     try {
       /**
        * Build and fetch one web-search iteration on the given adapter, under the iteration
@@ -443,17 +466,32 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
         let response: Response;
         try {
           if (requestAdapter.fetchResponse) {
-            deps.onAttemptSend?.(recovery);
+            await reserveDispatchSlot();
+            let firstDispatch = true;
+            let nextRecovery = recovery;
+            const executor = async (
+              input: Parameters<typeof globalThis.fetch>[0],
+              init?: RequestInit,
+            ): Promise<Response> => {
+              if (firstDispatch) firstDispatch = false;
+              else await waitForRequestSlot?.(headerDeadline.signal);
+              const dispatchRecovery = nextRecovery;
+              nextRecovery = undefined;
+              deps.onAttemptSend?.(dispatchRecovery);
+              return fetchImpl(input, init);
+            };
             response = await requestAdapter.fetchResponse(request, {
               abortSignal: headerDeadline.signal,
               timeoutMs: connectTimeoutMs,
               returnRawErrors: true,
               stream: true,
-              executor: routedProviderFetch,
+              executor: Object.assign(executor, { preconnect: fetchImpl.preconnect }),
+              onRetry: retryRecovery => { nextRecovery = retryRecovery; },
             });
           } else {
             response = await fetchWithResetRetry(
-              (retryRecovery) => {
+              async (retryRecovery) => {
+                await reserveDispatchSlot();
                 // Record every helper-driven send (the callback runs for the first attempt and
                 // each connection-reset replay); preserve the caller's recovery kind
                 // (rate-limit-429 / key-429) when the retry layer supplies none.
@@ -465,7 +503,7 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
                 // so the transport-level `keepalive: false` this helper adds is what actually
                 // opens a new connection. Spending `retryRecovery` on telemetry alone left every
                 // replay on this leg eligible for the same dead socket the reset came from.
-                return routedProviderFetch(request.url, applyUpstreamRecoveryInit({
+                return fetchImpl(request.url, applyUpstreamRecoveryInit({
                   method: request.method,
                   headers: h,
                   body: request.body,

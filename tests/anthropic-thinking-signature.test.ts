@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { bridgeToResponsesSSE, buildResponseJSON } from "../src/bridge";
 import { createAnthropicAdapter as createAnthropicAdapterProduction } from "../src/adapters/anthropic";
 import { parseRequest } from "../src/responses/parser";
+import { guardEmptyCompletionEventStream } from "../src/server/responses/empty-completion-guard";
 import { encodeReasoningEnvelope, decodeReasoningEnvelope, OCX_REASONING_PREFIX } from "../src/responses/reasoning-envelope";
 import type { AdapterEvent, OcxProviderConfig, OcxThinkingContent } from "../src/types";
 import { withTestTranslatorBudget } from "./helpers/translator-budget";
@@ -108,6 +109,32 @@ describe("bridge ocxr1 envelope emission", () => {
     expect(env?.sig).toBe("RealSig1234567890==");
   });
 
+  test("SSE: signed reasoning stays separate across an empty-completion retry", async () => {
+    const guarded = guardEmptyCompletionEventStream({
+      firstEvents: (async function* (): AsyncGenerator<AdapterEvent> {
+        yield { type: "thinking_delta", thinking: "first attempt" };
+        yield { type: "thinking_signature", signature: "FirstSignature123456==" };
+        yield { type: "done", usage: { inputTokens: 10, outputTokens: 0 } };
+      })(),
+      continuation: () => (async function* (): AsyncGenerator<AdapterEvent> {
+        yield { type: "thinking_delta", thinking: "second attempt" };
+        yield { type: "thinking_signature", signature: "SecondSignature123456==" };
+        yield { type: "text_delta", text: "answer" };
+        yield { type: "done", usage: { inputTokens: 20, outputTokens: 1 } };
+      })(),
+    });
+    const sse = await drainSse(bridgeToResponsesSSE(guarded, "claude-x"));
+    const reasoning = sseItems(sse).filter(i => i.type === "reasoning");
+
+    expect(reasoning.map(item => ({
+      text: (item.summary as Array<{ text: string }>)[0]?.text,
+      signature: decodeReasoningEnvelope(item.encrypted_content as string)?.sig,
+    }))).toEqual([
+      { text: "first attempt", signature: "FirstSignature123456==" },
+      { text: "second attempt", signature: "SecondSignature123456==" },
+    ]);
+  });
+
   test("SSE hideThinkingSummary: envelope-only reasoning item, no text leak", async () => {
     async function* gen() { yield* baseEvents; }
     const sse = await drainSse(bridgeToResponsesSSE(gen(), "claude-x", undefined, undefined, undefined, undefined, 2000, { hideThinkingSummary: true }));
@@ -121,17 +148,16 @@ describe("bridge ocxr1 envelope emission", () => {
     expect(env?.txt).toBe("hidden chain"); // signed text survives inside the envelope only
   });
 
-  test("JSON: reasoning item carries envelope; redacted blocks included", async () => {
+  test("JSON: reasoning items preserve redacted block and signed thinking order", async () => {
     const response = buildResponseJSON([
       { type: "redacted_thinking", data: "RED1" },
       ...baseEvents,
     ], "claude-x");
-    const output = response.output as Record<string, unknown>[];
-    const reasoning = output.find(i => i.type === "reasoning");
-    expect(reasoning).toBeDefined();
-    const env = decodeReasoningEnvelope(reasoning!.encrypted_content as string);
-    expect(env?.sig).toBe("RealSig1234567890==");
-    expect(env?.red).toEqual(["RED1"]);
+    const reasoning = (response.output as Record<string, unknown>[])
+      .filter(i => i.type === "reasoning");
+    expect(reasoning).toHaveLength(2);
+    expect(decodeReasoningEnvelope(reasoning[0]!.encrypted_content as string)?.red).toEqual(["RED1"]);
+    expect(decodeReasoningEnvelope(reasoning[1]!.encrypted_content as string)?.sig).toBe("RealSig1234567890==");
   });
 
   test("redacted-only turn still emits an envelope reasoning item (SSE)", async () => {

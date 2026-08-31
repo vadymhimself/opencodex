@@ -247,7 +247,8 @@ export function createMimoFreeAdapter(provider: OcxProviderConfig): ProviderAdap
     },
 
     async fetchResponse(request: AdapterRequest, ctx): Promise<Response> {
-      const response = await fetch(request.url, {
+      const executor = ctx?.executor ?? fetch;
+      const response = await executor(request.url, {
         method: request.method,
         headers: request.headers as Record<string, string>,
         body: request.body,
@@ -266,7 +267,8 @@ export function createMimoFreeAdapter(provider: OcxProviderConfig): ProviderAdap
           ...(request.headers as Record<string, string>),
           "Authorization": `Bearer ${freshJwt}`,
         };
-        return fetch(request.url, {
+        ctx?.onRetry?.("oauth-401");
+        return executor(request.url, {
           method: request.method,
           headers: retryHeaders,
           body: request.body,

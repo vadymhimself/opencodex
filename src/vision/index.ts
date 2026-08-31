@@ -268,7 +268,7 @@ function carriesImages(role: string): boolean {
   return role === "user" || role === "developer" || role === "toolResult";
 }
 
-function messagesHaveImage(parsed: OcxParsedRequest): boolean {
+export function messagesHaveImage(parsed: OcxParsedRequest): boolean {
   return parsed.context.messages.some(m =>
     carriesImages(m.role) && Array.isArray(m.content) && (m.content as OcxContentPart[]).some(p => p.type === "image"));
 }

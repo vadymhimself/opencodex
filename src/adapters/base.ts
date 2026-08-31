@@ -1,6 +1,17 @@
 import type { AdapterEvent, OcxParsedRequest } from "../types";
+import type { AttemptRecoveryKind } from "../usage/log";
 import type { TranslatorBudget } from "../lib/translator-budget";
 import type { AdapterTierMetadata } from "../providers/fastwire";
+
+export interface AnthropicMessagesSource {
+  readonly body: Readonly<Record<string, unknown>>;
+  readonly headers: {
+    readonly anthropicVersion?: string;
+    readonly anthropicBeta?: string;
+  };
+  /** Source contains Anthropic-native tools that translated routes cannot represent. */
+  readonly requiresExactReplay?: true;
+}
 
 /** Metadata about the caller's incoming request, for auth-forwarding adapters. */
 export interface IncomingMeta {
@@ -13,6 +24,8 @@ export interface IncomingMeta {
    * the same pacing queue and custom provider fetch seam.
    */
   providerFetch?: typeof globalThis.fetch;
+  /** Validated original Messages body, available only to exact canonical Anthropic replay. */
+  anthropicMessagesSource?: AnthropicMessagesSource;
   /**
    * Image-normalization ladder bias for upstream-413 tightened retries: every image
    * starts one tier lower (devlog/260714_image_normalization_pipeline/030). Only the
@@ -62,11 +75,13 @@ export interface ProviderAdapter {
     response: Response,
     budget: TranslatorBudget,
     tierMetadata?: AdapterTierMetadata,
+    request?: AdapterRequest,
   ): AsyncGenerator<AdapterEvent>;
   parseResponse?(
     response: Response,
     budget: TranslatorBudget,
     tierMetadata?: AdapterTierMetadata,
+    request?: AdapterRequest,
   ): Promise<AdapterEvent[]>;
   runTurn?(
     parsed: OcxParsedRequest,
@@ -83,6 +98,10 @@ export interface AdapterRequest {
     method: string;
     headers: Record<string, string>;
     body: string;
+    /** True only when body replays validated source on exact canonical Anthropic Messages. */
+    anthropicSourceReplay?: boolean;
+    /** Exact caller-declared tool names preserved on source replay. */
+    anthropicSourceToolNames?: ReadonlySet<string>;
     /** Final upstream wire names of custom tools lowered to functions while building this request. */
     convertedRoutedCustomToolNames?: ReadonlySet<string>;
     /** Native custom-tool wire names authorized for representation-only response repair. */
@@ -133,6 +152,8 @@ export interface AdapterFetchContext {
   stream?: boolean;
   /** Custom fetch executor to use for physical upstream network requests (defaults to globalThis.fetch). */
   executor?: typeof globalThis.fetch;
+  /** Set the recovery label consumed by the next executor dispatch. Does not itself record a send. */
+  onRetry?: (recovery: AttemptRecoveryKind) => void;
 }
 
 /**

@@ -142,10 +142,13 @@ describe("enforceAnthropicImageLimits", () => {
   });
 
   test("C6: a single >8000px image is textified even in a small request", () => {
-    const messages = [userMsg([imageBlock(HUGE), imageBlock(SMALL)])];
+    const oversized = imageBlock(HUGE) as Record<string, unknown>;
+    oversized.cache_control = { type: "ephemeral", ttl: "1h" };
+    const messages = [userMsg([oversized, imageBlock(SMALL)])];
     enforceAnthropicImageLimits(messages);
-    const content = (messages[0] as { content: Array<{ type: string }> }).content;
+    const content = (messages[0] as { content: Array<Record<string, unknown>> }).content;
     expect(content[0].type).toBe("text");
+    expect(content[0].cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
     expect(content[1].type).toBe("image");
   });
 

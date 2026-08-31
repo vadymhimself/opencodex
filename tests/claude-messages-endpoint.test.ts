@@ -6,6 +6,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { saveConfig } from "../src/config";
 import { createAnthropicAdapter } from "../src/adapters/anthropic";
+import { clearAnthropicAccountPoolState } from "../src/oauth/anthropic-routing";
+import { clearPoolRotationState } from "../src/codex/pool-rotation";
 import { clearableDeadline } from "../src/lib/abort";
 import {
   clearRequestLogsForTests,
@@ -23,7 +25,7 @@ import {
   tapAnthropicSseForLog,
 } from "../src/server/claude-messages";
 import { estimateTokens } from "../src/lib/token-estimate";
-import type { OcxConfig } from "../src/types";
+import type { OcxConfig, OcxParsedRequest } from "../src/types";
 import { installIsolatedCodexHome, type IsolatedCodexHome } from "./helpers/isolated-codex-home";
 import { SERVER_BUDGET_MS } from "./helpers/test-budget";
 import { createTestTranslatorBudget } from "./helpers/translator-budget";
@@ -53,6 +55,7 @@ beforeEach(() => {
   process.env.OPENCODEX_HOME = testDir;
   previousDesktopConfigDir = process.env.OPENCODEX_CLAUDE_DESKTOP_CONFIG_DIR;
   process.env.OPENCODEX_CLAUDE_DESKTOP_CONFIG_DIR = join(testDir, "claude-desktop");
+  clearRequestLogsForTests();
   globalThis.fetch = originalFetch;
 });
 
@@ -700,6 +703,86 @@ test("native openai-responses route carries prompt_cache_key + synthesized sessi
     globalThis.fetch = originalFetch;
     await server.stop(true);
     upstream.stop(true);
+  }
+});
+
+test("combo openai-responses target strips user but preserves prompt_cache_key", async () => {
+  const capture: { body?: Record<string, unknown> } = {};
+  let returnTopLevelError = false;
+  const claudeBody = {
+    model: "claude-haiku-4-5",
+    max_tokens: 128,
+    messages: [{ role: "user", content: "hi" }],
+    metadata: { user_id: "user_abc123_account__session_11111111-2222-3333-4444-555555555555" },
+  };
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    const url = new URL(request.url);
+    if (url.origin === "https://chatgpt.com") {
+      expect(url.pathname).toBe("/backend-api/codex/responses");
+      capture.body = await request.json() as Record<string, unknown>;
+      if (returnTopLevelError) {
+        return new Response(
+          `event: error\ndata: ${JSON.stringify({
+            type: "error",
+            error: { type: "invalid_request_error", message: "Unsupported parameter: user" },
+          })}\n\n`,
+          { headers: { "content-type": "text/event-stream" } },
+        );
+      }
+      return new Response([
+        `event: response.created\ndata: ${JSON.stringify({ response: { id: "resp_1", status: "in_progress" } })}\n\n`,
+        `event: response.output_text.delta\ndata: ${JSON.stringify({ delta: "Hello" })}\n\n`,
+        `event: response.completed\ndata: ${JSON.stringify({ response: { status: "completed", usage: { input_tokens: 10, output_tokens: 2 } } })}\n\n`,
+      ].join(""), { headers: { "content-type": "text/event-stream" } });
+    }
+    return originalFetch(input, init);
+  }) as typeof fetch;
+  saveConfig({
+    port: 0,
+    defaultProvider: "native",
+    providers: {
+      native: {
+        adapter: "openai-responses",
+        baseUrl: "https://chatgpt.com/backend-api/codex",
+        authMode: "forward",
+      },
+    },
+    combos: {
+      waterfall: {
+        strategy: "failover",
+        targets: [{ provider: "native", model: "gpt-test" }],
+      },
+    },
+    claudeCode: { modelMap: { "claude-haiku-4-5": "combo/waterfall" } },
+  } as OcxConfig);
+  const server = startServer(0);
+  try {
+    const response = await originalFetch(new URL("/v1/messages", server.url), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(claudeBody),
+    });
+    expect(response.status).toBe(200);
+    await response.text();
+    expect(capture.body?.user).toBeUndefined();
+    expect(capture.body?.prompt_cache_key).toMatch(/^[0-9a-f]{32}$/);
+    expect(getRequestLogEntries().findLast(row => row.surface === "claude")?.attempts).toMatchObject([
+      { provider: "native", model: "gpt-test", sendCount: 1 },
+    ]);
+
+    returnTopLevelError = true;
+    const failure = await originalFetch(new URL("/v1/messages", server.url), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(claudeBody),
+    });
+    expect(failure.status).toBe(529);
+    const failureBody = await failure.text();
+    expect(failureBody).toContain("Unsupported parameter: user");
+    expect(failureBody).not.toContain("adapter_eof");
+  } finally {
+    await server.stop(true);
   }
 });
 
@@ -1441,6 +1524,1247 @@ test("generated agent effort directive restores exact xhigh and max after Claude
   } finally {
     await server.stop(true);
     upstream.stop(true);
+  }
+});
+
+function routedAnthropicSource(): Record<string, unknown> {
+  return {
+    model: "claude-haiku-4-5",
+    max_tokens: 64000,
+    stream: false,
+    system: [
+      { type: "text", text: "identity" },
+      { type: "text", text: "policy", cache_control: { type: "ephemeral", ttl: "1h" } },
+      { type: "text", text: "tools", cache_control: { type: "ephemeral" } },
+    ],
+    messages: [
+      { role: "user", content: [{ type: "text", text: "first" }] },
+      {
+        role: "assistant",
+        content: [
+          { type: "redacted_thinking", data: "opaque-source-data" },
+          { type: "thinking", thinking: "private thought", signature: "source-signature-1234567890" },
+          { type: "text", text: "calling" },
+          { type: "tool_use", id: "toolu_source", name: "custom_source", input: { value: 1 } },
+        ],
+      },
+      {
+        role: "user",
+        content: [{
+          type: "tool_result",
+          tool_use_id: "toolu_source",
+          content: [{ type: "text", text: "done" }],
+          cache_control: { type: "ephemeral" },
+        }],
+      },
+      {
+        role: "user",
+        content: [{ type: "text", text: "continue" }],
+      },
+    ],
+    tools: [{
+      name: "custom_source",
+      description: "source tool",
+      input_schema: { type: "object", properties: { value: { type: "number" } }, required: ["value"] },
+    }],
+    thinking: { type: "adaptive", display: "omitted" },
+    output_config: { effort: "high" },
+    context_management: { source_sentinel: true },
+    metadata: { user_id: "source-session" },
+  };
+}
+
+function routedAnthropicNativeToolSource(): Record<string, any> {
+  return {
+    model: "claude-haiku-4-5",
+    max_tokens: 128,
+    stream: false,
+    messages: [{ role: "user", content: [{ type: "text", text: "use the computer" }] }],
+    tools: [{
+      type: "computer_20250124",
+      name: "computer",
+      display_width_px: 1024,
+      display_height_px: 768,
+      input_schema: { type: "object" },
+    }],
+    context_management: { source_sentinel: true },
+  };
+}
+
+function anthropicTextSse(text = "ok", stopReason = "end_turn"): Response {
+  return new Response([
+    'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","model":"claude-opus-5","content":[],"stop_reason":null,"usage":{"input_tokens":3,"output_tokens":0}}}\n\n',
+    `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n`,
+    `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text } })}\n\n`,
+    'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+    `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: stopReason }, usage: { output_tokens: 1 } })}\n\n`,
+    'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+  ].join(""), { headers: { "content-type": "text/event-stream" } });
+}
+
+function anthropicCitationSse(citations: Array<Record<string, unknown>>): Response {
+  return new Response([
+    'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_citations","type":"message","role":"assistant","model":"claude-opus-5","content":[],"stop_reason":null,"usage":{"input_tokens":8,"output_tokens":0}}}\n\n',
+    'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+    'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"A"}}\n\n',
+    `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "citations_delta", citation: citations[0] } })}\n\n`,
+    'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"B"}}\n\n',
+    `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "citations_delta", citation: citations[1] } })}\n\n`,
+    'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+    'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":2}}\n\n',
+    'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+  ].join(""), { headers: { "content-type": "text/event-stream" } });
+}
+
+test("routed canonical Anthropic preserves citations for streaming and buffered clients", async () => {
+  const citations = [
+    { type: "char_location", cited_text: "first", document_index: 0, start_char_index: 4, end_char_index: 9 },
+    { type: "web_search_result_location", cited_text: "second", url: "https://example.test/source", title: "Source" },
+  ];
+  let sends = 0;
+  globalThis.fetch = async (input, init) => {
+    const request = new Request(input, init);
+    if (request.url !== "https://api.anthropic.com/v1/messages") {
+      throw new Error(`unexpected egress ${request.url}`);
+    }
+    sends++;
+    return anthropicCitationSse(citations);
+  };
+  saveConfig({
+    port: 0,
+    defaultProvider: "citation-target",
+    providers: {
+      "citation-target": {
+        adapter: "anthropic",
+        baseUrl: "https://api.anthropic.com",
+        authMode: "key",
+        apiKey: "selected-key",
+      },
+    },
+    claudeCode: {
+      modelMap: { "claude-haiku-4-5": "citation-target/claude-opus-5" },
+    },
+  } as OcxConfig);
+  const server = startServer(0);
+  try {
+    const streamingSource = { ...routedAnthropicSource(), stream: true };
+    const streamingResponse = await originalFetch(new URL("/v1/messages", server.url), {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": "placeholder" },
+      body: JSON.stringify(streamingSource),
+    });
+    expect(streamingResponse.status).toBe(200);
+    const frames = (await streamingResponse.text())
+      .split("\n")
+      .filter(line => line.startsWith("data: "))
+      .map(line => JSON.parse(line.slice(6)) as Record<string, any>);
+    expect(frames
+      .filter(frame => frame.type === "content_block_delta")
+      .map(frame => frame.delta)).toEqual([
+      { type: "text_delta", text: "A" },
+      { type: "citations_delta", citation: citations[0] },
+      { type: "text_delta", text: "B" },
+      { type: "citations_delta", citation: citations[1] },
+    ]);
+
+    const bufferedSource = { ...routedAnthropicSource(), stream: false };
+    const bufferedResponse = await originalFetch(new URL("/v1/messages", server.url), {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": "placeholder" },
+      body: JSON.stringify(bufferedSource),
+    });
+    expect(bufferedResponse.status).toBe(200);
+    const buffered = await bufferedResponse.json() as { content: Array<Record<string, unknown>> };
+    expect(buffered.content).toContainEqual({ type: "text", text: "AB", citations });
+    expect(sends).toBe(2);
+  } finally {
+    await server.stop(true);
+  }
+});
+
+test("routed canonical Anthropic preserves the validated Messages source wire", async () => {
+  const captured: Array<{ url: string; headers: Headers; body: Record<string, unknown> }> = [];
+  globalThis.fetch = async (input, init) => {
+    const request = new Request(input, init);
+    if (request.url !== "https://api.anthropic.com/v1/messages") {
+      throw new Error(`unexpected egress ${request.url}`);
+    }
+    captured.push({
+      url: request.url,
+      headers: request.headers,
+      body: await request.json() as Record<string, unknown>,
+    });
+    return new Response([
+      'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","model":"claude-opus-5","content":[],"stop_reason":null,"usage":{"input_tokens":3,"cache_creation_input_tokens":5,"cache_read_input_tokens":7,"output_tokens":0}}}\n\n',
+      'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_reply","name":"custom_source","input":{}}}\n\n',
+      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}\n\n',
+      'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join(""), { headers: { "content-type": "text/event-stream" } });
+  };
+  writeFileSync(join(testDir, "auth.json"), JSON.stringify({
+    anthropic: {
+      activeAccountId: "test-account",
+      accounts: [{
+        id: "test-account",
+        credential: {
+          access: "selected-oauth-token",
+          refresh: "test-refresh-token",
+          expires: 9999999999999,
+        },
+      }],
+    },
+  }), { mode: 0o600 });
+  saveConfig({
+    port: 0,
+    defaultProvider: "anthropic",
+    providers: {
+      anthropic: {
+        adapter: "anthropic",
+        baseUrl: "https://api.anthropic.com",
+        authMode: "oauth",
+        headers: { "anthropic-beta": "provider-beta,source-beta" },
+      },
+    },
+    claudeCode: {
+      modelMap: { "claude-haiku-4-5": "anthropic/claude-opus-5" },
+    },
+  } as OcxConfig);
+  const source = routedAnthropicSource();
+  const server = startServer(0);
+  try {
+    const response = await originalFetch(new URL("/v1/messages", server.url), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": "placeholder",
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": "source-beta,duplicate-beta,source-beta",
+        "user-agent": "source-user-agent",
+        "x-client-request-id": "source-request-id",
+        "x-arbitrary-source-header": "must-not-forward",
+      },
+      body: JSON.stringify(source),
+    });
+    if (!response.ok) throw new Error(`${response.status}: ${await response.clone().text()} (captured=${captured.length})`);
+    expect(response.status).toBe(200);
+    const result = await response.json() as { content?: Array<{ type?: string; name?: string }> };
+    expect(captured).toHaveLength(1);
+    expect(captured[0]!.body).toEqual({ ...structuredClone(source), model: "claude-opus-5", stream: true });
+    expect(captured[0]!.headers.get("authorization")).toBe("Bearer selected-oauth-token");
+    expect(captured[0]!.headers.get("x-api-key")).toBeNull();
+    expect(captured[0]!.headers.get("anthropic-version")).toBe("2023-06-01");
+    expect(captured[0]!.headers.get("user-agent")).not.toBe("source-user-agent");
+    expect(captured[0]!.headers.get("x-client-request-id")).not.toBe("source-request-id");
+    expect(captured[0]!.headers.get("x-arbitrary-source-header")).toBeNull();
+    expect(captured[0]!.headers.get("anthropic-beta")).toBe(
+      "source-beta,duplicate-beta,provider-beta,claude-code-20250219,oauth-2025-04-20",
+    );
+    expect(result.content?.find(block => block.type === "tool_use")?.name).toBe("custom_source");
+  } finally {
+    await server.stop(true);
+  }
+});
+
+test("routed canonical Anthropic preserves native server tools on source wire and bypasses media bridges", async () => {
+  const captured: Record<string, unknown>[] = [];
+  globalThis.fetch = async (input, init) => {
+    const request = new Request(input, init);
+    if (request.url !== "https://api.anthropic.com/v1/messages") {
+      throw new Error(`unexpected egress ${request.url}`);
+    }
+    captured.push(await request.json() as Record<string, unknown>);
+    return anthropicTextSse();
+  };
+  saveConfig({
+    port: 0,
+    defaultProvider: "target",
+    providers: {
+      target: {
+        adapter: "anthropic",
+        baseUrl: "https://api.anthropic.com",
+        authMode: "key",
+        apiKey: "selected-key",
+      },
+      xai: {
+        adapter: "openai-chat",
+        baseUrl: "https://api.x.ai/v1",
+        authMode: "key",
+        apiKey: "xai-test-key",
+      },
+    },
+    images: { videoBridgeEnabled: true },
+    claudeCode: { modelMap: { "claude-haiku-4-5": "target/claude-opus-5" } },
+  } as OcxConfig);
+  const source = routedAnthropicNativeToolSource();
+  const server = startServer(0);
+  try {
+    const response = await originalFetch(new URL("/v1/messages", server.url), {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": "placeholder" },
+      body: JSON.stringify(source),
+    });
+    expect(response.status).toBe(200);
+    await response.text();
+    expect(captured).toEqual([{
+      ...structuredClone(source),
+      model: "claude-opus-5",
+      stream: true,
+    }]);
+  } finally {
+    await server.stop(true);
+  }
+});
+
+test("Anthropic-native tools fail closed before incompatible upstream sends", async () => {
+  const cases = [
+    {
+      name: "custom endpoint",
+      source: routedAnthropicNativeToolSource(),
+      provider: {
+        adapter: "anthropic",
+        baseUrl: "https://compatible.example",
+        authMode: "key",
+        apiKey: "selected-key",
+      },
+      target: "claude-opus-5",
+    },
+    {
+      name: "incompatible target model",
+      source: {
+        ...routedAnthropicNativeToolSource(),
+        model: "claude-sonnet-4-5",
+        thinking: { type: "adaptive" },
+      },
+      provider: {
+        adapter: "anthropic",
+        baseUrl: "https://api.anthropic.com",
+        authMode: "key",
+        apiKey: "selected-key",
+      },
+      target: "claude-haiku-4-5",
+    },
+  ];
+
+  for (const testCase of cases) {
+    let sends = 0;
+    globalThis.fetch = async () => {
+      sends++;
+      throw new Error(`unexpected ${testCase.name} upstream send`);
+    };
+    saveConfig({
+      port: 0,
+      defaultProvider: "target",
+      providers: { target: testCase.provider },
+      claudeCode: { modelMap: { [testCase.source.model]: `target/${testCase.target}` } },
+    } as OcxConfig);
+    const server = startServer(0);
+    try {
+      const response = await originalFetch(new URL("/v1/messages", server.url), {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-api-key": "placeholder" },
+        body: JSON.stringify(testCase.source),
+      });
+      expect(response.status).toBe(400);
+      expect(await response.text()).toContain("require exact canonical Anthropic Messages replay");
+      expect(sends).toBe(0);
+    } finally {
+      await server.stop(true);
+    }
+  }
+});
+
+test("combo rejects exact-only source without recording a physical attempt", async () => {
+  clearRequestLogsForTests();
+  let sends = 0;
+  globalThis.fetch = async () => {
+    sends++;
+    throw new Error("unexpected exact-only combo upstream send");
+  };
+  saveConfig({
+    port: 0,
+    defaultProvider: "target",
+    providers: {
+      target: {
+        adapter: "anthropic",
+        baseUrl: "https://compatible.example",
+        authMode: "key",
+        apiKey: "selected-key",
+      },
+    },
+    combos: {
+      waterfall: {
+        strategy: "failover",
+        targets: [{ provider: "target", model: "claude-opus-5" }],
+      },
+    },
+    claudeCode: { modelMap: { "claude-haiku-4-5": "combo/waterfall" } },
+  } as OcxConfig);
+  const server = startServer(0);
+  try {
+    const response = await originalFetch(new URL("/v1/messages", server.url), {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": "placeholder" },
+      body: JSON.stringify(routedAnthropicNativeToolSource()),
+    });
+    expect(response.status).toBe(400);
+    expect(await response.text()).toContain("require exact canonical Anthropic Messages replay");
+    expect(sends).toBe(0);
+    const entry = getRequestLogEntries().findLast(row => row.surface === "claude");
+    expect(entry?.provider).toBe("combo");
+    expect(entry?.attempts ?? []).toEqual([]);
+  } finally {
+    await server.stop(true);
+    clearRequestLogsForTests();
+  }
+});
+
+test("exact-only image request rejects before text-only vision sidecar dispatch", async () => {
+  let sends = 0;
+  globalThis.fetch = async () => {
+    sends++;
+    throw new Error("unexpected exact-only image upstream send");
+  };
+  saveConfig({
+    port: 0,
+    defaultProvider: "target",
+    providers: {
+      target: {
+        adapter: "anthropic",
+        baseUrl: "https://api.anthropic.com",
+        authMode: "key",
+        apiKey: "selected-key",
+        noVisionModels: ["claude-opus-5"],
+      },
+    },
+    visionSidecar: { backend: "openai" },
+    claudeCode: { modelMap: { "claude-haiku-4-5": "target/claude-opus-5" } },
+  } as OcxConfig);
+  const source = routedAnthropicNativeToolSource();
+  source.messages = [{
+    role: "user",
+    content: [
+      {
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: "image/png",
+          data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+        },
+      },
+      { type: "text", text: "inspect" },
+    ],
+  }];
+  const server = startServer(0);
+  try {
+    const response = await originalFetch(new URL("/v1/messages", server.url), {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": "placeholder" },
+      body: JSON.stringify(source),
+    });
+    expect(response.status).toBe(400);
+    expect(sends).toBe(0);
+  } finally {
+    await server.stop(true);
+  }
+});
+
+test("representable web search uses translated sidecar when Anthropic source replay is incompatible", async () => {
+  const exaBodies: Record<string, any>[] = [];
+  const anthropicBodies: Record<string, any>[] = [];
+  globalThis.fetch = async (input, init) => {
+    const request = new Request(input, init);
+    if (request.url === "https://api.exa.ai/search") {
+      exaBodies.push(await request.json() as Record<string, any>);
+      return Response.json({
+        results: [{ title: "OpenCodex", url: "https://example.test/opencodex", text: "search result" }],
+      });
+    }
+    if (request.url !== "https://api.anthropic.com/v1/messages") {
+      throw new Error(`unexpected egress ${request.url}`);
+    }
+    anthropicBodies.push(await request.json() as Record<string, any>);
+    if (anthropicBodies.length === 1) {
+      return new Response([
+        'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_search","type":"message","role":"assistant","model":"claude-haiku-4-5","content":[],"stop_reason":null,"usage":{"input_tokens":3,"output_tokens":0}}}\n\n',
+        'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_search","name":"web_search","input":{}}}\n\n',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"query\\":\\"OpenCodex\\"}"}}\n\n',
+        'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}}\n\n',
+        'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+      ].join(""), { headers: { "content-type": "text/event-stream" } });
+    }
+    return anthropicTextSse("searched");
+  };
+  saveConfig({
+    port: 0,
+    defaultProvider: "target",
+    providers: {
+      target: {
+        adapter: "anthropic",
+        baseUrl: "https://api.anthropic.com",
+        authMode: "key",
+        apiKey: "selected-key",
+      },
+    },
+    webSearchSidecar: { backend: "exa", exaApiKey: "exa-test-key" },
+    claudeCode: { modelMap: { "claude-sonnet-4-5": "target/claude-haiku-4-5" } },
+  } as OcxConfig);
+  const source = {
+    model: "claude-sonnet-4-5",
+    max_tokens: 128,
+    stream: false,
+    thinking: { type: "adaptive" },
+    context_management: { source_sentinel: true },
+    tools: [{ type: "web_search_20260209", name: "web_search" }],
+    messages: [{ role: "user", content: "search OpenCodex" }],
+  };
+  const server = startServer(0);
+  try {
+    const response = await originalFetch(new URL("/v1/messages", server.url), {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": "placeholder" },
+      body: JSON.stringify(source),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain("searched");
+    expect(exaBodies).toHaveLength(1);
+    expect(exaBodies[0]!.query).toBe("OpenCodex");
+    expect(anthropicBodies).toHaveLength(2);
+    expect(anthropicBodies[0]!.context_management).toBeUndefined();
+    expect(anthropicBodies[0]!.tools).toContainEqual(expect.objectContaining({ name: "web_search" }));
+  } finally {
+    await server.stop(true);
+  }
+});
+
+test("JSON Responses fallback keeps stop_sequence in synthesized Anthropic SSE", async () => {
+  let sends = 0;
+  globalThis.fetch = async (input, init) => {
+    const request = new Request(input, init);
+    if (request.url !== "https://api.openai.com/v1/responses") {
+      throw new Error(`unexpected egress ${request.url}`);
+    }
+    sends++;
+    return Response.json({
+      id: "resp_stop_sequence",
+      object: "response",
+      status: "completed",
+      output: [{
+        type: "message",
+        id: "msg_stop_sequence",
+        role: "assistant",
+        status: "completed",
+        content: [{ type: "output_text", text: "done", annotations: [] }],
+      }],
+      usage: { input_tokens: 3, output_tokens: 1 },
+      _ocx_anthropic_stop_reason: "stop_sequence",
+      _ocx_anthropic_stop_sequence: "DONE",
+    });
+  };
+  saveConfig({
+    port: 0,
+    defaultProvider: "target",
+    providers: {
+      target: {
+        adapter: "openai-responses",
+        baseUrl: "https://api.openai.com/v1",
+        authMode: "key",
+        apiKey: "selected-key",
+      },
+    },
+    claudeCode: { modelMap: { "claude-haiku-4-5": "target/gpt-5.4" } },
+  } as OcxConfig);
+  const source = {
+    model: "claude-haiku-4-5",
+    max_tokens: 128,
+    stream: true,
+    messages: [{ role: "user", content: "stop at DONE" }],
+  };
+  const server = startServer(0);
+  try {
+    const response = await originalFetch(new URL("/v1/messages", server.url), {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": "placeholder" },
+      body: JSON.stringify(source),
+    });
+    expect(response.status).toBe(200);
+    const body = await response.text();
+    expect(body).toContain('"stop_reason":"stop_sequence"');
+    expect(body).toContain('"stop_sequence":"DONE"');
+    expect(sends).toBe(1);
+  } finally {
+    await server.stop(true);
+  }
+});
+
+test("routed canonical source falls back when history or thinking is incompatible with the target", async () => {
+  const captured: Array<Record<string, any>> = [];
+  globalThis.fetch = async (input, init) => {
+    const request = new Request(input, init);
+    if (request.url !== "https://api.anthropic.com/v1/messages") {
+      throw new Error(`unexpected egress ${request.url}`);
+    }
+    captured.push(await request.json() as Record<string, any>);
+    return anthropicTextSse();
+  };
+  saveConfig({
+    port: 0,
+    defaultProvider: "target",
+    providers: {
+      target: {
+        adapter: "anthropic",
+        baseUrl: "https://api.anthropic.com",
+        authMode: "key",
+        apiKey: "selected-key",
+      },
+    },
+    claudeCode: {
+      modelMap: {
+        "claude-haiku-4-5": "target/claude-opus-5",
+        "claude-sonnet-4-5": "target/claude-haiku-4-5",
+        "claude-opus-4-6": "target/claude-opus-5",
+      },
+    },
+  } as OcxConfig);
+  const server = startServer(0);
+  try {
+    const invalidHistory = routedAnthropicSource();
+    (invalidHistory.messages as Array<Record<string, unknown>>).splice(-1, 0, {
+      role: "system",
+      content: [{ type: "text", text: "mid-turn", cache_control: { type: "ephemeral" } }],
+    });
+    const historyResponse = await originalFetch(new URL("/v1/messages", server.url), {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": "placeholder" },
+      body: JSON.stringify(invalidHistory),
+    });
+    expect(historyResponse.status).toBe(200);
+    await historyResponse.text();
+    expect(captured[0]!.context_management).toBeUndefined();
+    expect(captured[0]!.messages.every((message: Record<string, unknown>) =>
+      message.role === "user" || message.role === "assistant")).toBe(true);
+    expect(JSON.stringify(captured[0]!.system)).toContain("mid-turn");
+
+    const adaptiveToLegacy = routedAnthropicSource();
+    adaptiveToLegacy.model = "claude-sonnet-4-5";
+    const legacyResponse = await originalFetch(new URL("/v1/messages", server.url), {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": "placeholder" },
+      body: JSON.stringify(adaptiveToLegacy),
+    });
+    expect(legacyResponse.status).toBe(200);
+    await legacyResponse.text();
+    expect(captured[1]!.context_management).toBeUndefined();
+    expect(captured[1]!.model).toBe("claude-haiku-4-5");
+    expect(captured[1]!.thinking?.type).toBe("enabled");
+    expect(captured[1]!.output_config?.effort).toBeUndefined();
+
+    const enabledToAdaptive = routedAnthropicSource();
+    enabledToAdaptive.model = "claude-opus-4-6";
+    enabledToAdaptive.thinking = { type: "enabled", budget_tokens: 4096 };
+    delete enabledToAdaptive.output_config;
+    const adaptiveResponse = await originalFetch(new URL("/v1/messages", server.url), {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": "placeholder" },
+      body: JSON.stringify(enabledToAdaptive),
+    });
+    expect(adaptiveResponse.status).toBe(200);
+    await adaptiveResponse.text();
+    expect(captured[2]!.context_management).toBeUndefined();
+    expect(captured[2]!.model).toBe("claude-opus-5");
+    expect(captured[2]!.thinking).toEqual({ type: "adaptive" });
+    expect(captured[2]!.output_config?.effort).toBeDefined();
+  } finally {
+    await server.stop(true);
+  }
+});
+
+test("routed canonical source preserves combo attempts across Anthropic OAuth account rotation", async () => {
+  clearRequestLogsForTests();
+  clearAnthropicAccountPoolState();
+  clearPoolRotationState();
+  const sends: Array<{ authorization: string | null; body: string }> = [];
+  globalThis.fetch = async (input, init) => {
+    const request = new Request(input, init);
+    if (request.url !== "https://api.anthropic.com/v1/messages") {
+      throw new Error(`unexpected egress ${request.url}`);
+    }
+    sends.push({ authorization: request.headers.get("authorization"), body: await request.text() });
+    if (sends.length === 1) {
+      return Response.json(
+        { type: "error", error: { type: "rate_limit_error", message: "rate limited" } },
+        { status: 429, headers: { "retry-after": "30" } },
+      );
+    }
+    return anthropicTextSse("rotated");
+  };
+  writeFileSync(join(testDir, "auth.json"), JSON.stringify({
+    anthropic: {
+      activeAccountId: "account-a",
+      accounts: [
+        {
+          id: "account-a",
+          credential: {
+            access: "synthetic-access-a",
+            refresh: "synthetic-refresh-a",
+            expires: 9999999999999,
+            accountId: "synthetic-account-a",
+          },
+        },
+        {
+          id: "account-b",
+          credential: {
+            access: "synthetic-access-b",
+            refresh: "synthetic-refresh-b",
+            expires: 9999999999999,
+            accountId: "synthetic-account-b",
+          },
+        },
+      ],
+    },
+  }), { mode: 0o600 });
+  saveConfig({
+    port: 0,
+    defaultProvider: "anthropic",
+    providers: {
+      anthropic: {
+        adapter: "anthropic",
+        baseUrl: "https://api.anthropic.com",
+        authMode: "oauth",
+      },
+    },
+    anthropicAccountPool: { enabled: true, autoSwitchThreshold: 100 },
+    combos: {
+      waterfall: {
+        strategy: "failover",
+        targets: [{ provider: "anthropic", model: "claude-opus-5" }],
+      },
+    },
+    claudeCode: { modelMap: { "claude-haiku-4-5": "combo/waterfall" } },
+  } as OcxConfig);
+  const source = routedAnthropicSource();
+  const server = startServer(0);
+  try {
+    const response = await originalFetch(new URL("/v1/messages", server.url), {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": "placeholder" },
+      body: JSON.stringify(source),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain("rotated");
+    expect(sends.map(send => send.authorization)).toEqual([
+      "Bearer synthetic-access-a",
+      "Bearer synthetic-access-b",
+    ]);
+    expect(sends).toHaveLength(2);
+    expect(sends[1]!.body).toBe(sends[0]!.body);
+    expect(JSON.parse(sends[0]!.body)).toEqual({
+      ...structuredClone(source),
+      model: "claude-opus-5",
+      stream: true,
+    });
+    const entry = getRequestLogEntries().findLast(row => row.surface === "claude");
+    expect(entry?.provider).toBe("combo");
+    expect(entry?.comboTargetAdvanced).toBeUndefined();
+    expect(entry?.attempts).toHaveLength(2);
+    expect(entry?.attempts?.[0]).toMatchObject({
+      status: 429,
+      sendCount: 1,
+    });
+    expect(entry?.attempts?.[1]).toMatchObject({
+      status: 200,
+      sendCount: 1,
+      recoveryKinds: ["anthropic-oauth-429"],
+    });
+    expect(entry?.attempts?.[1]?.provider).not.toBe(entry?.attempts?.[0]?.provider);
+  } finally {
+    await server.stop(true);
+    clearAnthropicAccountPoolState();
+    clearPoolRotationState();
+    clearRequestLogsForTests();
+  }
+});
+
+test("routed canonical source rebuilds only images after Anthropic 413", async () => {
+  clearRequestLogsForTests();
+  const onePxPng = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+  const png = await new Bun.Image(Buffer.from(onePxPng, "base64"))
+    .resize(1500, 1000)
+    .png()
+    .toBuffer();
+  const source = {
+    model: "claude-haiku-4-5",
+    max_tokens: 128,
+    stream: false,
+    messages: [{
+      role: "user",
+      content: [
+        {
+          type: "image",
+          source: {
+            type: "base64",
+            media_type: "image/png",
+            data: Buffer.from(png).toString("base64"),
+          },
+          cache_control: { type: "ephemeral", ttl: "1h" },
+        },
+        { type: "text", text: "look" },
+      ],
+    }],
+    context_management: { source_sentinel: true },
+  };
+  const snapshot = structuredClone(source);
+  const sends: Array<{ apiKey: string | null; body: Record<string, any> }> = [];
+  globalThis.fetch = async (input, init) => {
+    const request = new Request(input, init);
+    if (request.url !== "https://api.anthropic.com/v1/messages") {
+      throw new Error(`unexpected egress ${request.url}`);
+    }
+    sends.push({
+      apiKey: request.headers.get("x-api-key"),
+      body: await request.json() as Record<string, any>,
+    });
+    if (sends.length === 1) {
+      return Response.json(
+        { type: "error", error: { type: "request_too_large", message: "too large" } },
+        { status: 413 },
+      );
+    }
+    return anthropicTextSse("resized");
+  };
+  saveConfig({
+    port: 0,
+    defaultProvider: "target",
+    providers: {
+      target: {
+        adapter: "anthropic",
+        baseUrl: "https://api.anthropic.com",
+        authMode: "key",
+        apiKey: "selected-key",
+      },
+    },
+    claudeCode: { modelMap: { "claude-haiku-4-5": "target/claude-opus-5" } },
+  } as OcxConfig);
+  const server = startServer(0);
+  try {
+    const response = await originalFetch(new URL("/v1/messages", server.url), {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": "placeholder" },
+      body: JSON.stringify(source),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain("resized");
+    expect(source).toEqual(snapshot);
+    expect(sends).toHaveLength(2);
+    expect(sends.map(send => send.apiKey)).toEqual(["selected-key", "selected-key"]);
+    expect(sends[0]!.body).toEqual({ ...structuredClone(snapshot), model: "claude-opus-5", stream: true });
+    const firstImage = sends[0]!.body.messages[0].content[0];
+    const secondImage = sends[1]!.body.messages[0].content[0];
+    expect(firstImage.source.media_type).toBe("image/png");
+    expect(secondImage.source.media_type).toBe("image/jpeg");
+    expect(firstImage.cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
+    expect(secondImage.cache_control).toEqual(firstImage.cache_control);
+    const expectedRetry = structuredClone(sends[0]!.body);
+    expectedRetry.messages[0].content[0] = secondImage;
+    expect(sends[1]!.body).toEqual(expectedRetry);
+    const entry = getRequestLogEntries().findLast(row => row.surface === "claude");
+    expect(entry?.attempts).toHaveLength(1);
+    expect(entry?.attempts?.[0]).toMatchObject({ sendCount: 2, recoveryKinds: ["image-413"] });
+  } finally {
+    await server.stop(true);
+    clearRequestLogsForTests();
+  }
+});
+
+test("routed canonical source retries empty output byte-identically and suppresses generated continuation", async () => {
+  clearRequestLogsForTests();
+  const sends: string[] = [];
+  globalThis.fetch = async (input, init) => {
+    const request = new Request(input, init);
+    if (request.url !== "https://api.anthropic.com/v1/messages") {
+      throw new Error(`unexpected egress ${request.url}`);
+    }
+    sends.push(await request.text());
+    if (sends.length === 1) {
+      return new Response([
+        'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_empty","type":"message","role":"assistant","model":"claude-opus-5","content":[],"stop_reason":null,"usage":{"input_tokens":3,"output_tokens":0}}}\n\n',
+        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":0}}\n\n',
+        'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+      ].join(""), { headers: { "content-type": "text/event-stream" } });
+    }
+    if (sends.length === 2) return anthropicTextSse("retried");
+    if (sends.length === 3) return anthropicTextSse("limited", "max_tokens");
+    throw new Error("unexpected generated continuation");
+  };
+  saveConfig({
+    port: 0,
+    defaultProvider: "target",
+    emptyCompletionRetry: true,
+    providers: {
+      target: {
+        adapter: "anthropic",
+        baseUrl: "https://api.anthropic.com",
+        authMode: "key",
+        apiKey: "selected-key",
+      },
+    },
+    claudeCode: {
+      modelMap: {
+        "claude-haiku-4-5": "target/claude-opus-5",
+        "claude-sonnet-4-5": "target/claude-opus-5",
+      },
+    },
+  } as OcxConfig);
+  const server = startServer(0);
+  try {
+    const source = routedAnthropicSource();
+    const retried = await originalFetch(new URL("/v1/messages", server.url), {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": "placeholder" },
+      body: JSON.stringify(source),
+    });
+    expect(retried.status).toBe(200);
+    expect(await retried.text()).toContain("retried");
+    expect(sends).toHaveLength(2);
+    expect(sends[1]).toBe(sends[0]);
+    const firstEntry = getRequestLogEntries().findLast(row => row.surface === "claude");
+    expect(firstEntry?.attempts?.[0]).toMatchObject({
+      sendCount: 2,
+      recoveryKinds: ["empty-completion"],
+    });
+
+    source.model = "claude-sonnet-4-5";
+    const limited = await originalFetch(new URL("/v1/messages", server.url), {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": "placeholder" },
+      body: JSON.stringify(source),
+    });
+    expect(limited.status).toBe(200);
+    expect(await limited.text()).toContain("limited");
+    expect(sends).toHaveLength(3);
+    expect(JSON.parse(sends[2]!)).toEqual({
+      ...structuredClone(source),
+      model: "claude-opus-5",
+      stream: true,
+    });
+    const lastEntry = getRequestLogEntries().findLast(row => row.surface === "claude");
+    expect(lastEntry?.attempts?.[0]).toMatchObject({ sendCount: 1 });
+    expect(lastEntry?.attempts?.[0]?.recoveryKinds).toEqual([]);
+  } finally {
+    await server.stop(true);
+    clearRequestLogsForTests();
+  }
+});
+
+test("same metadata user keeps concurrent routed source aborts isolated", async () => {
+  clearRequestLogsForTests();
+  const encoder = new TextEncoder();
+  type PhysicalRequest = {
+    signal: AbortSignal;
+    controller: ReadableStreamDefaultController<Uint8Array>;
+    body: Record<string, any>;
+  };
+  const physical: PhysicalRequest[] = [];
+  let resolveFirstSend!: () => void;
+  let resolveSecondSend!: () => void;
+  let resolveFirstAbort!: () => void;
+  const firstSend = new Promise<void>(resolve => { resolveFirstSend = resolve; });
+  const secondSend = new Promise<void>(resolve => { resolveSecondSend = resolve; });
+  const firstAbort = new Promise<void>(resolve => { resolveFirstAbort = resolve; });
+
+  globalThis.fetch = async (input, init) => {
+    const request = new Request(input, init);
+    if (request.url !== "https://api.anthropic.com/v1/messages") {
+      throw new Error(`unexpected egress ${request.url}`);
+    }
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const stream = new ReadableStream<Uint8Array>({
+      start(next) {
+        controller = next;
+        next.enqueue(encoder.encode([
+          'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_held","type":"message","role":"assistant","model":"claude-opus-5","content":[],"stop_reason":null,"usage":{"input_tokens":3,"output_tokens":0}}}\n\n',
+          'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+          'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"held"}}\n\n',
+        ].join("")));
+      },
+    });
+    const entry = {
+      signal: request.signal,
+      controller,
+      body: await request.json() as Record<string, any>,
+    };
+    physical.push(entry);
+    request.signal.addEventListener("abort", () => {
+      try { controller.error(request.signal.reason); } catch { /* already settled */ }
+      if (physical[0] === entry) resolveFirstAbort();
+    }, { once: true });
+    if (physical.length === 1) resolveFirstSend();
+    if (physical.length === 2) resolveSecondSend();
+    return new Response(stream, { headers: { "content-type": "text/event-stream" } });
+  };
+
+  const config = {
+    port: 0,
+    defaultProvider: "target",
+    providers: {
+      target: {
+        adapter: "anthropic",
+        baseUrl: "https://api.anthropic.com",
+        authMode: "key",
+        apiKey: "selected-key",
+      },
+    },
+    combos: {
+      isolated: {
+        strategy: "failover",
+        targets: [{ provider: "target", model: "claude-opus-5" }],
+      },
+    },
+    claudeCode: { modelMap: { "claude-haiku-4-5": "combo/isolated" } },
+  } as OcxConfig;
+  const invoke = (client: AbortController, text: string) => handleClaudeMessages(
+    new Request("http://localhost/v1/messages", {
+      method: "POST",
+      signal: client.signal,
+      headers: { "content-type": "application/json", "x-api-key": "placeholder" },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5",
+        max_tokens: 16,
+        stream: true,
+        metadata: { user_id: "shared-user-id" },
+        messages: [{ role: "user", content: text }],
+      }),
+    }),
+    config,
+    { model: "", provider: "" } as RequestLogContext,
+  );
+
+  try {
+    const firstClient = new AbortController();
+    const firstPending = invoke(firstClient, "first");
+    await firstSend;
+    const secondClient = new AbortController();
+    const secondPending = invoke(secondClient, "second");
+    await secondSend;
+    const [firstResponse, secondResponse] = await Promise.all([firstPending, secondPending]);
+    expect(firstResponse.status).toBe(200);
+    expect(secondResponse.status).toBe(200);
+    expect(physical).toHaveLength(2);
+    expect(physical[0]!.body.metadata).toEqual(physical[1]!.body.metadata);
+
+    firstClient.abort(new DOMException("first client closed", "AbortError"));
+    await firstAbort;
+    expect(physical[0]!.signal.aborted).toBe(true);
+    expect(physical[1]!.signal.aborted).toBe(false);
+
+    physical[1]!.controller.enqueue(encoder.encode([
+      'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
+      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+    ].join("")));
+    physical[1]!.controller.close();
+    expect(await secondResponse.text()).toContain("message_stop");
+  } finally {
+    for (const entry of physical) {
+      if (!entry.signal.aborted) {
+        try { entry.controller.close(); } catch { /* already settled */ }
+      }
+    }
+    clearRequestLogsForTests();
+  }
+});
+
+test("routed source replay is restricted to the exact canonical Anthropic Messages URL", async () => {
+  const destinations = [
+    "http://api.anthropic.com",
+    "https://api.anthropic.com.evil.test",
+    "https://api.anthropic.com:8443",
+    "https://api.anthropic.com/proxy",
+    "https://compatible.example/v1",
+  ];
+
+  for (const baseUrl of destinations) {
+    const captured: Array<{ url: string; headers: Headers; body: Record<string, unknown> }> = [];
+    globalThis.fetch = async (input, init) => {
+      const request = new Request(input, init);
+      captured.push({
+        url: request.url,
+        headers: request.headers,
+        body: await request.json() as Record<string, unknown>,
+      });
+      return anthropicTextSse();
+    };
+    saveConfig({
+      port: 0,
+      defaultProvider: "target",
+      providers: {
+        target: { adapter: "anthropic", baseUrl, authMode: "key", apiKey: "selected-key" },
+      },
+      claudeCode: {
+        modelMap: { "claude-haiku-4-5": "target/claude-opus-5" },
+      },
+    } as OcxConfig);
+    const server = startServer(0);
+    try {
+      const response = await originalFetch(new URL("/v1/messages", server.url), {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-api-key": "caller-key" },
+        body: JSON.stringify(routedAnthropicSource()),
+      });
+      expect(response.status).toBe(200);
+      await response.text();
+      expect(captured).toHaveLength(1);
+      expect(captured[0]!.body.context_management).toBeUndefined();
+      expect(captured[0]!.headers.get("x-api-key")).toBe("selected-key");
+      expect(captured[0]!.headers.get("authorization")).toBeNull();
+    } finally {
+      await server.stop(true);
+    }
+  }
+
+  const parsed = {
+    modelId: "claude-opus-5",
+    stream: true,
+    options: {},
+    context: { systemPrompt: ["system"], messages: [{ role: "user", content: "hello" }] },
+  } as OcxParsedRequest;
+  for (const baseUrl of [
+    "https://api.anthropic.com?target=proxy",
+    "https://api.anthropic.com#proxy",
+  ]) {
+    const request = await createAnthropicAdapter({
+      adapter: "anthropic",
+      baseUrl,
+      authMode: "key",
+      apiKey: "selected-key",
+    }).buildRequest(parsed, {
+      headers: new Headers(),
+      translatorBudget: createTestTranslatorBudget(),
+      anthropicMessagesSource: { body: routedAnthropicSource(), headers: {} },
+    });
+    expect(request.anthropicSourceReplay).toBeUndefined();
+    expect((JSON.parse(request.body) as Record<string, unknown>).context_management).toBeUndefined();
+  }
+});
+
+test("mixed combo isolates source wire and never fails over after visible output", async () => {
+  clearRequestLogsForTests();
+  const { server: backup, captured: backupBodies } = mockChatUpstreamCapturing();
+  const anthropicBodies: Array<Record<string, unknown>> = [];
+  let failAfterVisibleOutput = false;
+  globalThis.fetch = async (input, init) => {
+    const request = new Request(input, init);
+    if (request.url === "https://api.anthropic.com/v1/messages") {
+      anthropicBodies.push(await request.json() as Record<string, unknown>);
+      if (failAfterVisibleOutput) {
+        return new Response([
+          'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_test","type":"message","role":"assistant","model":"claude-opus-5","content":[],"stop_reason":null,"usage":{"input_tokens":3,"output_tokens":0}}}\n\n',
+          'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+          'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"already visible"}}\n\n',
+          'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+          'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"late failure"}}\n\n',
+        ].join(""), { headers: { "content-type": "text/event-stream" } });
+      }
+      return new Response(
+        'event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"busy"}}\n\n',
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    }
+    return originalFetch(input, init);
+  };
+  saveConfig({
+    port: 0,
+    defaultProvider: "source-anthropic",
+    providers: {
+      "source-anthropic": {
+        adapter: "anthropic",
+        baseUrl: "https://api.anthropic.com",
+        authMode: "key",
+        apiKey: "selected-anthropic-key",
+      },
+      "source-anthropic-visible": {
+        adapter: "anthropic",
+        baseUrl: "https://api.anthropic.com",
+        authMode: "key",
+        apiKey: "selected-anthropic-key",
+      },
+      backup: {
+        adapter: "openai-chat",
+        baseUrl: `${backup.url.toString().replace(/\/$/, "")}/v1`,
+        authMode: "key",
+        apiKey: "backup-key",
+        allowPrivateNetwork: true,
+      },
+    },
+    combos: {
+      waterfall: {
+        strategy: "failover",
+        targets: [
+          { provider: "source-anthropic", model: "claude-opus-5" },
+          { provider: "backup", model: "gpt-test" },
+        ],
+      },
+      "visible-waterfall": {
+        strategy: "failover",
+        targets: [
+          { provider: "source-anthropic-visible", model: "claude-opus-5" },
+          { provider: "backup", model: "gpt-test" },
+        ],
+      },
+    },
+    claudeCode: {
+      modelMap: {
+        "claude-haiku-4-5": "combo/waterfall",
+        "claude-sonnet-4-5": "combo/visible-waterfall",
+      },
+    },
+  } as OcxConfig);
+  const source = routedAnthropicSource();
+  const server = startServer(0);
+  try {
+    const response = await originalFetch(new URL("/v1/messages", server.url), {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": "placeholder" },
+      body: JSON.stringify(source),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.text()).toContain("Hello from mock");
+    expect(anthropicBodies).toEqual([{ ...structuredClone(source), model: "claude-opus-5", stream: true }]);
+    expect(backupBodies).toHaveLength(1);
+    expect(backupBodies[0]!.context_management).toBeUndefined();
+    const entry = getRequestLogEntries().findLast(row => row.surface === "claude");
+    expect(entry?.attempts).toMatchObject([
+      { provider: "source-anthropic", model: "claude-opus-5", sendCount: 1 },
+      { provider: "backup", model: "gpt-test", sendCount: 1 },
+    ]);
+
+    failAfterVisibleOutput = true;
+    source.model = "claude-sonnet-4-5";
+    source.stream = true;
+    const lateFailure = await originalFetch(new URL("/v1/messages", server.url), {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": "placeholder" },
+      body: JSON.stringify(source),
+    });
+    expect(lateFailure.status).toBe(200);
+    const lateFailureBody = await lateFailure.text();
+    expect(lateFailureBody).toContain("already visible");
+    expect(lateFailureBody).not.toContain("Hello from mock");
+    expect(anthropicBodies).toHaveLength(2);
+    expect(anthropicBodies[1]).toEqual({ ...structuredClone(source), model: "claude-opus-5", stream: true });
+    expect(backupBodies).toHaveLength(1);
+    const lateEntry = getRequestLogEntries().findLast(row => row.surface === "claude");
+    expect(lateEntry?.attempts).toHaveLength(1);
+    expect(lateEntry?.attempts).toMatchObject([
+      { provider: "source-anthropic-visible", model: "claude-opus-5", sendCount: 1 },
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await server.stop(true);
+    backup.stop(true);
+    clearRequestLogsForTests();
   }
 });
 

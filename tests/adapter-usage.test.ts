@@ -3,7 +3,7 @@ import { anthropicToolCallId, MAX_TOOL_CALL_ID_LENGTH } from "../src/adapters/to
 import { createAnthropicAdapter as createAnthropicAdapterProduction } from "../src/adapters/anthropic";
 import { createGoogleAdapter as createGoogleAdapterProduction } from "../src/adapters/google";
 import { createOpenAIChatAdapter as createOpenAIChatAdapterProduction } from "../src/adapters/openai-chat";
-import { withTestTranslatorBudget } from "./helpers/translator-budget";
+import { createTestTranslatorBudget, withTestTranslatorBudget } from "./helpers/translator-budget";
 
 const createAnthropicAdapter = (...args: Parameters<typeof createAnthropicAdapterProduction>) =>
   withTestTranslatorBudget(createAnthropicAdapterProduction(...args));
@@ -321,6 +321,95 @@ describe("usage and content retention (F2)", () => {
         cacheCreationInputTokens: 2,
       },
     });
+  });
+
+  test("anthropic source-replay stream preserves opaque citation deltas in order", async () => {
+    const adapter = createAnthropicAdapterProduction({ ...provider, adapter: "anthropic" });
+    const budget = createTestTranslatorBudget();
+    const request = {
+      url: "https://api.anthropic.com/v1/messages",
+      method: "POST",
+      headers: {},
+      body: "{}",
+      anthropicSourceReplay: true,
+    };
+    const citations = [
+      { type: "char_location", cited_text: "first", document_index: 0, start_char_index: 4, end_char_index: 9 },
+      { type: "page_location", cited_text: "second", document_index: 1, start_page_number: 2, end_page_number: 3 },
+    ];
+    const response = new Response([
+      'event: message_start\n',
+      'data: {"type":"message_start","message":{"usage":{"input_tokens":5}}}\n\n',
+      'event: content_block_start\n',
+      'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+      'event: content_block_delta\n',
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"A"}}\n\n',
+      'event: content_block_delta\n',
+      `data: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "citations_delta", citation: citations[0] } })}\n\n`,
+      'event: content_block_delta\n',
+      'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"B"}}\n\n',
+      'event: content_block_delta\n',
+      `data: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "citations_delta", citation: citations[1] } })}\n\n`,
+      'event: content_block_stop\n',
+      'data: {"type":"content_block_stop","index":0}\n\n',
+      'event: message_delta\n',
+      'data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":2}}\n\n',
+      'event: message_stop\n',
+      'data: {"type":"message_stop"}\n\n',
+    ].join(""));
+
+    const events = [];
+    for await (const event of adapter.parseStream(response, budget, undefined, request)) events.push(event);
+
+    expect(events).toEqual([
+      { type: "text_delta", text: "A" },
+      { type: "anthropic_citation_delta", delta: { type: "citations_delta", citation: citations[0] } },
+      { type: "text_delta", text: "B" },
+      { type: "anthropic_citation_delta", delta: { type: "citations_delta", citation: citations[1] } },
+      {
+        type: "done",
+        usage: { inputTokens: 5, outputTokens: 2 },
+        stopReason: "end_turn",
+        anthropicStopReason: "end_turn",
+        anthropicStopSequence: null,
+      },
+    ]);
+  });
+
+  test("anthropic source-replay buffered response preserves opaque citations in order", async () => {
+    const adapter = createAnthropicAdapterProduction({ ...provider, adapter: "anthropic" });
+    const budget = createTestTranslatorBudget();
+    const request = {
+      url: "https://api.anthropic.com/v1/messages",
+      method: "POST",
+      headers: {},
+      body: "{}",
+      anthropicSourceReplay: true,
+    };
+    const citations = [
+      { type: "content_block_location", cited_text: "first", document_index: 0, start_block_index: 1, end_block_index: 2 },
+      { type: "web_search_result_location", cited_text: "second", url: "https://example.test/source", title: "Source" },
+    ];
+
+    const events = await adapter.parseResponse?.(new Response(JSON.stringify({
+      content: [{ type: "text", text: "answer", citations: [citations[0], "invalid", citations[1]] }],
+      stop_reason: "end_turn",
+      stop_sequence: null,
+      usage: { input_tokens: 4, output_tokens: 1 },
+    })), budget, undefined, request);
+
+    expect(events).toEqual([
+      { type: "text_delta", text: "answer" },
+      { type: "anthropic_citation_delta", delta: { type: "citations_delta", citation: citations[0] } },
+      { type: "anthropic_citation_delta", delta: { type: "citations_delta", citation: citations[1] } },
+      {
+        type: "done",
+        usage: { inputTokens: 4, outputTokens: 1 },
+        stopReason: "end_turn",
+        anthropicStopReason: "end_turn",
+        anthropicStopSequence: null,
+      },
+    ]);
   });
 
   test("anthropic stream fails closed on EOF when message_stop and stop_reason are missing", async () => {

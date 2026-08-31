@@ -138,6 +138,7 @@ export interface ImageBlockRef {
   container: unknown[];
   index: number;
   base64: string | null;
+  cacheControl?: unknown;
 }
 
 function isImageBlock(block: unknown): block is { type: "image"; source: Record<string, unknown> } {
@@ -156,6 +157,7 @@ export function collectImageRefs(messages: unknown[]): ImageBlockRef[] {
           container: arr,
           index: i,
           base64: source?.type === "base64" && typeof source.data === "string" ? source.data : null,
+          cacheControl: (block as { cache_control?: unknown }).cache_control,
         });
       } else if (typeof block === "object" && block !== null && (block as { type?: unknown }).type === "tool_result") {
         const content = (block as { content?: unknown }).content;
@@ -171,7 +173,11 @@ export function collectImageRefs(messages: unknown[]): ImageBlockRef[] {
 }
 
 function textify(ref: ImageBlockRef, text: string): void {
-  ref.container[ref.index] = { type: "text", text };
+  ref.container[ref.index] = {
+    type: "text",
+    text,
+    ...(ref.cacheControl !== undefined ? { cache_control: ref.cacheControl } : {}),
+  };
 }
 
 /**

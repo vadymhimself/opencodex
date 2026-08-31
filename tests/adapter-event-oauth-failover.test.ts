@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { ProviderAdapter } from "../src/adapters/base";
 import { clearGenericFailoverHealth } from "../src/oauth/generic-account-failover";
 import { saveCredential } from "../src/oauth/store";
+import type { RequestLogContext } from "../src/server/request-log";
 import type { AdapterEvent, OcxConfig, OcxProviderConfig } from "../src/types";
 
 const actualResolver = await import("../src/server/adapter-resolve");
@@ -21,9 +22,10 @@ function fixtureAdapter(provider: OcxProviderConfig): ProviderAdapter {
     async *parseStream() {
       yield { type: "error", message: "fixture uses runTurn" } as AdapterEvent;
     },
-    async runTurn(_parsed, _incoming, emit) {
+    async runTurn(_parsed, incoming, emit) {
       const index = attemptKeys.length;
       attemptKeys.push(provider.apiKey ?? "");
+      await incoming.providerFetch!(provider.baseUrl, { method: "POST" });
       if (slowAttempt) return await slowAttempt(emit);
       for (const event of attempts[index] ?? []) emit(event);
     },
@@ -56,6 +58,7 @@ function config(enabled?: boolean): OcxConfig {
         baseUrl: "https://api2.cursor.sh",
         authMode: "oauth",
         models: ["model"],
+        fetch: async () => new Response(),
       },
     },
     ...(enabled === undefined ? {} : { oauthAccountFailover: { enabled } }),
@@ -106,10 +109,17 @@ describe("#2568 adapter-event OAuth failover", () => {
         [{ type: "text_delta", text: "alternate answer" }, { type: "done" }],
       ];
 
-      const response = await handleResponses(request(stream), config(), { model: "", provider: "" });
+      const logCtx: RequestLogContext = { model: "", provider: "" };
+      const response = await handleResponses(request(stream), config(), logCtx);
       const body = await response.text();
 
       expect(attemptKeys).toEqual(["cursor-access-1", "cursor-access-0"]);
+      expect(logCtx.attempts).toMatchObject([
+        { status: 429, sendCount: 1 },
+        { sendCount: 1, recoveryKinds: ["oauth-account-429"] },
+      ]);
+      expect(logCtx.attempts?.[1]?.accountLogLabel)
+        .not.toBe(logCtx.attempts?.[0]?.accountLogLabel);
       expect(body).toContain("alternate answer");
       expect(body).not.toContain("Cursor rate limit exceeded");
     });

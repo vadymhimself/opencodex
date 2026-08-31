@@ -91,6 +91,24 @@ describe("empty-completion guard retry", () => {
     ]);
   });
 
+  test("native Anthropic server output is content and is never retried", async () => {
+    let continuations = 0;
+    const block = {
+      type: "anthropic_server_block" as const,
+      block: { type: "web_fetch_tool_result", tool_use_id: "srvtoolu_1", content: [] },
+    };
+    const events = await collect(guardEmptyCompletionEventStream({
+      firstEvents: eventsOf(block, { type: "done", stopReason: "pause_turn" }),
+      continuation: () => {
+        continuations += 1;
+        return eventsOf();
+      },
+    }));
+
+    expect(continuations).toBe(0);
+    expect(events).toEqual([block, { type: "done", stopReason: "pause_turn" }]);
+  });
+
   test("a reasoning-only terminal turn is retried once and the identical-turn retry succeeds", async () => {
     let continuations = 0;
     const events = await collect(guardEmptyCompletionEventStream({

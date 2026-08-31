@@ -26,6 +26,7 @@ import {
   formatCodexProviderForLog,
   getCodexUpstreamHealth,
 } from "../src/codex/routing";
+import { computeRoutingAnalytics } from "../src/routing/analytics";
 import { startServer } from "../src/server";
 import { fakeChatGptJwt } from "./helpers/fake-chatgpt-jwt";
 import { catalogConvergenceFactory } from "./helpers/catalog-convergence";
@@ -36,6 +37,10 @@ import {
   responseStatePersistPendingForTests,
 } from "../src/responses/state";
 import { clearCursorThreadContinuityForTests } from "../src/adapters/cursor/thread-continuity";
+import {
+  resetProviderRequestPacingForTest,
+  setProviderRequestPacingLimitsForTest,
+} from "../src/providers/request-pacing";
 
 // Full-suite Windows load: startServer + combo rename/delete management flows exceed the
 // default 5s per-test budget (same flake class as 810fa115 / claude-management-api).
@@ -103,11 +108,28 @@ mock.module("../src/server/adapter-resolve", () => ({
 
 mock.module("../src/lib/upstream-retry", () => ({
   ...actualRetry,
-  fetchWithTransientRetry(
+  async fetchWithTransientRetry(
     ...args: Parameters<typeof actualFetchWithTransientRetry>
   ): ReturnType<typeof actualFetchWithTransientRetry> {
-    if (customTransientResponse) return customTransientResponse();
-    return actualFetchWithTransientRetry(...args);
+    const respond = customTransientResponse;
+    if (!respond) return actualFetchWithTransientRetry(...args);
+    const originalFetch = globalThis.fetch;
+    let intercepted = false;
+    globalThis.fetch = Object.assign(() => {
+      intercepted = true;
+      return Promise.reject(new Error("intercepted combo test send"));
+    }, {
+      preconnect: originalFetch.preconnect,
+    }) as typeof globalThis.fetch;
+    try {
+      await args[0]();
+      throw new Error("combo test send was not intercepted");
+    } catch (error) {
+      if (!intercepted) throw error;
+      return await respond();
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   },
 }));
 
@@ -234,7 +256,7 @@ function provider(
   adapter: string,
   url: string,
   apiKey: string,
-  extra: Partial<OcxProviderConfig> = {},
+  extra: Partial<OcxProviderConfig> & { fetch?: typeof globalThis.fetch } = {},
 ): OcxProviderConfig {
   return {
     adapter,
@@ -245,6 +267,16 @@ function provider(
     ...extra,
   };
 }
+
+const dispatchAdapterRequest: NonNullable<ProviderAdapter["fetchResponse"]> = (request, context) => {
+  if (!context?.executor) throw new Error("missing provider executor");
+  return context.executor(request.url, {
+    method: request.method,
+    headers: request.headers,
+    body: request.body,
+    signal: context.abortSignal,
+  });
+};
 
 function comboConfig(
   providers: OcxConfig["providers"],
@@ -582,12 +614,20 @@ describe("server combo failover 030 activation matrix", () => {
         model: "combo/free",
         requestedModel: "combo/free",
         resolvedModel: "m2",
+        comboTargetAdvanced: true,
         attempts: [
           { ordinal: 1, provider: "a", model: "m1", status: 503, usage: { inputTokens: 7, outputTokens: 1 } },
           { ordinal: 2, provider: "b", model: "m2", status: 200, usage: { inputTokens: 2, outputTokens: 1 } },
         ],
       });
     }
+
+    clearRequestLogsForTests();
+    expect(hydrateRequestLogsFromDisk()).toBe(1);
+    const hydratedResponse = await management(config, "GET", "/api/logs?tail=1");
+    const hydrated = logsFromApiBody(await hydratedResponse!.json());
+    expect(hydrated[0]?.comboTargetAdvanced).toBe(true);
+    expect((await computeRoutingAnalytics({})).comboFailoverRequests).toBe(1);
   });
 
   test("persists one immutable combo route trace, not the child route trace", async () => {
@@ -1161,15 +1201,16 @@ describe("server combo failover 030 activation matrix", () => {
 
   test("keeps a failed estimate on A without overwriting B reported usage", async () => {
     customUsageEstimate = model => model === "m1" ? 41 : undefined;
-    customFetchResponse = async request => {
-      const model = (JSON.parse(String(request.body)) as { model?: string }).model;
+    const fakeUpstream = Object.assign(async (_input: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) => {
+      const model = (JSON.parse(String(init?.body)) as { model?: string }).model;
       return model === "m1"
         ? Response.json({ error: { message: "down" } }, { status: 503 })
         : chatSuccess("estimate backup", "m2");
-    };
+    }, { preconnect() {} }) as typeof globalThis.fetch;
+    customFetchResponse = dispatchAdapterRequest;
     const config = comboConfig({
-      a: provider("test-response", "https://test.invalid/v1", "key-a"),
-      b: provider("test-response", "https://test.invalid/v1", "key-b"),
+      a: provider("test-response", "https://test.invalid/v1", "key-a", { fetch: fakeUpstream }),
+      b: provider("test-response", "https://test.invalid/v1", "key-b", { fetch: fakeUpstream }),
     });
     const response = await postLogged(config);
     await response.text();
@@ -1182,7 +1223,7 @@ describe("server combo failover 030 activation matrix", () => {
 
   test("captures ordinary failed usage from its original bounded body exactly once", async () => {
     let ordinaryReads = 0;
-    customFetchResponse = async () => new Response(new ReadableStream<Uint8Array>({
+    const fakeUpstream = Object.assign(async () => new Response(new ReadableStream<Uint8Array>({
       pull(controller) {
         ordinaryReads += 1;
         controller.enqueue(new TextEncoder().encode(JSON.stringify({
@@ -1191,9 +1232,10 @@ describe("server combo failover 030 activation matrix", () => {
         })));
         controller.close();
       },
-    }), { status: 503, headers: { "content-type": "application/json" } });
+    }), { status: 503, headers: { "content-type": "application/json" } }), { preconnect() {} }) as typeof globalThis.fetch;
+    customFetchResponse = dispatchAdapterRequest;
     const ordinaryConfig = comboConfig({
-      a: provider("test-response", "https://test.invalid/v1", "key-a"),
+      a: provider("test-response", "https://test.invalid/v1", "key-a", { fetch: fakeUpstream }),
     });
     const ordinary = await postLogged(ordinaryConfig);
     const ordinaryBody = await ordinary.json() as Record<string, unknown>;
@@ -1244,18 +1286,19 @@ describe("server combo failover 030 activation matrix", () => {
     const estimates = [10, 25];
     customUsageEstimate = () => estimates.shift();
     let calls = 0;
-    customFetchResponse = async () => {
+    const fakeUpstream = Object.assign(async () => {
       calls += 1;
       return calls === 1
         ? Response.json({ error: { message: "rotate" } }, { status: 429 })
         : chatSuccess("rotated", "m1");
-    };
+    }, { preconnect() {} }) as typeof globalThis.fetch;
+    customFetchResponse = dispatchAdapterRequest;
     const pool = [
       { id: "k1", key: "key-alpha-000111222333", addedAt: 1 },
       { id: "k2", key: "key-beta-444555666777", addedAt: 2 },
     ];
     const config = comboConfig({
-      a: provider("test-response", "https://test.invalid/v1", pool[0]!.key, { apiKeyPool: pool }),
+      a: provider("test-response", "https://test.invalid/v1", pool[0]!.key, { apiKeyPool: pool, fetch: fakeUpstream }),
     });
     const response = await postLogged(config);
     expect(response.status).toBe(200);
@@ -1268,6 +1311,85 @@ describe("server combo failover 030 activation matrix", () => {
       inputTokenEstimate: 25,
       recoveryKinds: ["key-429"],
     });
+  });
+
+  test("fetchResponse executor records each adapter-local transient replay", async () => {
+    const transportStatuses: number[] = [];
+    const pendingStatuses = [503, 503, 200];
+    const fakeUpstream = Object.assign(async () => {
+      const status = pendingStatuses.shift();
+      if (status === undefined) throw new Error("unexpected extra transport send");
+      transportStatuses.push(status);
+      return status === 200
+        ? chatSuccess("recovered", "m1")
+        : Response.json({ error: { message: "retry" } }, { status });
+    }, { preconnect() {} }) as typeof globalThis.fetch;
+    customFetchResponse = async (request, context) => {
+      if (!context?.executor) throw new Error("missing provider executor");
+      const send = () => context.executor!(request.url, {
+        method: request.method,
+        headers: request.headers,
+        body: request.body,
+      });
+      let response = await send();
+      while (response.status === 503) {
+        context.onRetry?.("transient-5xx");
+        response = await send();
+      }
+      return response;
+    };
+    const configured = {
+      ...provider("test-response", "https://test.invalid/v1", "key-a"),
+      fetch: fakeUpstream,
+    } as OcxProviderConfig & { fetch: typeof globalThis.fetch };
+    const config = comboConfig({ a: configured });
+
+    const response = await postLogged(config);
+    expect(response.status).toBe(200);
+    await response.text();
+    const attempt = (await latestAttemptReceipts(config)).usage.attempts?.[0];
+
+    expect(transportStatuses).toEqual([503, 503, 200]);
+    expect(attempt).toMatchObject({
+      sendCount: 3,
+      recoveryCount: 2,
+      recoveryKinds: ["transient-5xx"],
+    });
+  });
+
+  test("fetchResponse pacing rejection records no transport send", async () => {
+    let upstreamCalls = 0;
+    const fakeUpstream = Object.assign(async () => {
+      upstreamCalls += 1;
+      return chatSuccess("should not send", "m1");
+    }, { preconnect() {} }) as typeof globalThis.fetch;
+    const configured = {
+      ...provider("test-response", "https://test.invalid/v1", "key-a", {
+        requestPacing: { enabled: true, minIntervalMs: 60_000 },
+      }),
+      fetch: fakeUpstream,
+    } as OcxProviderConfig & { fetch: typeof globalThis.fetch };
+    const config = comboConfig({ a: configured });
+    customFetchResponse = async (request, context) => {
+      if (!context?.executor) throw new Error("missing provider executor");
+      return context.executor(request.url, {
+        method: request.method,
+        headers: request.headers,
+        body: request.body,
+      });
+    };
+    setProviderRequestPacingLimitsForTest({ maxQueueDepth: 0 });
+
+    try {
+      const response = await postModelLogged(config, "a/m1");
+      await response.text();
+      const attempt = (await latestAttemptReceipts(config)).usage.attempts?.[0];
+
+      expect(attempt?.sendCount).toBe(0);
+      expect(upstreamCalls).toBe(0);
+    } finally {
+      resetProviderRequestPacingForTest();
+    }
   });
 
   test("connection exception reaches the backup exactly once", async () => {
@@ -1341,7 +1463,10 @@ describe("server combo failover 030 activation matrix", () => {
   });
 
   test("runTurn combo attempts retain requested effort without adapter wire metadata", async () => {
-    customRunTurn = async (parsed, _incoming, emit) => {
+    const fakeUpstream = Object.assign(async () => new Response("ok"), { preconnect() {} }) as typeof globalThis.fetch;
+    customRunTurn = async (parsed, incoming, emit) => {
+      if (!incoming.providerFetch) throw new Error("missing provider executor");
+      await incoming.providerFetch("https://test.invalid/v1", { method: "POST" });
       if (parsed.modelId === "m1") {
         emit({ type: "error", message: "first target unavailable" });
         return;
@@ -1350,8 +1475,8 @@ describe("server combo failover 030 activation matrix", () => {
       emit({ type: "done" });
     };
     const config = comboConfig({
-      a: provider("test-run-turn", "https://a.test/v1", "key-a"),
-      b: provider("test-run-turn", "https://b.test/v1", "key-b"),
+      a: provider("test-run-turn", "https://a.test/v1", "key-a", { fetch: fakeUpstream }),
+      b: provider("test-run-turn", "https://b.test/v1", "key-b", { fetch: fakeUpstream }),
     });
 
     const response = await postLogged(config, {
@@ -2583,8 +2708,8 @@ describe("server combo failover 030 activation matrix", () => {
     const bodyCancelled = deferred();
     let cancelled = 0;
     let bHits = 0;
-    customFetchResponse = async request => {
-      const body = JSON.parse(String(request.body)) as { model?: string };
+    const fakeUpstream = Object.assign(async (_input: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { model?: string };
       if (body.model === "m2") {
         bHits += 1;
         return chatSuccess("must not run");
@@ -2601,10 +2726,11 @@ describe("server combo failover 030 activation matrix", () => {
           bodyCancelled.resolve();
         },
       }), { status: 429, headers: { "content-type": "application/json" } });
-    };
+    }, { preconnect() {} }) as typeof globalThis.fetch;
+    customFetchResponse = dispatchAdapterRequest;
     const config = comboConfig({
-      a: provider("test-response", "https://test.invalid/v1", "key-a"),
-      b: provider("test-response", "https://test.invalid/v1", "key-b"),
+      a: provider("test-response", "https://test.invalid/v1", "key-a", { fetch: fakeUpstream }),
+      b: provider("test-response", "https://test.invalid/v1", "key-b", { fetch: fakeUpstream }),
     });
     const abort = new AbortController();
     const pending = postLogged(config, {}, { abortSignal: abort.signal });
@@ -2624,21 +2750,22 @@ describe("server combo failover 030 activation matrix", () => {
     const started = deferred();
     let waitForAbort = true;
     const models: string[] = [];
-    customFetchResponse = async (request, context) => {
-      const model = (JSON.parse(String(request.body)) as { model?: string }).model ?? "";
+    const fakeUpstream = Object.assign(async (_input: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) => {
+      const model = (JSON.parse(String(init?.body)) as { model?: string }).model ?? "";
       models.push(model);
       if (waitForAbort) {
         started.resolve();
         await new Promise<void>(resolve => {
-          if (context?.abortSignal?.aborted) resolve();
-          else context?.abortSignal?.addEventListener("abort", () => resolve(), { once: true });
+          if (init?.signal?.aborted) resolve();
+          else init?.signal?.addEventListener("abort", () => resolve(), { once: true });
         });
       }
       return chatSuccess(`ok ${model}`, model);
-    };
+    }, { preconnect() {} }) as typeof globalThis.fetch;
+    customFetchResponse = dispatchAdapterRequest;
     const config = comboConfig({
-      a: provider("test-response", "https://test.invalid/v1", "key-a"),
-      b: provider("test-response", "https://test.invalid/v1", "key-b"),
+      a: provider("test-response", "https://test.invalid/v1", "key-a", { fetch: fakeUpstream }),
+      b: provider("test-response", "https://test.invalid/v1", "key-b", { fetch: fakeUpstream }),
     }, undefined, { strategy: "round-robin", stickyLimit: 2 });
     const abort = new AbortController();
     let authPublications = 0;
@@ -2661,17 +2788,18 @@ describe("server combo failover 030 activation matrix", () => {
 
   test("direct child status 499 is retained exactly once without backup", async () => {
     let bHits = 0;
-    customFetchResponse = async request => {
-      const model = (JSON.parse(String(request.body)) as { model?: string }).model;
+    const fakeUpstream = Object.assign(async (_input: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) => {
+      const model = (JSON.parse(String(init?.body)) as { model?: string }).model;
       if (model === "m2") {
         bHits += 1;
         return chatSuccess("must not run", "m2");
       }
       return Response.json({ error: { code: "client_cancelled" } }, { status: 499 });
-    };
+    }, { preconnect() {} }) as typeof globalThis.fetch;
+    customFetchResponse = dispatchAdapterRequest;
     const config = comboConfig({
-      a: provider("test-response", "https://test.invalid/v1", "key-a"),
-      b: provider("test-response", "https://test.invalid/v1", "key-b"),
+      a: provider("test-response", "https://test.invalid/v1", "key-a", { fetch: fakeUpstream }),
+      b: provider("test-response", "https://test.invalid/v1", "key-b", { fetch: fakeUpstream }),
     });
     const response = await postLogged(config);
     expect(response.status).toBe(499);
@@ -2684,8 +2812,8 @@ describe("server combo failover 030 activation matrix", () => {
     const hostile = `hostile-prefix-${"x".repeat(70_000)}`;
     let reads = 0;
     let cancels = 0;
-    customFetchResponse = async request => {
-      const model = (JSON.parse(String(request.body)) as { model?: string }).model;
+    const fakeUpstream = Object.assign(async (_input: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) => {
+      const model = (JSON.parse(String(init?.body)) as { model?: string }).model;
       if (model === "m2") return chatSuccess("safe backup", "m2");
       return new Response(new ReadableStream<Uint8Array>({
         start(controller) {
@@ -2694,10 +2822,11 @@ describe("server combo failover 030 activation matrix", () => {
         },
         cancel() { cancels += 1; },
       }), { status: 429, headers: { "content-type": "application/json" } });
-    };
+    }, { preconnect() {} }) as typeof globalThis.fetch;
+    customFetchResponse = dispatchAdapterRequest;
     const config = comboConfig({
-      a: provider("test-response", "https://test.invalid/v1", "key-a"),
-      b: provider("test-response", "https://test.invalid/v1", "key-b"),
+      a: provider("test-response", "https://test.invalid/v1", "key-a", { fetch: fakeUpstream }),
+      b: provider("test-response", "https://test.invalid/v1", "key-b", { fetch: fakeUpstream }),
     });
     const response = await postLogged(config);
     expect(response.status).toBe(200);

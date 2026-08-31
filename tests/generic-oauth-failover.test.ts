@@ -1,7 +1,8 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { IncomingMeta, ProviderAdapter } from "../src/adapters/base";
 import {
   clearGenericFailoverHealth,
   eligibleFailoverAccounts,
@@ -12,9 +13,44 @@ import {
   rotateGenericOAuthAccountOn429,
 } from "../src/oauth/generic-account-failover";
 import { getAccountSet, markAccountNeedsReauth, saveCredential } from "../src/oauth/store";
+import type { RequestLogContext } from "../src/server/request-log";
 import { resolveCopilotApiBaseUrl } from "../src/oauth/github-copilot";
 import { resolveProviderTransport } from "../src/providers/xai-transport";
-import type { OcxConfig, OcxProviderConfig } from "../src/types";
+import type { OcxConfig, OcxParsedRequest, OcxProviderConfig } from "../src/types";
+
+let sidecarObservedTokens: string[] = [];
+let handleResponses: typeof import("../src/server/responses")["handleResponses"];
+
+beforeAll(async () => {
+  mock.module("../src/web-search/index", () => ({
+    buildWebSearchTool: () => ({ name: "web_search", parameters: { type: "object", properties: {} } }),
+    planWebSearch: () => ({ backend: "openai" }),
+    shouldResolveOpenAiWebSearchSidecar: () => false,
+    runWithWebSearch: async (args: {
+      adapter: ProviderAdapter;
+      parsed: OcxParsedRequest;
+      incomingMeta: IncomingMeta;
+      onAttemptSend?: (recovery?: "key-429") => void;
+      on429?: (retryAfter: string | null) => ProviderAdapter | null | Promise<ProviderAdapter | null>;
+    }) => {
+      const tokenFor = async (adapter: ProviderAdapter): Promise<string> => {
+        const request = await adapter.buildRequest(args.parsed, args.incomingMeta);
+        return new Headers(request.headers).get("authorization")?.replace(/^Bearer /, "") ?? "";
+      };
+      sidecarObservedTokens.push(await tokenFor(args.adapter));
+      args.onAttemptSend?.();
+      const rotated = await args.on429?.("30");
+      if (!rotated) throw new Error("expected sidecar account rotation");
+      sidecarObservedTokens.push(await tokenFor(rotated));
+      args.onAttemptSend?.("key-429");
+      return new Response("data: {\"type\":\"done\"}\n\n", {
+        headers: { "content-type": "text/event-stream" },
+      });
+    },
+  }));
+
+  ({ handleResponses } = await import("../src/server/responses"));
+});
 
 const originalHome = process.env.OPENCODEX_HOME;
 let home: string;
@@ -23,6 +59,7 @@ beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "ocx-generic-failover-"));
   process.env.OPENCODEX_HOME = home;
   clearGenericFailoverHealth();
+  sidecarObservedTokens = [];
 });
 
 afterEach(() => {
@@ -30,6 +67,10 @@ afterEach(() => {
   if (originalHome === undefined) delete process.env.OPENCODEX_HOME;
   else process.env.OPENCODEX_HOME = originalHome;
   rmSync(home, { recursive: true, force: true });
+});
+
+afterAll(() => {
+  mock.restore();
 });
 
 const OAUTH_PROVIDER = {
@@ -180,6 +221,35 @@ describe("#2568 generic OAuth account failover", () => {
     // reimplement, so presence does not speak for them.
     expect(isGenericOAuthFailoverEnabled(config(), "openai")).toBe(false);
     expect(isGenericOAuthFailoverEnabled(config(true), "openai")).toBe(false);
+  });
+
+  test("sidecar OAuth rotation opens a new physical attempt", async () => {
+    await seed(2);
+    const runtimeConfig = config();
+    runtimeConfig.defaultProvider = "xai";
+    runtimeConfig.providers.xai = { ...OAUTH_PROVIDER, models: ["grok"] };
+
+    const logCtx: RequestLogContext = { model: "", provider: "" };
+    const response = await handleResponses(new Request("http://localhost/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "xai/grok",
+        input: "search",
+        stream: true,
+        tools: [{ type: "web_search" }],
+      }),
+    }), runtimeConfig, logCtx);
+    await response.text();
+
+    expect(sidecarObservedTokens).toEqual(["access-1", "access-0"]);
+    expect(logCtx.attempts).toMatchObject([
+      { status: 429, sendCount: 1 },
+      { sendCount: 1, recoveryKinds: ["key-429"] },
+    ]);
+    expect(logCtx.attempts).toHaveLength(2);
+    expect(logCtx.attempts?.[1]?.accountLogLabel)
+      .not.toBe(logCtx.attempts?.[0]?.accountLogLabel);
   });
 });
 

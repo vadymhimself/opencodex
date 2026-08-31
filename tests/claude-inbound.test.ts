@@ -91,6 +91,62 @@ describe("claude inbound translation", () => {
     expect(tail[1]).toEqual({ type: "input_image", image_url: "data:image/png;base64,aWc=" });
   });
 
+  test("preserves Claude Code mid-turn steering after its tool result", () => {
+    const steering = `The user sent a new message while you were working:
+<message>
+
+You swapped the images in the email.
+
+This is how Claude Code surfaces messages the user sends mid-turn — within the running turn, often alongside the next tool result, rather than as a separate conversation turn. Address the message above as you continue this turn.`;
+    const body = anthropicToResponsesBody({
+      model: "gpt-5.6-terra",
+      max_tokens: 100,
+      messages: [
+        { role: "assistant", content: [{ type: "tool_use", id: "toolu_steer", name: "Bash", input: { command: "true" } }] },
+        { role: "user", content: [
+          { type: "tool_result", tool_use_id: "toolu_steer", content: [{ type: "text", text: "done" }] },
+          { type: "text", text: steering },
+        ] },
+      ],
+    }) as Record<string, any>;
+
+    expect(body.input).toEqual([
+      expect.objectContaining({ type: "function_call", call_id: "toolu_steer" }),
+      expect.objectContaining({ type: "function_call_output", call_id: "toolu_steer" }),
+      { type: "message", role: "user", content: [{ type: "input_text", text: steering }] },
+    ]);
+    expect(() => parseRequest(body)).not.toThrow();
+  });
+
+  test("marks only unrepresentable Anthropic-native tools for exact replay", () => {
+    const base = { model: "m", max_tokens: 10, messages: [{ role: "user", content: "hi" }] };
+    const representable = anthropicToResponsesTranslation({
+      ...base,
+      tools: [
+        { name: "Read", input_schema: { type: "object" } },
+        { type: "web_search_20260209", name: "web_search" },
+      ],
+    });
+    expect(representable.requiresExactAnthropicReplay).toBe(false);
+    expect(representable.body.tools).toEqual([
+      { type: "function", name: "Read", parameters: { type: "object" } },
+      { type: "web_search" },
+    ]);
+
+    const native = anthropicToResponsesTranslation({
+      ...base,
+      tools: [{
+        type: "computer_20250124",
+        name: "computer",
+        input_schema: { type: "object" },
+        display_width_px: 1024,
+        display_height_px: 768,
+      }],
+    });
+    expect(native.requiresExactAnthropicReplay).toBe(true);
+    expect(native.body.tools).toBeUndefined();
+  });
+
   test("thinking variants", () => {
     const base = { model: "m", max_tokens: 10, messages: [{ role: "user", content: "hi" }] };
     expect((anthropicToResponsesBody({ ...base, thinking: { type: "adaptive" } }) as any).reasoning).toEqual({ summary: "auto" });

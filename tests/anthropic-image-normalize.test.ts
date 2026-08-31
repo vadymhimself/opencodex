@@ -215,11 +215,14 @@ describe("normalizeAnthropicImages — real Bun.Image path", () => {
   });
 
   test("N6: undecodable garbage is textified with the undecodable note", async () => {
-    const messages = [userMsg([imageBlock(Buffer.from("this is not an image at all").toString("base64"))])];
+    const image = imageBlock(Buffer.from("this is not an image at all").toString("base64"));
+    image.cache_control = { type: "ephemeral" };
+    const messages = [userMsg([image])];
     await normalizeAnthropicImages(messages);
     const [block] = contentOf(messages);
     expect(block.type).toBe("text");
     expect(block.text).toContain("undecodable");
+    expect((block as Record<string, unknown>).cache_control).toEqual({ type: "ephemeral" });
   });
 
   test("N6b: sniffable-but-truncated PNG is caught by pass-through validation and textified", async () => {

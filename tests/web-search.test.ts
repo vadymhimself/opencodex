@@ -9,7 +9,7 @@ import { listOpenAiForwardSidecarCandidates, resolveFirstUsableOpenAiSidecar } f
 import { handleResponses } from "../src/server/responses/core";
 import { providerFetch } from "../src/server/responses/fetch-helpers";
 import type { AdapterEvent, OcxConfig, OcxProviderConfig } from "../src/types";
-import type { AdapterFetchContext, ProviderAdapter } from "../src/adapters/base";
+import type { AdapterFetchContext, AdapterRequest, ProviderAdapter } from "../src/adapters/base";
 import type { OcxMessage, OcxParsedRequest } from "../src/types";
 import { fakeChatGptJwt } from "./helpers/fake-chatgpt-jwt";
 import { createTestTranslatorBudget } from "./helpers/translator-budget";
@@ -26,6 +26,16 @@ function withUpstreamHttpVersionExecutor(
 ): typeof globalThis.fetch {
   return ((input: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) =>
     inner(input, withUpstreamHttpVersion(input, init, provider))) as typeof globalThis.fetch;
+}
+
+function dispatchAdapterRequest(request: AdapterRequest, ctx?: AdapterFetchContext): Promise<Response> {
+  if (!ctx?.executor) throw new Error("adapter executor missing");
+  return ctx.executor(request.url, {
+    method: request.method,
+    headers: request.headers,
+    body: request.body,
+    signal: ctx.abortSignal,
+  });
 }
 
 /** Run the web-search loop with a default test translator budget. */
@@ -1003,23 +1013,24 @@ describe("web-search sidecar native web_search_call emission", () => {
           body: "{}",
         };
       },
-      fetchResponse: async () => {
-        sends += 1;
-        if (sends === 1) {
-          return new Response("rate limited", { status: 429, headers: { "retry-after": "30" } });
-        }
-        return new Response("{}", { status: 200 });
-      },
+      fetchResponse: dispatchAdapterRequest,
       async *parseStream() {
         yield { type: "text_delta", text: "answer after same-key retry" };
         yield { type: "done" };
       },
       async parseResponse() { throw new Error("parseResponse must be unreachable"); },
     };
+    const fetchImpl = async (): Promise<Response> => {
+      sends += 1;
+      return sends === 1
+        ? new Response("rate limited", { status: 429, headers: { "retry-after": "30" } })
+        : new Response("{}", { status: 200 });
+    };
 
     const response = await runWithWebSearch({
       parsed: parseRequest({ model: "routed/model", input: "hi", stream: true, tools: [{ type: "web_search" }] }),
       adapter: retryingAdapter,
+      fetchImpl,
       forwardProvider,
       hostedTool: { type: "web_search" },
       selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
@@ -1148,13 +1159,7 @@ describe("web-search sidecar native web_search_call emission", () => {
     const retryingAdapter: ProviderAdapter = {
       name: "mock-retry429",
       buildRequest: () => ({ url: "https://routed.test/v1", method: "POST", headers: {}, body: "{}" }),
-      fetchResponse: async () => {
-        sends += 1;
-        if (sends === 1 || sends === 3) {
-          return new Response("rate limited", { status: 429, headers: { "retry-after": "30" } });
-        }
-        return new Response("{}", { status: 200 });
-      },
+      fetchResponse: dispatchAdapterRequest,
       async *parseStream() {
         if (sends === 2) {
           // Round 0 success carries a web_search call so the loop advances to a forced-answer round.
@@ -1168,10 +1173,17 @@ describe("web-search sidecar native web_search_call emission", () => {
       },
       async parseResponse() { throw new Error("parseResponse must be unreachable"); },
     };
+    const fetchImpl = async (): Promise<Response> => {
+      sends += 1;
+      return sends === 1 || sends === 3
+        ? new Response("rate limited", { status: 429, headers: { "retry-after": "30" } })
+        : new Response("{}", { status: 200 });
+    };
 
     const response = await runWithWebSearch({
       parsed: parseRequest({ model: "routed/model", input: "hi", stream: true, tools: [{ type: "web_search" }] }),
       adapter: retryingAdapter,
+      fetchImpl,
       forwardProvider,
       hostedTool: { type: "web_search" },
       selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),

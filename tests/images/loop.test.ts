@@ -2,7 +2,12 @@ import { afterAll, beforeAll, beforeEach, describe, expect, mock, test } from "b
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import type { ProviderAdapter, IncomingMeta } from "../../src/adapters/base";
+import type {
+  AdapterFetchContext,
+  AdapterRequest,
+  ProviderAdapter,
+  IncomingMeta,
+} from "../../src/adapters/base";
 import type { AdapterEvent, OcxParsedRequest } from "../../src/types";
 import type { ImageBridgePlan, ImageCallResult } from "../../src/images/types";
 import type { ImageBridgeDeps } from "../../src/images/loop";
@@ -66,6 +71,16 @@ beforeEach(() => {
   buildRequestCalls = 0;
   streamQueue = [];
 });
+
+function dispatchAdapterRequest(request: AdapterRequest, ctx?: AdapterFetchContext): Promise<Response> {
+  if (!ctx?.executor) throw new Error("adapter executor missing");
+  return ctx.executor(request.url, {
+    method: request.method,
+    headers: request.headers,
+    body: request.body,
+    signal: ctx.abortSignal,
+  });
+}
 
 const mockAdapter: ProviderAdapter = {
   name: "test",
@@ -214,22 +229,24 @@ describe("runWithImageBridge", () => {
     let retrySends = 0;
     const retryingAdapter: ProviderAdapter = {
       ...mockAdapter,
-      fetchResponse: async () => {
-        sends += 1;
-        if (sends === 1) {
-          return new Response(JSON.stringify({ error: { message: "rate limited" } }), {
-            status: 429,
-            headers: { "content-type": "application/json" },
-          });
-        }
-        return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
-      },
+      fetchResponse: dispatchAdapterRequest,
+    };
+    const fetchImpl = async (): Promise<Response> => {
+      sends += 1;
+      if (sends === 1) {
+        return new Response(JSON.stringify({ error: { message: "rate limited" } }), {
+          status: 429,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
     };
     streamQueue = [[{ type: "text_delta" as const, text: "recovered" }, { type: "done" as const }]];
     const response = await runWithImageBridge({
       parsed: makeParsed(),
       adapter: retryingAdapter,
       plan,
+      fetchImpl,
       retryOn429Policy: { enabled: true, attempts: 2, intervalMs: 120, maxIntervalMs: 60_000, respectRetryAfter: false },
       waitForRequestSlot: async () => { pacingReservations += 1; },
       on429: () => {
@@ -364,16 +381,17 @@ describe("runWithImageBridge", () => {
     let rotations = 0;
     const retryingAdapter: ProviderAdapter = {
       ...mockAdapter,
-      fetchResponse: async () => {
-        sends += 1;
-        if (sends === 1 || sends === 3) {
-          return new Response(JSON.stringify({ error: { message: "rate limited" } }), {
-            status: 429,
-            headers: { "content-type": "application/json" },
-          });
-        }
-        return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
-      },
+      fetchResponse: dispatchAdapterRequest,
+    };
+    const fetchImpl = async (): Promise<Response> => {
+      sends += 1;
+      if (sends === 1 || sends === 3) {
+        return new Response(JSON.stringify({ error: { message: "rate limited" } }), {
+          status: 429,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("{}", { status: 200, headers: { "content-type": "application/json" } });
     };
     // Round 0: 429 -> one same-key replay (attempts=1) -> 200 carrying an image call.
     // Round 1 (forced final): 429 with the request budget already spent -> no replay -> rotation.
@@ -385,6 +403,7 @@ describe("runWithImageBridge", () => {
       parsed: makeParsed(),
       adapter: retryingAdapter,
       plan,
+      fetchImpl,
       maxRounds: 1,
       retryOn429Policy: { enabled: true, attempts: 1, intervalMs: 50, maxIntervalMs: 60_000, respectRetryAfter: false },
       on429: () => {
@@ -409,19 +428,21 @@ describe("runWithImageBridge", () => {
     let rotations = 0;
     const retryingAdapter: ProviderAdapter = {
       ...mockAdapter,
-      fetchResponse: async () => {
-        sends += 1;
-        return new Response(JSON.stringify({ error: { message: "rate limited" } }), {
-          status: 429,
-          headers: { "content-type": "application/json" },
-        });
-      },
+      fetchResponse: dispatchAdapterRequest,
+    };
+    const fetchImpl = async (): Promise<Response> => {
+      sends += 1;
+      return new Response(JSON.stringify({ error: { message: "rate limited" } }), {
+        status: 429,
+        headers: { "content-type": "application/json" },
+      });
     };
     streamQueue = [[{ type: "text_delta" as const, text: "unused" }, { type: "done" as const }]];
     const response = await runWithImageBridge({
       parsed: makeParsed(),
       adapter: retryingAdapter,
       plan,
+      fetchImpl,
       retryOn429Policy: { enabled: true, attempts: 1, intervalMs: 50, maxIntervalMs: 60_000, respectRetryAfter: false },
       on429: () => {
         rotations += 1;
@@ -430,10 +451,7 @@ describe("runWithImageBridge", () => {
         return rotations === 1
           ? ({
               ...mockAdapter,
-              fetchResponse: async () => {
-                sends += 1;
-                return new Response("{}", { status: 429 });
-              },
+              fetchResponse: dispatchAdapterRequest,
             } as ProviderAdapter)
           : null;
       },
@@ -733,6 +751,39 @@ describe("runWithImageBridge — runTurn adapter", () => {
     const response = await runWithImageBridge({ parsed: makeParsed(), adapter: runTurnAdapter, plan });
     const sse = await response.text();
     expect(sse).toContain("hello from runTurn");
+  });
+
+  test("runTurn adapter paces and records every physical dispatch", async () => {
+    let transportSends = 0;
+    let pacingReservations = 0;
+    let recordedSends = 0;
+    const dispatchingAdapter: ProviderAdapter = {
+      ...mockAdapter,
+      runTurn: async (_parsed, incoming, emit) => {
+        if (!incoming.providerFetch) throw new Error("missing provider fetch");
+        await incoming.providerFetch("https://test/run-sse");
+        await incoming.providerFetch("https://test/bidi-append");
+        await incoming.providerFetch("https://test/bidi-append");
+        emit({ type: "text_delta", text: "sent" });
+        emit({ type: "done" });
+      },
+    };
+    const response = await runWithImageBridge({
+      parsed: makeParsed(),
+      adapter: dispatchingAdapter,
+      plan,
+      fetchImpl: async () => {
+        transportSends += 1;
+        return new Response(null, { status: 200 });
+      },
+      waitForRequestSlot: async () => { pacingReservations += 1; },
+      onAttemptSend: () => { recordedSends += 1; },
+    });
+
+    expect(await response.text()).toContain("sent");
+    expect(transportSends).toBe(3);
+    expect(pacingReservations).toBe(3);
+    expect(recordedSends).toBe(3);
   });
 
   test("runTurn adapter → error event surfaces as upstream failure", async () => {

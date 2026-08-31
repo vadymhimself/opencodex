@@ -1,4 +1,4 @@
-import type { IncomingMeta, ProviderAdapter } from "./base";
+import type { AdapterRequest, IncomingMeta, ProviderAdapter } from "./base";
 import { createToolCallIdAllocator, type ToolCallIdAllocator } from "./tool-call-id";
 import { debugDroppedFrame } from "../lib/debug";
 import type {
@@ -29,6 +29,7 @@ import { decodeServerSentEvents } from "../lib/sse-decoder";
 import { isTranslatorBudgetExceededError, retainTranslatedEventBatch, type TranslatorBudget } from "../lib/translator-budget";
 import { isReasoningEffortOmitted, modelRecordValue } from "../reasoning-effort";
 import { applyAgentRouterLanguageFraming, isAgentRouterEndpoint } from "./agentrouter";
+import type { AdapterTierMetadata } from "../providers/fastwire";
 
 /** Map a user content part to an Anthropic content block (text or image source). */
 function toAnthropicContentPart(p: OcxContentPart): unknown {
@@ -340,6 +341,33 @@ export function anthropicMessagesUrl(baseUrl: string): string {
   return `${root}/v1/messages`;
 }
 
+export function isExactCanonicalAnthropicMessagesUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:"
+      && url.hostname === "api.anthropic.com"
+      && url.port === ""
+      && url.username === ""
+      && url.password === ""
+      && url.pathname === "/v1/messages"
+      && url.search === ""
+      && url.hash === "";
+  } catch {
+    return false;
+  }
+}
+
+function mergeAnthropicBeta(...values: Array<string | undefined>): string | undefined {
+  const tokens = new Set<string>();
+  for (const value of values) {
+    for (const token of value?.split(",") ?? []) {
+      const trimmed = token.trim();
+      if (trimmed) tokens.add(trimmed);
+    }
+  }
+  return tokens.size > 0 ? [...tokens].join(",") : undefined;
+}
+
 function synthesizeToolUseId(): string {
   return `toolu_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`;
 }
@@ -549,6 +577,34 @@ function supportsExplicitThinkingDisable(modelId: string): boolean {
   return meetsFamilyMinimum(modelId, EXPLICIT_THINKING_DISABLE_FAMILY_MINIMUMS);
 }
 
+export function canReplayAnthropicSource(body: Readonly<Record<string, unknown>>, targetModel: string): boolean {
+  const messages = body.messages;
+  if (!Array.isArray(messages) || messages.some(message =>
+    !message || typeof message !== "object" || Array.isArray(message)
+    || !["user", "assistant"].includes(String((message as Record<string, unknown>).role)))) {
+    return false;
+  }
+
+  // No target-model semantic change: retain future source fields Anthropic may add.
+  if (body.model === targetModel) return true;
+
+  const thinking = body.thinking;
+  if (thinking !== undefined && (!thinking || typeof thinking !== "object" || Array.isArray(thinking))) {
+    return false;
+  }
+  const thinkingType = (thinking as Record<string, unknown> | undefined)?.type;
+  const targetUsesAdaptive = usesAdaptiveThinking(targetModel);
+  if (thinkingType === "adaptive" && !targetUsesAdaptive) return false;
+  if (thinkingType === "enabled" && targetUsesAdaptive) return false;
+  if (thinkingType === "disabled" && !supportsExplicitThinkingDisable(targetModel)) return false;
+  if (thinkingType !== undefined && !["adaptive", "enabled", "disabled"].includes(String(thinkingType))) return false;
+
+  const outputConfig = body.output_config;
+  const hasEffort = outputConfig !== null && typeof outputConfig === "object" && !Array.isArray(outputConfig)
+    && Object.hasOwn(outputConfig, "effort");
+  return !hasEffort || (targetUsesAdaptive && thinkingType === "adaptive");
+}
+
 /** `output_config.effort` accepts low|medium|high|xhigh|max — "minimal" is rejected with a 400. */
 function adaptiveEffort(effort: string): string {
   return effort === "minimal" ? "low" : effort;
@@ -566,33 +622,87 @@ function defaultReasoningEffort(provider: OcxProviderConfig, modelId: string): s
   return trimmed;
 }
 
-function usageFromAnthropic(usage: Record<string, number> | undefined): OcxUsage | undefined {
+function numericAnthropicUsage(usage: Record<string, unknown>, key: string): number {
+  return typeof usage[key] === "number" ? usage[key] : 0;
+}
+
+function anthropicServerToolUsage(usage: Record<string, unknown>): Record<string, number> | undefined {
+  const raw = usage.server_tool_use;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const counts = Object.fromEntries(
+    Object.entries(raw).filter((entry): entry is [string, number] => typeof entry[1] === "number"),
+  );
+  return Object.keys(counts).length > 0 ? counts : undefined;
+}
+
+function usageFromAnthropic(usage: Record<string, unknown> | undefined): OcxUsage | undefined {
   if (!usage) return undefined;
   const hasCache = usage.cache_read_input_tokens !== undefined || usage.cache_creation_input_tokens !== undefined;
-  const read = usage.cache_read_input_tokens ?? 0;
-  const write = usage.cache_creation_input_tokens ?? 0;
+  const read = numericAnthropicUsage(usage, "cache_read_input_tokens");
+  const write = numericAnthropicUsage(usage, "cache_creation_input_tokens");
+  const serverToolUse = anthropicServerToolUsage(usage);
   // Anthropic reports input_tokens EXCLUSIVE of cache read/write; normalize to the
   // canonical inclusive convention (types.ts OcxUsage / devlog 070).
   return {
-    inputTokens: (usage.input_tokens ?? 0) + read + write,
-    outputTokens: usage.output_tokens ?? 0,
+    inputTokens: numericAnthropicUsage(usage, "input_tokens") + read + write,
+    outputTokens: numericAnthropicUsage(usage, "output_tokens"),
     ...(hasCache ? {
       cachedInputTokens: read,
       cacheReadInputTokens: read,
       cacheCreationInputTokens: write,
     } : {}),
+    ...(serverToolUse ? { anthropicServerToolUse: serverToolUse } : {}),
   };
 }
 
 function mergeAnthropicUsage(
-  base: Record<string, number> | undefined,
-  next: Record<string, number> | undefined,
-): Record<string, number> | undefined {
+  base: Record<string, unknown> | undefined,
+  next: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
   if (!next) return base;
   if (!base) return { ...next };
   // Anthropic `message_delta.usage` values are CUMULATIVE; adding them to the
   // message_start snapshot double-counted output tokens. Later frames win per key.
   return { ...base, ...next };
+}
+
+function anthropicSearchQueries(block: Record<string, unknown>): string[] {
+  const input = block.input;
+  if (!input || typeof input !== "object" || Array.isArray(input)) return [];
+  const value = input as Record<string, unknown>;
+  if (Array.isArray(value.queries)) {
+    return value.queries.filter((query): query is string => typeof query === "string");
+  }
+  return typeof value.query === "string" ? [value.query] : [];
+}
+
+function anthropicSearchResultMetadata(block: Record<string, unknown>): {
+  status: "completed" | "failed";
+  sources: { url: string; title?: string }[];
+} {
+  const content = block.content;
+  if (!Array.isArray(content)) return { status: "failed", sources: [] };
+  const sources: { url: string; title?: string }[] = [];
+  for (const result of content) {
+    if (!result || typeof result !== "object" || Array.isArray(result)) continue;
+    const value = result as Record<string, unknown>;
+    if (value.type !== "web_search_result" || typeof value.url !== "string") continue;
+    sources.push({
+      url: value.url,
+      ...(typeof value.title === "string" ? { title: value.title } : {}),
+    });
+  }
+  return { status: "completed", sources };
+}
+
+function isAnthropicWebSearchServerTool(block: Record<string, unknown>): boolean {
+  return block.type === "server_tool_use"
+    && typeof block.name === "string"
+    && block.name.startsWith("web_search");
+}
+
+function isAnthropicWebSearchResult(block: Record<string, unknown>): boolean {
+  return block.type === "web_search_tool_result" && typeof block.tool_use_id === "string";
 }
 
 function buildToolNameTransforms(provider: OcxProviderConfig): { toWire: (name: string) => string; fromWire: (name: string) => string } {
@@ -870,6 +980,10 @@ function normalizeAnthropicInputSchema(schema: unknown): Record<string, unknown>
 export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetention?: "none" | "short" | "long"): ProviderAdapter {
   const isOAuth = provider.authMode === "oauth";
   const toolNames = buildToolNameTransforms(provider);
+  const fromWireToolName = (name: string, request?: AdapterRequest): string =>
+    request?.anthropicSourceReplay === true && request.anthropicSourceToolNames?.has(name)
+      ? name
+      : toolNames.fromWire(name);
   return {
     name: "anthropic",
 
@@ -881,6 +995,80 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
           throw new Error("anthropic oauth token missing — run ocx login anthropic");
         }
         throw new Error("anthropic provider requires a non-empty apiKey (authMode: key)");
+      }
+
+      const url = anthropicMessagesUrl(provider.baseUrl);
+      const unresolvedPlaceholder = url.match(/\{[^}]*\}/)?.[0];
+      if (unresolvedPlaceholder) {
+        throw new Error(`anthropic baseUrl contains unresolved ${unresolvedPlaceholder}`);
+      }
+
+      const source = incoming?.anthropicMessagesSource;
+      if (source
+        && isExactCanonicalAnthropicMessagesUrl(url)
+        && canReplayAnthropicSource(source.body, parsed.modelId)) {
+        const body = structuredClone(source.body) as Record<string, unknown>;
+        body.model = parsed.modelId;
+        body.stream = parsed.stream;
+        if (!Array.isArray(body.messages)) {
+          throw new Error("validated Anthropic source messages missing");
+        }
+        await normalizeAnthropicImages(body.messages, { tierBias: incoming?.imageTierBias ?? 0 });
+        enforceAnthropicImageLimits(body.messages);
+
+        const sourceToolNames = new Set<string>();
+        if (Array.isArray(body.tools)) {
+          for (const tool of body.tools) {
+            if (tool && typeof tool === "object" && !Array.isArray(tool)) {
+              const name = (tool as Record<string, unknown>).name;
+              if (typeof name === "string") sourceToolNames.add(name);
+            }
+          }
+        }
+
+        const sourceHeaders = new Headers({
+          "Content-Type": "application/json",
+          "anthropic-version": "2023-06-01",
+          "Accept": parsed.stream ? "text/event-stream" : "application/json",
+          "User-Agent": "@anthropic-ai/sdk/0.74.0",
+        });
+        if (isOAuth) {
+          for (const [name, value] of Object.entries(CLAUDE_CODE_HEADERS)) {
+            sourceHeaders.set(name, value);
+          }
+          sourceHeaders.set("X-Claude-Code-Session-Id", claudeCodeSessionId(provider.apiKey));
+          sourceHeaders.set("x-client-request-id", crypto.randomUUID());
+        }
+        for (const [name, value] of Object.entries(provider.headers ?? {})) {
+          sourceHeaders.set(name, value);
+        }
+        if (source.headers.anthropicVersion) {
+          sourceHeaders.set("anthropic-version", source.headers.anthropicVersion);
+        }
+        const beta = mergeAnthropicBeta(
+          source.headers.anthropicBeta,
+          sourceHeaders.get("anthropic-beta") ?? undefined,
+          isOAuth ? ANTHROPIC_OAUTH_BETA : undefined,
+        );
+        if (beta) sourceHeaders.set("anthropic-beta", beta);
+        else sourceHeaders.delete("anthropic-beta");
+
+        sourceHeaders.delete("authorization");
+        sourceHeaders.delete("x-api-key");
+        if (isOAuth || anthropicKeyUsesBearer(provider)) {
+          sourceHeaders.set("Authorization", `Bearer ${provider.apiKey}`);
+        } else {
+          sourceHeaders.set("x-api-key", provider.apiKey);
+        }
+
+        return {
+          url,
+          method: "POST",
+          headers: Object.fromEntries(sourceHeaders.entries()),
+          body: JSON.stringify(body),
+          anthropicSourceReplay: true,
+          anthropicSourceToolNames: sourceToolNames,
+        };
       }
 
       const { system, messages } = messagesToAnthropicFormat(parsed, toolNames);
@@ -983,11 +1171,6 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
         else if (typeof tc === "object" && "name" in tc) body.tool_choice = { type: "tool", name: toolNames.toWire(resolveToolChoiceWireName(parsed.context.tools, tc.name)) };
       }
 
-      const url = anthropicMessagesUrl(provider.baseUrl);
-      const unresolvedPlaceholder = url.match(/\{[^}]*\}/)?.[0];
-      if (unresolvedPlaceholder) {
-        throw new Error(`anthropic baseUrl contains unresolved ${unresolvedPlaceholder}`);
-      }
       const headers: Record<string, string> = {
         "Content-Type": "application/json",
         "anthropic-version": "2023-06-01",
@@ -1025,7 +1208,12 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
       return { url, method: "POST", headers, body: JSON.stringify(body) };
     },
 
-    async *parseStream(response: Response, budget: TranslatorBudget): AsyncGenerator<AdapterEvent> {
+    async *parseStream(
+      response: Response,
+      budget: TranslatorBudget,
+      _tierMetadata?: AdapterTierMetadata,
+      request?: AdapterRequest,
+    ): AsyncGenerator<AdapterEvent> {
       if (!response.body) {
         yield { type: "error", message: "No response body" };
         return;
@@ -1036,8 +1224,14 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
       let currentToolCallId = "";
       let currentToolCallName = "";
       let currentToolCallJson = "";
-      let pendingUsage: Record<string, number> | undefined;
+      let currentAnthropicServerBlock: Record<string, unknown> | undefined;
+      let currentAnthropicServerBlockBytes = 0;
+      let currentAnthropicServerJson = "";
+      let currentAnthropicServerJsonBytes = 0;
+      const webSearchQueriesById = new Map<string, string[]>();
+      let pendingUsage: Record<string, unknown> | undefined;
       let pendingStopReason: string | undefined;
+      let pendingStopSequence: string | null | undefined;
       let emittedDone = false;
       let sawVisibleText = false;
 
@@ -1060,6 +1254,12 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
           type: "done",
           usage: usageFromAnthropic(pendingUsage),
           ...(pendingStopReason ? { stopReason: pendingStopReason } : {}),
+          ...(request?.anthropicSourceReplay === true && pendingStopReason
+            ? { anthropicStopReason: pendingStopReason }
+            : {}),
+          ...(request?.anthropicSourceReplay === true && pendingStopSequence !== undefined
+            ? { anthropicStopSequence: pendingStopSequence }
+            : {}),
         };
       };
 
@@ -1090,24 +1290,34 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
 
         switch (record.event || data.type) {
               case "message_start": {
-                const message = data.message as { usage?: Record<string, number> } | undefined;
+                const message = data.message as { usage?: Record<string, unknown> } | undefined;
                 pendingUsage = mergeAnthropicUsage(pendingUsage, message?.usage);
                 break;
               }
               case "content_block_start": {
-                const block = data.content_block as { type: string; id?: string; name?: string; data?: string } | undefined;
-                if (!block) break;
+                const block = data.content_block as Record<string, unknown> | undefined;
+                if (!block || typeof block.type !== "string") break;
                 currentBlockType = block.type;
                 if (block.type === "tool_use") {
-                  currentToolCallId = usableToolUseId(block.id);
-                  currentToolCallName = toolNames.fromWire(block.name ?? "");
+                  currentToolCallId = usableToolUseId(typeof block.id === "string" ? block.id : undefined);
+                  currentToolCallName = fromWireToolName(typeof block.name === "string" ? block.name : "", request);
                   currentToolCallJson = "";
                   budget.openCall(currentToolCallId);
                   yield { type: "tool_call_start", id: currentToolCallId, name: currentToolCallName };
-                }
-                if (block.type === "redacted_thinking" && typeof block.data === "string") {
+                } else if (block.type === "redacted_thinking" && typeof block.data === "string") {
                   // Opaque redacted block: replay verbatim later or tool-use turns 400.
                   yield { type: "redacted_thinking", data: block.data };
+                } else if (
+                  request?.anthropicSourceReplay === true
+                  && block.type !== "text"
+                  && block.type !== "thinking"
+                  && block.type !== "reasoning"
+                ) {
+                  currentAnthropicServerBlock = structuredClone(block);
+                  currentAnthropicServerBlockBytes = budgetEncoder.encode(JSON.stringify(block)).byteLength;
+                  budget.chargeRetained(currentAnthropicServerBlockBytes, { kind: "retained_collectors" });
+                  currentAnthropicServerJson = "";
+                  currentAnthropicServerJsonBytes = 0;
                 }
                 break;
               }
@@ -1120,6 +1330,16 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
                   // profile, or a cut-off turn would surface as a successful empty answer.
                   if (delta.text.length > 0) sawVisibleText = true;
                   yield { type: "text_delta", text: delta.text };
+                } else if (
+                  request?.anthropicSourceReplay === true
+                  && currentBlockType === "text"
+                  && delta.type === "citations_delta"
+                  && isAnthropicRecord(delta.citation)
+                ) {
+                  yield {
+                    type: "anthropic_citation_delta",
+                    delta: structuredClone(delta),
+                  };
                 } else if (delta.type === "thinking_delta" && typeof delta.thinking === "string") {
                   yield { type: "thinking_delta", thinking: delta.thinking };
                 } else if (delta.type === "reasoning_delta" && typeof delta.reasoning === "string") {
@@ -1148,6 +1368,23 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
                     throw error;
                   }
                   yield { type: "tool_call_delta", arguments: delta.partial_json };
+                } else if (
+                  delta.type === "input_json_delta"
+                  && typeof delta.partial_json === "string"
+                  && currentAnthropicServerBlock
+                ) {
+                  const nextBytes = currentAnthropicServerJsonBytes
+                    + budgetEncoder.encode(delta.partial_json).byteLength;
+                  const reservation = budget.reserveTransient(nextBytes, { kind: "retained_collectors" });
+                  try {
+                    currentAnthropicServerJson += delta.partial_json;
+                    reservation.commitRetained();
+                    budget.releaseRetained(currentAnthropicServerJsonBytes, { kind: "retained_collectors" });
+                    currentAnthropicServerJsonBytes = nextBytes;
+                  } catch (error) {
+                    reservation.release();
+                    throw error;
+                  }
                 }
                 break;
               }
@@ -1169,15 +1406,60 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
                   budget.closeCall(currentToolCallId);
                   currentToolCallId = "";
                   currentToolCallJson = "";
+                } else if (currentAnthropicServerBlock) {
+                  if (currentAnthropicServerJson.length > 0) {
+                    try {
+                      currentAnthropicServerBlock.input = JSON.parse(currentAnthropicServerJson);
+                    } catch {
+                      yield {
+                        type: "error",
+                        message: "Anthropic stream sent malformed server_tool_use input (invalid JSON)",
+                      };
+                      return;
+                    }
+                  }
+                  const block = currentAnthropicServerBlock;
+                  if (isAnthropicWebSearchServerTool(block) && typeof block.id === "string") {
+                    const queries = anthropicSearchQueries(block);
+                    webSearchQueriesById.set(block.id, queries);
+                    yield {
+                      type: "web_search_call_begin",
+                      id: block.id,
+                      anthropicServerTool: block,
+                    };
+                  } else if (isAnthropicWebSearchResult(block)) {
+                    const id = block.tool_use_id as string;
+                    const metadata = anthropicSearchResultMetadata(block);
+                    yield {
+                      type: "web_search_call_end",
+                      id,
+                      queries: webSearchQueriesById.get(id) ?? [],
+                      status: metadata.status,
+                      sources: metadata.sources,
+                      anthropicServerToolResult: block,
+                    };
+                    webSearchQueriesById.delete(id);
+                  } else {
+                    yield { type: "anthropic_server_block", block };
+                  }
+                  budget.releaseRetained(currentAnthropicServerBlockBytes, { kind: "retained_collectors" });
+                  budget.releaseRetained(currentAnthropicServerJsonBytes, { kind: "retained_collectors" });
+                  currentAnthropicServerBlock = undefined;
+                  currentAnthropicServerBlockBytes = 0;
+                  currentAnthropicServerJson = "";
+                  currentAnthropicServerJsonBytes = 0;
                 }
                 currentBlockType = "";
                 break;
               }
               case "message_delta": {
-                const usage = data.usage as Record<string, number> | undefined;
+                const usage = data.usage as Record<string, unknown> | undefined;
                 pendingUsage = mergeAnthropicUsage(pendingUsage, usage);
-                const delta = data.delta as { stop_reason?: unknown } | undefined;
+                const delta = data.delta as { stop_reason?: unknown; stop_sequence?: unknown } | undefined;
                 if (typeof delta?.stop_reason === "string") pendingStopReason = delta.stop_reason;
+                if (delta?.stop_sequence === null || typeof delta?.stop_sequence === "string") {
+                  pendingStopSequence = delta.stop_sequence;
+                }
                 break;
               }
               case "message_stop": {
@@ -1206,6 +1488,12 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
         return;
       } finally {
         if (currentToolCallId) budget.closeCall(currentToolCallId);
+        if (currentAnthropicServerBlockBytes > 0) {
+          budget.releaseRetained(currentAnthropicServerBlockBytes, { kind: "retained_collectors" });
+        }
+        if (currentAnthropicServerJsonBytes > 0) {
+          budget.releaseRetained(currentAnthropicServerJsonBytes, { kind: "retained_collectors" });
+        }
       }
       if (!emittedDone) {
         // Fail closed on transport EOF. Compatible providers may omit message_stop after message_delta.stop_reason.
@@ -1235,6 +1523,12 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
             type: "done",
             usage: usageFromAnthropic(pendingUsage),
             ...(stopReason ? { stopReason } : {}),
+            ...(request?.anthropicSourceReplay === true && pendingStopReason
+              ? { anthropicStopReason: pendingStopReason }
+              : {}),
+            ...(request?.anthropicSourceReplay === true && pendingStopSequence !== undefined
+              ? { anthropicStopSequence: pendingStopSequence }
+              : {}),
           };
         } else if (provider.anthropicEofTolerance === true) {
           // AgentRouter-style compatibility profile (#658): the upstream can close the stream
@@ -1262,7 +1556,12 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
       }
     },
 
-    async parseResponse(response: Response, budget: TranslatorBudget): Promise<AdapterEvent[]> {
+    async parseResponse(
+      response: Response,
+      budget: TranslatorBudget,
+      _tierMetadata?: AdapterTierMetadata,
+      request?: AdapterRequest,
+    ): Promise<AdapterEvent[]> {
       const parsed: unknown = await response.json();
       // `response.json()` resolves a body of `null` to `null` without throwing, so the cast below
       // used to reach `json.content` on it — the #1219 defect at the buffered body root. The
@@ -1311,11 +1610,38 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
           }
         }
       }
-      const content = rawContent as { type: string; text?: string; id?: string; name?: string; input?: unknown; thinking?: string; reasoning?: string; signature?: string; data?: string }[] | undefined;
+      const content = rawContent as Array<{
+        type: string;
+        text?: string;
+        id?: string;
+        name?: string;
+        input?: unknown;
+        thinking?: string;
+        reasoning?: string;
+        signature?: string;
+        data?: string;
+        tool_use_id?: string;
+        content?: unknown;
+        citations?: unknown;
+        [key: string]: unknown;
+      }> | undefined;
+      const webSearchQueriesById = new Map<string, string[]>();
       if (content) {
         for (const block of content) {
-          if (block.type === "text" && block.text) {
-            events.push({ type: "text_delta", text: block.text });
+          if (block.type === "text") {
+            if (block.text) events.push({ type: "text_delta", text: block.text });
+            if (request?.anthropicSourceReplay === true && Array.isArray(block.citations)) {
+              for (const citation of block.citations) {
+                if (!isAnthropicRecord(citation)) continue;
+                events.push({
+                  type: "anthropic_citation_delta",
+                  delta: {
+                    type: "citations_delta",
+                    citation: structuredClone(citation),
+                  },
+                });
+              }
+            }
           } else if (block.type === "thinking" && typeof block.thinking === "string") {
             events.push({ type: "thinking_delta", thinking: block.thinking });
             if (typeof block.signature === "string" && block.signature) {
@@ -1327,14 +1653,42 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
             events.push({ type: "redacted_thinking", data: block.data });
           } else if (block.type === "tool_use") {
             const id = usableToolUseId(block.id);
-            events.push({ type: "tool_call_start", id, name: toolNames.fromWire(block.name ?? "") });
+            events.push({ type: "tool_call_start", id, name: fromWireToolName(block.name ?? "", request) });
             events.push({ type: "tool_call_delta", arguments: toolUseArguments(block.input, provider.anthropicEofTolerance === true) });
             events.push({ type: "tool_call_end" });
+          } else if (request?.anthropicSourceReplay === true) {
+            const preserved = structuredClone(block) as Record<string, unknown>;
+            if (isAnthropicWebSearchServerTool(preserved) && typeof preserved.id === "string") {
+              const queries = anthropicSearchQueries(preserved);
+              webSearchQueriesById.set(preserved.id, queries);
+              events.push({
+                type: "web_search_call_begin",
+                id: preserved.id,
+                anthropicServerTool: preserved,
+              });
+            } else if (isAnthropicWebSearchResult(preserved)) {
+              const id = preserved.tool_use_id as string;
+              const metadata = anthropicSearchResultMetadata(preserved);
+              events.push({
+                type: "web_search_call_end",
+                id,
+                queries: webSearchQueriesById.get(id) ?? [],
+                status: metadata.status,
+                sources: metadata.sources,
+                anthropicServerToolResult: preserved,
+              });
+              webSearchQueriesById.delete(id);
+            } else {
+              events.push({ type: "anthropic_server_block", block: preserved });
+            }
           }
         }
       }
-      const usage = json.usage as Record<string, number> | undefined;
+      const usage = json.usage as Record<string, unknown> | undefined;
       const stopReason = typeof json.stop_reason === "string" ? json.stop_reason : undefined;
+      const stopSequence = json.stop_sequence === null || typeof json.stop_sequence === "string"
+        ? json.stop_sequence
+        : undefined;
       // An Anthropic-compatible upstream can forward an `error` stop reason verbatim. As a
       // `done` it reads as a clean completion, so the turn reports success and — on a compaction
       // turn — installs its partial summary as replacement history (#422). Usage is preserved:
@@ -1354,6 +1708,12 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
         type: "done",
         usage: usageFromAnthropic(usage),
         ...(stopReason ? { stopReason } : {}),
+        ...(request?.anthropicSourceReplay === true && stopReason
+          ? { anthropicStopReason: stopReason }
+          : {}),
+        ...(request?.anthropicSourceReplay === true && stopSequence !== undefined
+          ? { anthropicStopSequence: stopSequence }
+          : {}),
       });
       retainTranslatedEventBatch(events, budget);
       return events;

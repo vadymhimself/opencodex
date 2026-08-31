@@ -9,6 +9,7 @@ import {
   sanitizeWebSearchInput,
 } from "../src/claude/outbound";
 import { createTestTranslatorBudget } from "./helpers/translator-budget";
+import { encodeReasoningEnvelope } from "../src/responses/reasoning-envelope";
 import {
   TRANSLATOR_MAX_CALL_ARGUMENT_BYTES,
   type TranslatorBudget,
@@ -786,6 +787,149 @@ describe("claude outbound SSE", () => {
     expect(snapshot.highWaterBytes).toBeLessThan(2 * 1024);
   });
 
+  test("canonical Anthropic metadata restores signed and redacted thinking plus pause_turn", async () => {
+    const signature = "original-anthropic-signature";
+    const upstream = [
+      sse("response.output_item.added", {
+        output_index: 0,
+        item: { type: "reasoning", id: "rs_1", summary: [] },
+      }),
+      sse("response.reasoning_summary_text.delta", {
+        item_id: "rs_1", output_index: 0, summary_index: 0, delta: "private thought",
+      }),
+      sse("response.output_item.done", {
+        output_index: 0,
+        item: {
+          type: "reasoning", id: "rs_1",
+          summary: [{ type: "summary_text", text: "private thought" }],
+          encrypted_content: encodeReasoningEnvelope({ sig: signature }),
+        },
+      }),
+      sse("response.output_item.done", {
+        output_index: 1,
+        item: {
+          type: "reasoning", id: "rs_2", summary: [],
+          encrypted_content: encodeReasoningEnvelope({ red: ["opaque-redacted"] }),
+        },
+      }),
+      sse("response.incomplete", {
+        response: {
+          status: "incomplete",
+          incomplete_details: { reason: "max_output_tokens" },
+          _ocx_anthropic_stop_reason: "pause_turn",
+          _ocx_anthropic_stop_sequence: null,
+          usage: {
+            input_tokens: 12,
+            output_tokens: 3,
+            anthropic_server_tool_use: { web_fetch_requests: 1 },
+          },
+        },
+      }),
+    ].join("");
+
+    const message = await collectAnthropicMessage(
+      responsesSseToAnthropicSse(streamFrom(upstream), "m"),
+      "m",
+    ) as Record<string, any>;
+    expect(message.content).toEqual([
+      { type: "thinking", thinking: "private thought", signature },
+      { type: "redacted_thinking", data: "opaque-redacted" },
+    ]);
+    expect(message.stop_reason).toBe("pause_turn");
+    expect(message.stop_sequence).toBeNull();
+    expect(message.usage.server_tool_use).toEqual({ web_fetch_requests: 1 });
+  });
+
+  test("canonical Anthropic metadata restores raw server blocks and stop_sequence", async () => {
+    const serverTool = {
+      type: "server_tool_use",
+      id: "srvtoolu_1",
+      name: "web_fetch",
+      input: { url: "https://example.test" },
+    };
+    const serverResult = {
+      type: "web_fetch_tool_result",
+      tool_use_id: "srvtoolu_1",
+      content: { type: "web_fetch_result", url: "https://example.test", content: "body" },
+    };
+    const upstream = [
+      sse("response.output_item.done", {
+        output_index: 0,
+        item: { type: "anthropic_server_block", id: "asb_1", block: serverTool },
+      }),
+      sse("response.output_item.done", {
+        output_index: 1,
+        item: { type: "anthropic_server_block", id: "asb_2", block: serverResult },
+      }),
+      sse("response.completed", {
+        response: {
+          status: "completed",
+          _ocx_anthropic_stop_reason: "stop_sequence",
+          _ocx_anthropic_stop_sequence: "DONE",
+        },
+      }),
+    ].join("");
+
+    const message = await collectAnthropicMessage(
+      responsesSseToAnthropicSse(streamFrom(upstream), "m"),
+      "m",
+    ) as Record<string, any>;
+    expect(message.content).toEqual([serverTool, serverResult]);
+    expect(message.stop_reason).toBe("stop_sequence");
+    expect(message.stop_sequence).toBe("DONE");
+  });
+
+  test("canonical Anthropic metadata restores citations in stream and collected message", async () => {
+    const citations = [
+      {
+        type: "web_search_result_location",
+        cited_text: "first source",
+        encrypted_index: "opaque-index",
+        title: "Example",
+        url: "https://example.test/one",
+      },
+      {
+        type: "char_location",
+        cited_text: "second source",
+        document_index: 0,
+        document_title: "Document",
+        start_char_index: 4,
+        end_char_index: 17,
+      },
+    ];
+    const upstream = () => streamFrom([
+      sse("response.output_text.delta", { delta: "Cited " }),
+      sse("response.anthropic_citation.delta", {
+        delta: { type: "citations_delta", citation: citations[0] },
+      }),
+      sse("response.output_text.delta", { delta: "answer" }),
+      sse("response.anthropic_citation.delta", {
+        delta: { type: "citations_delta", citation: citations[1] },
+      }),
+      sse("response.completed", { response: { status: "completed" } }),
+    ].join(""));
+
+    const events = await collectEvents(responsesSseToAnthropicSse(upstream(), "m"));
+    expect(events
+      .filter(event => event.name === "content_block_delta")
+      .map(event => event.data.delta)).toEqual([
+      { type: "text_delta", text: "Cited " },
+      { type: "citations_delta", citation: citations[0] },
+      { type: "text_delta", text: "answer" },
+      { type: "citations_delta", citation: citations[1] },
+    ]);
+
+    const message = await collectAnthropicMessage(
+      responsesSseToAnthropicSse(upstream(), "m"),
+      "m",
+    ) as Record<string, any>;
+    expect(message.content).toEqual([{
+      type: "text",
+      text: "Cited answer",
+      citations,
+    }]);
+  });
+
   test("no-output completed still emits a valid empty message", async () => {
     const upstream = sse("response.created", { response: {} }) + sse("response.completed", { response: { status: "completed" } });
     const events = await collectEvents(responsesSseToAnthropicSse(streamFrom(upstream), "m"));
@@ -812,6 +956,101 @@ describe("claude outbound non-stream + helpers", () => {
     expect(msg.content[1]).toEqual({ type: "text", text: "hi" });
     expect(msg.content[2]).toEqual({ type: "tool_use", id: "toolu_1", name: "Read", input: { a: 1 } });
     expect(msg.usage).toEqual({ input_tokens: 10, output_tokens: 4, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 });
+  });
+
+  test("Responses JSON restores canonical Anthropic private metadata without reconstruction", () => {
+    const signature = "original-signature";
+    const rawTool = {
+      type: "server_tool_use", id: "srvtoolu_1", name: "web_search",
+      input: { queries: ["first", "second"] },
+    };
+    const rawResult = {
+      type: "web_search_tool_result", tool_use_id: "srvtoolu_1",
+      content: [{ type: "web_search_result", url: "https://example.test", title: "Example", encrypted_content: "opaque" }],
+    };
+    const futureBlock = { type: "future_server_tool_result", id: "future_1", payload: { keep: true } };
+    const message = responsesJsonToAnthropicMessage({
+      status: "completed",
+      output: [
+        {
+          type: "reasoning", id: "rs_1",
+          summary: [{ type: "summary_text", text: "thought" }],
+          encrypted_content: encodeReasoningEnvelope({ sig: signature }),
+        },
+        {
+          type: "reasoning", id: "rs_2", summary: [],
+          encrypted_content: encodeReasoningEnvelope({ red: ["redacted"] }),
+        },
+        {
+          type: "web_search_call", status: "completed",
+          _ocx_anthropic_server_tool: rawTool,
+          _ocx_anthropic_server_tool_result: rawResult,
+        },
+        { type: "anthropic_server_block", block: futureBlock },
+      ],
+      _ocx_anthropic_stop_reason: "stop_sequence",
+      _ocx_anthropic_stop_sequence: "END",
+      usage: {
+        input_tokens: 10,
+        output_tokens: 2,
+        anthropic_server_tool_use: { web_search_requests: 7, code_execution_requests: 2 },
+      },
+    }, "m") as Record<string, any>;
+
+    expect(message.content).toEqual([
+      { type: "thinking", thinking: "thought", signature },
+      { type: "redacted_thinking", data: "redacted" },
+      rawTool,
+      rawResult,
+      futureBlock,
+    ]);
+    expect(message.stop_reason).toBe("stop_sequence");
+    expect(message.stop_sequence).toBe("END");
+    expect(message.usage.server_tool_use).toEqual({
+      web_search_requests: 7,
+      code_execution_requests: 2,
+    });
+  });
+
+  test("Responses JSON restores canonical Anthropic citations", () => {
+    const citations = [
+      {
+        type: "web_search_result_location",
+        cited_text: "source",
+        encrypted_index: "opaque",
+        title: "Example",
+        url: "https://example.test",
+      },
+      {
+        type: "page_location",
+        cited_text: "document",
+        document_index: 1,
+        document_title: "PDF",
+        start_page_number: 2,
+        end_page_number: 3,
+      },
+    ];
+    const message = responsesJsonToAnthropicMessage({
+      status: "completed",
+      output: [{
+        type: "message",
+        content: [{
+          type: "output_text",
+          text: "Cited answer",
+          _ocx_anthropic_citation_deltas: [
+            { type: "citations_delta", citation: citations[0] },
+            { type: "ignored", citation: { must_not_leak: true } },
+            { type: "citations_delta", citation: citations[1] },
+          ],
+        }],
+      }],
+    }, "m") as Record<string, any>;
+
+    expect(message.content).toEqual([{
+      type: "text",
+      text: "Cited answer",
+      citations,
+    }]);
   });
 
   test("error taxonomy table", () => {

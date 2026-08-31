@@ -56,6 +56,8 @@ export interface ProviderFetchOptions {
   modelId?: string;
   /** One pacing slot was acquired immediately before this fetch wrapper was created. */
   pacingSlotAcquired?: boolean;
+  /** Called after pacing admission, immediately before each physical transport dispatch. */
+  onDispatch?: () => void;
 }
 
 export function providerFetch(
@@ -76,6 +78,7 @@ export function providerFetch(
   // transport (measured ~3s faster TTFT than the SSE POST queue); everything
   // else keeps the provider's HTTP fetch. See ws-upstream.ts for the details.
   const unpaced = async (input: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) => {
+    options.onDispatch?.();
     if (typeof input === "string" && init && shouldUseCodexWsUpstream(input, init, runtime)) {
       // The fallback has to be the same HTTP fetch the non-WS branch would have
       // used, protocol pin included: a WS turn that falls back is serving the

@@ -389,12 +389,20 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
     // expose buildRequest/fetchResponse/parseStream to the bridge, so collect their events through
     // an AdapterEventQueue and wrap them in a pseudo-response whose parseStream replays them.
     if (adapter.runTurn) {
-      await deps.waitForRequestSlot?.(signal);
       const queue = createAdapterEventQueue({
         onBacklogExceeded: () => internalAbort.abort("runTurn backlog exceeded"),
       });
-      // Attempt telemetry must fire at dispatch time (parity with fetchOnce), not after collect.
-      deps.onAttemptSend?.();
+      const runTurnProviderFetch = Object.assign(
+        async (
+          input: Parameters<typeof globalThis.fetch>[0],
+          init?: RequestInit,
+        ): Promise<Response> => {
+          await deps.waitForRequestSlot?.(signal);
+          deps.onAttemptSend?.();
+          return fetchImpl(input, init);
+        },
+        { preconnect: fetchImpl.preconnect },
+      );
       void adapter
         .runTurn(
           iterParsed,
@@ -402,6 +410,7 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
             headers: deps.forwardHeaders ? new Headers(deps.forwardHeaders) : new Headers(),
             abortSignal: signal,
             translatorBudget,
+            providerFetch: runTurnProviderFetch,
           },
           queue.push,
         )
@@ -472,6 +481,15 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
       await deps.waitForRequestSlot?.(signal);
       headerDeadline = clearableDeadline(connectTimeoutMs, signal);
     };
+    let firstPacingSlot = true;
+    const reserveDispatchSlot = async (): Promise<void> => {
+      if (firstPacingSlot) {
+        firstPacingSlot = false;
+        await paceThenResetHeaderDeadline();
+      } else {
+        await deps.waitForRequestSlot?.(headerDeadline.signal);
+      }
+    };
     try {
       /**
        * Build and fetch one image-bridge iteration on the given adapter, under the iteration
@@ -502,19 +520,32 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
         let response: Response;
         try {
           if (requestAdapter.fetchResponse) {
-            await paceThenResetHeaderDeadline();
-            deps.onAttemptSend?.(recovery);
+            await reserveDispatchSlot();
+            let firstDispatch = true;
+            let nextRecovery = recovery;
+            const executor = async (
+              input: Parameters<typeof globalThis.fetch>[0],
+              init?: RequestInit,
+            ): Promise<Response> => {
+              if (firstDispatch) firstDispatch = false;
+              else await deps.waitForRequestSlot?.(headerDeadline.signal);
+              const dispatchRecovery = nextRecovery;
+              nextRecovery = undefined;
+              deps.onAttemptSend?.(dispatchRecovery);
+              return fetchImpl(input, init);
+            };
             response = await requestAdapter.fetchResponse(request, {
               abortSignal: headerDeadline.signal,
               timeoutMs: connectTimeoutMs,
               returnRawErrors: true,
               stream: true,
-              executor: fetchImpl,
+              executor: Object.assign(executor, { preconnect: fetchImpl.preconnect }),
+              onRetry: retryRecovery => { nextRecovery = retryRecovery; },
             });
           } else {
             response = await fetchWithResetRetry(
               async (retryRecovery) => {
-                await paceThenResetHeaderDeadline();
+                await reserveDispatchSlot();
                 // Record every helper-driven send (the callback runs for the first attempt and
                 // each connection-reset replay); preserve the caller's recovery kind
                 // (rate-limit-429 / key-429) when the retry layer supplies none.

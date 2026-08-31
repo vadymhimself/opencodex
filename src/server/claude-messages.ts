@@ -7,6 +7,7 @@
  * unchanged. The Responses output (SSE or JSON) is converted back to Anthropic shape.
  */
 import { FORWARD_HEADERS } from "../adapters/openai-responses";
+import type { AnthropicMessagesSource } from "../adapters/base";
 import { sseFieldValue } from "../lib/sse-decoder";
 import { enforceAnthropicImageLimits, sniffImageDimensions } from "../adapters/anthropic-image-guard";
 import { normalizeAnthropicImages } from "../adapters/anthropic-image-normalize";
@@ -599,6 +600,7 @@ async function handleClaudeMessagesWithBudget(
 
   let anthropicBody: unknown;
   let internalBody: Rec;
+  let anthropicMessagesSource: AnthropicMessagesSource | undefined;
   let cacheKeySource: ClaudeCacheKeySource = null;
   let effortOverride: ReturnType<typeof extractOcxEffortDirective> = null;
   try {
@@ -655,6 +657,16 @@ async function handleClaudeMessagesWithBudget(
     }
     const translation = anthropicToResponsesTranslation(anthropicBody, config.claudeCode);
     internalBody = translation.body;
+    const anthropicVersion = req.headers.get("anthropic-version")?.trim();
+    const anthropicBeta = req.headers.get("anthropic-beta")?.trim();
+    anthropicMessagesSource = {
+      body: anthropicBody as Rec,
+      headers: {
+        ...(anthropicVersion ? { anthropicVersion } : {}),
+        ...(anthropicBeta ? { anthropicBeta } : {}),
+      },
+      ...(translation.requiresExactAnthropicReplay ? { requiresExactReplay: true } : {}),
+    };
     translatorBudget.chargeRetained(new TextEncoder().encode(JSON.stringify(internalBody)).byteLength, { kind: "request_copies" });
     cacheKeySource = translation.cacheKeySource;
   } catch (err) {
@@ -777,6 +789,7 @@ async function handleClaudeMessagesWithBudget(
     // Without this the replay would look native and a Responses-scoped wire default
     // would fire, disagreeing with the pre-flight decision above.
     inboundWire: "anthropic",
+    ...(anthropicMessagesSource ? { anthropicMessagesSource } : {}),
     stripClaudeMainAuthForNoncanonicalForward: true,
     translatorBudget,
     ...(logIds ? { onFirstOutput: () => recordFirstOutput(logCtx, logIds.start) } : {}),
@@ -912,7 +925,7 @@ async function handleClaudeMessagesWithBudget(
     emit("content_block_start", { type: "content_block_start", index, content_block: block });
     emit("content_block_stop", { type: "content_block_stop", index });
   });
-  emit("message_delta", { type: "message_delta", delta: { stop_reason: (message as Rec).stop_reason ?? "end_turn", stop_sequence: null }, usage: (message as Rec).usage ?? {} });
+  emit("message_delta", { type: "message_delta", delta: { stop_reason: (message as Rec).stop_reason ?? "end_turn", stop_sequence: (message as Rec).stop_sequence ?? null }, usage: (message as Rec).usage ?? {} });
   emit("message_stop", { type: "message_stop" });
   return new Response(encoder.encode(frames.join("")), {
     status: 200,

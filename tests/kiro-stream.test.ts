@@ -306,20 +306,43 @@ describe("kiro adapter — parseStream", () => {
 
   test("progress-only required response makes exactly one structural text fallback", async () => {
     const requests: Record<string, any>[] = [];
-    globalThis.fetch = (async (_input, init) => {
+    const recoveries: Array<string | undefined> = [];
+    let nextRecovery: string | undefined;
+    globalThis.fetch = (async () => {
+      throw new Error("fallback bypassed the request executor");
+    }) as typeof fetch;
+    const executor = (async (_input, init) => {
+      recoveries.push(nextRecovery);
+      nextRecovery = undefined;
       requests.push(JSON.parse(String(init?.body)));
+      if (requests.length === 1) {
+        return new Response(streamOf(
+          eventFrame({ content: "I am checking." }),
+          eventFrame({ conversationId: "returned-conversation-42" }),
+        ));
+      }
+      if (requests.length === 2) {
+        return new Response(JSON.stringify({
+          __type: "ThrottlingException",
+          message: "USER_REQUEST_RATE_EXCEEDED: please wait",
+        }), { status: 429, headers: { "Retry-After": "0" } });
+      }
       return new Response(streamOf(eventFrame({ content: "Final from fallback." })));
     }) as typeof fetch;
     const adapter = createKiroAdapter(provider);
-    await adapter.buildRequest(parsedWith([{ role: "user", content: "do it" }], [bashTool]));
+    const request = await adapter.buildRequest(parsedWith([{ role: "user", content: "do it" }], [bashTool]));
+    const firstResponse = await adapter.fetchResponse!(request, {
+      stream: true,
+      executor,
+      onRetry: recovery => { nextRecovery = recovery; },
+    });
 
-    const events = await collectAdapterEvents(adapter.parseStream(new Response(streamOf(
-      eventFrame({ content: "I am checking." }),
-      eventFrame({ conversationId: "returned-conversation-42" }),
-    ))));
+    const events = await collectAdapterEvents(adapter.parseStream(firstResponse));
 
-    expect(requests).toHaveLength(1);
-    const retry = requests[0].conversationState;
+    expect(requests).toHaveLength(3);
+    expect(recoveries).toEqual([undefined, "adapter-retry", "rate-limit-429"]);
+    const retry = requests[1].conversationState;
+    expect(requests[2].conversationState).toEqual(retry);
     expect(retry.conversationId).toBe("returned-conversation-42");
     expect(retry.history.at(-1).assistantResponseMessage).toEqual({ content: "I am checking." });
     expect(retry.currentMessage.userInputMessage.content).toBe(KIRO_COMPLETION_RETRY_MESSAGE);
