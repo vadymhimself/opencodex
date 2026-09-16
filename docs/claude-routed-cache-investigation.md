@@ -432,3 +432,14 @@ The fix was then proved on live traffic rather than fixtures, against genuinely 
 - Second identical request, immediately after: `0` attempts, `8 ms`, HTTP 503 `No available targets for combo: waterfall`.
 
 Zero wasted upstream sends where the old behaviour re-sent to every exhausted account each minute for the life of the window.
+
+## Incident closed: no defect, 2026-09-16
+
+Vadym closed the unexpected-burn incident as **no defect**. That verdict is correct for the question the incident actually asked — whether routing Claude Code through the gateway breaks prompt caching. It does not. With both arms warmed on the same prefix cohort, gateway and native measured 0.9623 read share each with 16 raw tokens, and the combo path measured 0.9620; the 0.8522 that first looked like a regression was a cold prefix cohort, nothing more. The trigger was the switch from cloud to gateway, as suspected, not a caching fault.
+
+Two things found along the way are separate from that verdict and remain in effect, so this entry is not a rollback:
+
+- The Codex exhaustion misclassification was a real defect and is fixed, committed (`f47552136`), deployed to both hosts, and verified against live exhausted quota. Leave it deployed.
+- `ENABLE_TOOL_SEARCH=true` is persisted in the agent recipes on both hosts and cuts turn-0 input from 103,158 to 33,984 with every MCP intact. It is configuration, not a fix for any gateway fault.
+
+Open levers were deliberately not taken: combo `waitForCooldownMs` stays at its default of 0 (no waiting before a hop to Astra), no upstream PR was opened, and the quota watcher keeps its current thresholds.
