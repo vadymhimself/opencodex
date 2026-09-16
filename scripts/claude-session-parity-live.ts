@@ -209,6 +209,12 @@ function summarize(arm: "native" | "gateway", model: string, turns: TurnUsage[])
   };
 }
 
+/**
+ * Set `OPENCODEX_PARITY_TOOL_SEARCH=0` to measure the unsupported configuration instead — useful
+ * for reproducing the inflation itself, not for judging the gateway.
+ */
+const toolSearch = process.env.OPENCODEX_PARITY_TOOL_SEARCH !== "0";
+
 async function runSession(options: {
   arm: "native" | "gateway";
   model: string;
@@ -226,6 +232,12 @@ async function runSession(options: {
   delete env.ANTHROPIC_API_KEY;
   if (options.baseUrl) {
     env.ANTHROPIC_BASE_URL = options.baseUrl;
+    // Claude Code defers MCP tools by default but turns tool search OFF for a non-first-party
+    // base URL, because most proxies drop `tool_reference`. Ours does not (strict replay forwards
+    // the body and relays Anthropic's bytes verbatim), so the supported configuration is tool
+    // search ON — measured 103,158 -> 33,984 turn-0 tokens. Without this the eval would measure a
+    // setup nobody should run and report its 2.4x as if it were a gateway regression.
+    env.ENABLE_TOOL_SEARCH = toolSearch ? "true" : "false";
   } else {
     delete env.ANTHROPIC_BASE_URL;
   }
@@ -346,6 +358,9 @@ async function main(): Promise<void> {
     report = {
       schemaVersion: 1,
       mode: "live",
+      // Which configuration these numbers describe. A report without it is unreadable six months
+      // from now: the same gateway measures 33,984 or 103,158 on turn 0 depending on this flag.
+      toolSearch,
       port,
       passed: comparison.passed,
       native: { ...nativeArm, turns: nativeArm.turns.length },
