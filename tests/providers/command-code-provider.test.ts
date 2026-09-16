@@ -619,25 +619,78 @@ describe("Command Code provider", () => {
     expect(JSON.parse(bareBuilt.body).params.tools).toEqual(tools);
   });
 
-  test("refreshes a stale official effort record only after a reasoning rejection and retries without it", async () => {
+  test("starts the response-header timeout after provider pacing", async () => {
+    let pacingCalls = 0;
+    let physicalSends = 0;
+    const waitForPacing = (signal?: AbortSignal) => new Promise<void>((resolve, reject) => {
+      pacingCalls += 1;
+      const onAbort = () => {
+        clearTimeout(timer);
+        reject(signal?.reason);
+      };
+      const timer = setTimeout(() => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve();
+      }, 40);
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
+    const unpacedFetch = Object.assign(
+      async () => {
+        physicalSends += 1;
+        return new Response("{}", { status: 200 });
+      },
+      { preconnect: () => {} },
+    ) as typeof globalThis.fetch;
+    const executor = Object.assign(
+      async (input: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) => {
+        await waitForPacing(init?.signal);
+        return unpacedFetch(input, init);
+      },
+      { preconnect: () => {}, waitForPacing, unpacedFetch },
+    ) as typeof globalThis.fetch;
+    const adapter = createCommandCodeAdapter(provider);
+    const request = await adapter.buildRequest(parsed());
+
+    const response = await adapter.fetchResponse!(request, {
+      executor,
+      timeoutMs: 10,
+    });
+
+    expect(response.status).toBe(200);
+    expect(pacingCalls).toBe(1);
+    expect(physicalSends).toBe(1);
+  });
+
+  test("refreshes a stale effort record and retries through the request executor", async () => {
     const requests: Array<{ url: string; body?: string }> = [];
-    const fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    const recoveries: Array<string | undefined> = [];
+    let nextRecovery: string | undefined;
+    const profileFetch = (async (url: string | URL | Request) => {
       const href = String(url);
+      requests.push({ url: href });
+      if (!href.includes("commandcode.ai/models/")) throw new Error("generation bypassed the request executor");
+      return new Response("Reasoning efforts high are supported; no other reasoning settings.");
+    }) as typeof globalThis.fetch;
+    const executor = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      recoveries.push(nextRecovery);
+      nextRecovery = undefined;
       requests.push({ url: href, body: typeof init?.body === "string" ? init.body : undefined });
-      if (href.includes("commandcode.ai/models/")) {
-        return new Response("Reasoning efforts high are supported; no other reasoning settings.");
-      }
-      return requests.filter(request => request.url.endsWith("/alpha/generate")).length === 1
+      return recoveries.length === 1
         ? new Response(JSON.stringify({ error: "unsupported reasoning_effort" }), { status: 400 })
         : new Response("{}", { status: 200 });
     }) as typeof globalThis.fetch;
-    const adapter = createCommandCodeAdapter({ ...provider, fetch } as OcxProviderConfig);
+    const adapter = createCommandCodeAdapter({ ...provider, fetch: profileFetch } as OcxProviderConfig);
     const request = await adapter.buildRequest({ ...parsed(), options: { reasoning: "max" } });
-    const response = await adapter.fetchResponse!(request);
+    const response = await adapter.fetchResponse!(request, {
+      executor,
+      onRetry: recovery => { nextRecovery = recovery; },
+    });
     expect(response.ok).toBe(true);
     expect(commandCodeReasoningEfforts("deepseek/deepseek-v4-flash")).toEqual(["high"]);
     const generated = requests.filter(request => request.url.endsWith("/alpha/generate"));
     expect(JSON.parse(generated[1]!.body!).params).not.toHaveProperty("reasoning_effort");
+    expect(recoveries).toEqual([undefined, "adapter-retry"]);
   });
 
   // Pins the profileUrl of each id added for #2647 — nothing more.

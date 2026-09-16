@@ -47,6 +47,31 @@ describe("client-facing SSE frame bounds", () => {
     expect(framer.finish().byteLength).toBe(0);
   });
 
+  test("the byte framer preserves a lone-CR delimiter split across chunks", () => {
+    const framer = new BoundedSseFrameBuffer(64);
+
+    expect(framer.feed(enc.encode("data: first\r"))).toEqual([]);
+    expect(framer.feed(enc.encode("\r"))).toEqual([]);
+    const { frames, tail } = framer.finishFrames();
+
+    expect(frames).toHaveLength(1);
+    expect(dec.decode(frames[0]!.block)).toBe("data: first");
+    expect(dec.decode(frames[0]!.delimiter)).toBe("\r\r");
+    expect(tail.byteLength).toBe(0);
+  });
+
+  test("the byte framer waits for a split CRLF delimiter's final LF", () => {
+    const framer = new BoundedSseFrameBuffer(64);
+
+    expect(framer.feed(enc.encode("data: first\r"))).toEqual([]);
+    expect(framer.feed(enc.encode("\n\r"))).toEqual([]);
+    const frames = framer.feed(enc.encode("\n"));
+
+    expect(frames).toHaveLength(1);
+    expect(dec.decode(frames[0]!.block)).toBe("data: first");
+    expect(dec.decode(frames[0]!.delimiter)).toBe("\r\n\r\n");
+  });
+
   test("the byte framer rejects cap + 1 without retaining an oversized tail", () => {
     const framer = new BoundedSseFrameBuffer(8);
 

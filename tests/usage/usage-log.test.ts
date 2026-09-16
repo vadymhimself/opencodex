@@ -7,6 +7,7 @@ import {
   appendUsageEntry,
   currentUsageLogRevision,
   normalizeUsageEntryForTest,
+  physicalUsageAttempts,
   readRecentUsageEntries,
   readUsageEntries,
   readUsageEntriesForManagement,
@@ -54,6 +55,25 @@ describe("usage log", () => {
     expect(normalized.attempts).toEqual([]);
   });
 
+  test("preserves only literal-true combo target advances", () => {
+    const entry: PersistedUsageEntry = {
+      requestId: "ocx-combo-target-advance",
+      timestamp: 1,
+      provider: "combo",
+      model: "combo/test",
+      status: 200,
+      durationMs: 1,
+      usageStatus: "unreported",
+      comboTargetAdvanced: true,
+    };
+
+    expect(normalizeUsageEntryForTest(entry).comboTargetAdvanced).toBe(true);
+    expect(normalizeUsageEntryForTest({
+      ...entry,
+      comboTargetAdvanced: false,
+    } as unknown as PersistedUsageEntry).comboTargetAdvanced).toBeUndefined();
+  });
+
   test("preserves only valid non-PII Codex account log labels", () => {
     const normalized = normalizeUsageEntryForTest({
       requestId: "ocx-account-label",
@@ -87,6 +107,48 @@ describe("usage log", () => {
     });
     expect(rejected.accountLogLabel).toBeUndefined();
     expect(rejected.attempts?.[0]?.accountLogLabel).toBeUndefined();
+  });
+
+  test("preserves only valid physical send time and prompt-cache TTL metadata", () => {
+    const base = {
+      requestId: "ocx-physical-order",
+      timestamp: 1,
+      provider: "anthropic-pabc123",
+      model: "claude-opus-5",
+      status: 200,
+      durationMs: 1,
+      usageStatus: "reported" as const,
+      attempts: [{
+        ordinal: 1,
+        provider: "anthropic-pabc123",
+        model: "claude-opus-5",
+        adapter: "anthropic",
+        status: 200,
+        durationMs: 1,
+        sendCount: 1,
+        recoveryKinds: [],
+        usageStatus: "reported" as const,
+        firstSendAt: 123.25,
+        promptCacheTtlMs: 3_600_000,
+      }],
+    };
+
+    const normalized = normalizeUsageEntryForTest(base as unknown as PersistedUsageEntry);
+    expect(normalized.attempts?.[0]).toMatchObject({
+      firstSendAt: 123.25,
+      promptCacheTtlMs: 3_600_000,
+    });
+
+    const rejected = normalizeUsageEntryForTest({
+      ...base,
+      attempts: [{
+        ...base.attempts[0],
+        firstSendAt: -1,
+        promptCacheTtlMs: Number.NaN,
+      }],
+    } as unknown as PersistedUsageEntry);
+    expect(rejected.attempts?.[0]?.firstSendAt).toBeUndefined();
+    expect(rejected.attempts?.[0]?.promptCacheTtlMs).toBeUndefined();
   });
 
   test("persists the rate-limit-429 recovery kind on attempts", () => {
@@ -348,6 +410,83 @@ describe("usage log", () => {
     })]);
   });
 
+  test("persists server-tool counters on parent and attempt usage", () => {
+    appendUsageEntry({
+      requestId: "ocx-server-tools",
+      timestamp: 1,
+      provider: "anthropic",
+      model: "claude-opus-5",
+      status: 200,
+      durationMs: 10,
+      usageStatus: "reported",
+      usage: {
+        inputTokens: 20,
+        outputTokens: 2,
+        anthropicServerToolUse: { web_search_requests: 3, web_fetch_requests: 1 },
+      },
+      attempts: [{
+        ordinal: 1,
+        provider: "anthropic",
+        model: "claude-opus-5",
+        adapter: "anthropic",
+        status: 200,
+        durationMs: 10,
+        sendCount: 1,
+        recoveryKinds: [],
+        usageStatus: "reported",
+        usage: {
+          inputTokens: 20,
+          outputTokens: 2,
+          anthropicServerToolUse: { web_search_requests: 3, web_fetch_requests: 1 },
+        },
+      }],
+    });
+
+    expect(readUsageEntries()[0]).toMatchObject({
+      usage: {
+        anthropicServerToolUse: { web_search_requests: 3, web_fetch_requests: 1 },
+      },
+      attempts: [{
+        usage: {
+          anthropicServerToolUse: { web_search_requests: 3, web_fetch_requests: 1 },
+        },
+      }],
+    });
+  });
+
+  test("bounds and sanitizes persisted server-tool counter maps", () => {
+    const counters = Object.fromEntries([
+      ["web_search_requests", 2],
+      ["negative", -1],
+      ["not_finite", Number.POSITIVE_INFINITY],
+      ["__proto__", 1],
+      ["x".repeat(200), 1],
+      ...Array.from({ length: 200 }, (_, index) => [`tool_${index}`, index]),
+    ]);
+    const normalized = normalizeUsageEntryForTest({
+      requestId: "ocx-server-tool-bounds",
+      timestamp: 1,
+      provider: "anthropic",
+      model: "claude-opus-5",
+      status: 200,
+      durationMs: 1,
+      usageStatus: "reported",
+      usage: {
+        inputTokens: 1,
+        outputTokens: 1,
+        anthropicServerToolUse: counters,
+      },
+    });
+    const persisted = normalized.usage?.anthropicServerToolUse;
+
+    expect(persisted?.web_search_requests).toBe(2);
+    expect(persisted).not.toHaveProperty("negative");
+    expect(persisted).not.toHaveProperty("not_finite");
+    expect(Object.prototype.hasOwnProperty.call(persisted, "__proto__")).toBe(false);
+    expect(persisted).not.toHaveProperty("x".repeat(200));
+    expect(Object.keys(persisted ?? {}).length).toBeLessThan(200);
+  });
+
   test("never invents a context checkpoint when the adapter reported none", () => {
     appendUsageEntry({
       requestId: "ocx-no-checkpoint",
@@ -516,7 +655,7 @@ describe("usage log", () => {
     expect(valid.attempts?.[0]?.reasoningWireValue).toBe(false);
   });
 
-  test("drops only malformed persisted attempts while preserving valid siblings", () => {
+  test("drops malformed attempt identity while preserving valid siblings", () => {
     const valid = (ordinal: number) => ({
       ordinal,
       provider: ordinal === 1 ? "a" : "c",
@@ -534,13 +673,6 @@ describe("usage log", () => {
       { ...valid(2), status: 99 },
       { ...valid(2), status: 600 },
       { ...valid(2), status: 200.5 },
-      { ...valid(2), inputTokenEstimate: -1 },
-      { ...valid(2), totalTokens: -1 },
-      { ...valid(2), firstOutputMs: -1 },
-      { ...valid(2), firstOutputMs: null },
-      { ...valid(2), firstOutputMs: "3" },
-      { ...valid(2), usage: { inputTokens: "2", outputTokens: 1 } },
-      { ...valid(2), usage: { inputTokens: 2, outputTokens: "1" } },
     ];
     for (const middle of malformed) {
       writeFileSync(usageLogPath(), `${JSON.stringify({
@@ -558,6 +690,91 @@ describe("usage log", () => {
       const [entry] = readUsageEntries();
       expect(entry?.requestId).toBe("parent");
       expect(entry?.attempts?.map(attempt => attempt.ordinal)).toEqual([1, 3]);
+    }
+  });
+
+  test("keeps physical identity when optional attempt telemetry is malformed", () => {
+    const valid = {
+      ordinal: 1,
+      provider: "anthropic",
+      model: "claude-opus-5",
+      adapter: "anthropic",
+      status: 200,
+      durationMs: 1,
+      sendCount: 1,
+      recoveryKinds: [],
+      usageStatus: "reported",
+      usage: { inputTokens: 2, outputTokens: 1 },
+      totalTokens: 3,
+    };
+    const malformed: Array<[string, Record<string, unknown>]> = [
+      ["inputTokenEstimate", { ...valid, inputTokenEstimate: -1 }],
+      ["totalTokens", { ...valid, totalTokens: -1 }],
+      ["firstOutputMs", { ...valid, firstOutputMs: -1 }],
+      ["firstOutputMs", { ...valid, firstOutputMs: null }],
+      ["firstOutputMs", { ...valid, firstOutputMs: "3" }],
+      ["recoveryCount", { ...valid, recoveryCount: -1 }],
+      ["usage", { ...valid, usage: { inputTokens: "2", outputTokens: 1 } }],
+      ["usage", { ...valid, usage: { inputTokens: 2, outputTokens: "1" } }],
+    ];
+
+    for (const [field, rawAttempt] of malformed) {
+      const normalized = normalizeUsageEntryForTest({
+        requestId: `optional-${field}`,
+        timestamp: 1,
+        provider: "combo",
+        model: "combo/free",
+        status: 200,
+        durationMs: 1,
+        usageStatus: "reported",
+        attempts: [rawAttempt as unknown as typeof valid],
+      });
+      expect(normalized.attempts).toHaveLength(1);
+      expect(normalized.attempts?.[0]).toMatchObject({
+        ordinal: 1,
+        provider: "anthropic",
+        model: "claude-opus-5",
+        status: 200,
+      });
+      expect(normalized.attempts?.[0]).not.toHaveProperty(field);
+    }
+  });
+
+  test("retains nonphysical duplicate ordinals until physical filtering", () => {
+    const physical = {
+      ordinal: 1,
+      provider: "anthropic",
+      model: "claude-opus-5",
+      adapter: "anthropic",
+      status: 200,
+      durationMs: 2,
+      sendCount: 1,
+      recoveryKinds: [],
+      usageStatus: "reported" as const,
+      usage: { inputTokens: 10, outputTokens: 2 },
+      totalTokens: 12,
+    };
+
+    for (const diagnostic of [
+      { ...physical, provider: "local", locallyAnswered: true },
+      { ...physical, provider: "unsent", sendCount: 0 },
+    ]) {
+      const normalized = normalizeUsageEntryForTest({
+        requestId: `duplicate-${diagnostic.provider}`,
+        timestamp: 1,
+        provider: "combo",
+        model: "combo/free",
+        status: 200,
+        durationMs: 3,
+        usageStatus: "reported",
+        attempts: [diagnostic, physical],
+      });
+
+      expect(normalized.attempts?.map(attempt => attempt.provider)).toEqual([
+        diagnostic.provider,
+        physical.provider,
+      ]);
+      expect(physicalUsageAttempts(normalized.attempts ?? [])).toEqual([physical]);
     }
   });
 

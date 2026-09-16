@@ -459,6 +459,7 @@ export function httpStatusFromTerminalError(error: {
     return 400;
   }
   if (error.type === "rate_limit_error" || error.code === "rate_limit_exceeded") return 429;
+  if (error.type === "overloaded_error") return 529;
   if (error.type === "authentication_error" || error.code === "invalid_api_key") return 401;
   if (
     error.type === "permission_error" ||

@@ -8,12 +8,12 @@ import { headersForCodexAuthContext } from "../../src/codex/auth-context";
 import { listOpenAiForwardSidecarCandidates, resolveFirstUsableOpenAiSidecar } from "../../src/providers/openai-sidecar";
 import { handleResponses } from "../../src/server/responses/core";
 import { providerFetch } from "../../src/server/responses/fetch-helpers";
-import type { AdapterEvent, OcxConfig, OcxProviderConfig } from "../../src/types";
-import type { AdapterFetchContext, ProviderAdapter } from "../../src/adapters/base";
-import type { OcxMessage, OcxParsedRequest } from "../../src/types";
+import type { AdapterEvent, OcxConfig, OcxMessage, OcxParsedRequest, OcxProviderConfig } from "../../src/types";
+import type { AdapterFetchContext, AdapterRequest, ProviderAdapter } from "../../src/adapters/base";
 import { fakeChatGptJwt } from "../helpers/fake-chatgpt-jwt";
 import { createTestTranslatorBudget } from "../helpers/translator-budget";
 import { withUpstreamHttpVersion } from "../../src/lib/upstream-http-version";
+import { RequestPacingQueueOverloadError } from "../../src/providers/request-pacing";
 
 /**
  * Wrap a fetch so it applies the provider's HTTP-version pin the way `providerFetch` does in
@@ -26,6 +26,16 @@ function withUpstreamHttpVersionExecutor(
 ): typeof globalThis.fetch {
   return ((input: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) =>
     inner(input, withUpstreamHttpVersion(input, init, provider))) as typeof globalThis.fetch;
+}
+
+function dispatchAdapterRequest(request: AdapterRequest, ctx?: AdapterFetchContext): Promise<Response> {
+  if (!ctx?.executor) throw new Error("adapter executor missing");
+  return ctx.executor(request.url, {
+    method: request.method,
+    headers: request.headers,
+    body: request.body,
+    signal: ctx.abortSignal,
+  });
 }
 
 /** Run the web-search loop with a default test translator budget. */
@@ -65,7 +75,10 @@ describe("issue #1001 — forced-answer passes must produce usable output", () =
     };
   }
 
-  async function drive(secondPass: AdapterEvent[]) {
+  async function drive(
+    secondPass: AdapterEvent[],
+    callbacks: Pick<WebSearchLoopDeps, "onIterationUsage" | "onUsage"> = {},
+  ) {
     const response = await runWithWebSearch({
       parsed: parseRequest({ model: "routed/model", input: "hi", stream: true, tools: [{ type: "web_search" }] }),
       adapter: twoPassAdapter(secondPass),
@@ -74,6 +87,7 @@ describe("issue #1001 — forced-answer passes must produce usable output", () =
       selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
       settings: { model: "gpt-5.6-luna", reasoning: "low", timeoutMs: 30_000 },
       maxSearches: 1,
+      ...callbacks,
     });
     return collectSse(response.body!);
   }
@@ -103,6 +117,22 @@ describe("issue #1001 — forced-answer passes must produce usable output", () =
     const frames = await drive([{ type: "done" }]);
     expect(frames.some(frame => frame.event === "response.failed")).toBe(true);
     expect(frames.some(frame => frame.event === "response.completed")).toBe(false);
+  });
+
+  test("a rejected forced-answer terminal remains in request usage", async () => {
+    const iterations: unknown[] = [];
+    const aggregate: unknown[] = [];
+    const frames = await drive(
+      [{ type: "done", usage: { inputTokens: 3, outputTokens: 2 } }],
+      {
+        onIterationUsage: usage => iterations.push(usage),
+        onUsage: usage => aggregate.push(usage),
+      },
+    );
+
+    expect(frames.some(frame => frame.event === "response.failed")).toBe(true);
+    expect(iterations).toEqual([{ inputTokens: 3, outputTokens: 2 }]);
+    expect(aggregate).toEqual([{ inputTokens: 3, outputTokens: 2 }]);
   });
 
   test("commentary-only output does not satisfy the forced pass", async () => {
@@ -644,18 +674,25 @@ describe("BUG-R86 routed web-search timeout semantics", () => {
     expect(new Set(models)).toEqual(new Set(["anthropic/claude-sonnet-5"]));
   });
 
-  test("translator overflow remains typed through the sidecar loop and bridge", async () => {
+  test("usage-bearing translator overflow reaches attempt, request, and wire without sidecar dispatch", async () => {
+    const iterations: unknown[] = [];
+    const aggregate: unknown[] = [];
+    const sidecarOutcomes: unknown[] = [];
     const adapter: ProviderAdapter = {
       name: "overflow",
       buildRequest: () => ({ url: "https://routed.test/v1", method: "POST", headers: {}, body: "{}" }),
       fetchResponse: async () => new Response("wire", { status: 200 }),
       async *parseStream() {
+        yield { type: "tool_call_start", id: "ws1", name: "web_search" };
+        yield { type: "tool_call_delta", arguments: '{"q":"docs"}' };
+        yield { type: "tool_call_end" };
         yield {
           type: "error",
           status: 502,
           errorType: "upstream_error",
           code: "translation_buffer_limit",
           message: "upstream translation buffer exceeded the safe limit",
+          usage: { inputTokens: 7, outputTokens: 1 },
         };
       },
     };
@@ -667,14 +704,28 @@ describe("BUG-R86 routed web-search timeout semantics", () => {
       selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
       settings: { model: "gpt-5.6-luna", reasoning: "low", timeoutMs: 30_000 },
       maxSearches: 1,
+      onIterationUsage: usage => iterations.push(usage),
+      onUsage: usage => aggregate.push(usage),
+      recordSidecarOutcome: outcome => sidecarOutcomes.push(outcome),
     });
 
     const frames = await collectSse(response.body!);
     const failed = frames.filter(frame => frame.event === "response.failed");
     expect(failed).toHaveLength(1);
-    expect((failed[0]?.data.response as { error?: { code?: string } }).error?.code)
-      .toBe("translation_buffer_limit");
+    const failedResponse = failed[0]?.data.response as {
+      error?: { code?: string };
+      usage?: Record<string, unknown>;
+    };
+    expect(failedResponse.error?.code).toBe("translation_buffer_limit");
+    expect(failedResponse.usage).toMatchObject({
+      input_tokens: 7,
+      output_tokens: 1,
+      total_tokens: 8,
+    });
     expect(frames.some(frame => frame.event === "response.completed")).toBe(false);
+    expect(iterations).toEqual([{ inputTokens: 7, outputTokens: 1 }]);
+    expect(aggregate).toEqual([{ inputTokens: 7, outputTokens: 1 }]);
+    expect(sidecarOutcomes).toEqual([]);
   });
 
   test("Kiro-style commentary streams before the iteration finishes", async () => {
@@ -790,6 +841,50 @@ describe("BUG-R86 routed web-search timeout semantics", () => {
     expect(frames.some(frame => frame.event === "response.completed")).toBe(true);
   });
 
+  test("reports usage from hidden and final routed iterations", async () => {
+    globalThis.fetch = (() => Promise.resolve(new Response(
+      'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"result"}\n\n'
+        + 'event: response.completed\ndata: {"type":"response.completed"}\n\n',
+      { headers: { "content-type": "text/event-stream" } },
+    ))) as typeof fetch;
+
+    let pass = 0;
+    const adapter: ProviderAdapter = {
+      name: "usage",
+      buildRequest: () => ({ url: "https://routed.test/v1", method: "POST", headers: {}, body: "{}" }),
+      fetchResponse: async () => new Response("wire", { status: 200 }),
+      async *parseStream() {
+        const events: AdapterEvent[] = pass++ === 0
+          ? [
+              { type: "tool_call_start", id: "ws1", name: "web_search" },
+              { type: "tool_call_delta", arguments: '{"query":"docs"}' },
+              { type: "tool_call_end" },
+              { type: "done", usage: { inputTokens: 10, outputTokens: 4 } },
+            ]
+          : [
+              { type: "text_delta", text: "final" },
+              { type: "done", usage: { inputTokens: 3, outputTokens: 2 } },
+            ];
+        for (const event of events) yield event;
+      },
+    };
+    const seen: unknown[] = [];
+    const response = await runWithWebSearch({
+      parsed: parseRequest({ model: "routed/model", input: "search", stream: true, tools: [{ type: "web_search" }] }),
+      adapter,
+      forwardProvider,
+      hostedTool: { type: "web_search" },
+      selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
+      settings: { model: "gpt", reasoning: "low", timeoutMs: 30_000 },
+      maxSearches: 1,
+      onUsage: usage => seen.push(usage),
+    });
+
+    await response.text();
+    expect(pass).toBe(2);
+    expect(seen).toEqual([{ inputTokens: 13, outputTokens: 6, totalTokens: 19 }]);
+  });
+
   test("fast headers plus raw byte progress can outlive connectTimeoutMs", async () => {
     const delay = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
     let bodyCancelled = 0;
@@ -861,7 +956,7 @@ describe("BUG-R86 routed web-search timeout semantics", () => {
       { type: "tool_call_start", id: "call_bad", name: "web_search" },
       { type: "tool_call_delta", arguments: JSON.stringify({ query: "must not run" }) },
       { type: "tool_call_end" },
-      { type: "error", message: "routed model failed" },
+      { type: "error", message: "routed model failed", usage: { inputTokens: 7, outputTokens: 1 } },
     ];
     const finalPass: AdapterEvent[] = [
       { type: "text_delta", text: "fallback answer" },
@@ -880,6 +975,8 @@ describe("BUG-R86 routed web-search timeout semantics", () => {
       },
     };
 
+    const iterations: unknown[] = [];
+    const aggregate: unknown[] = [];
     const response = await runWithWebSearch({
       parsed: parseRequest({ model: "routed/model", input: "hi", stream: true, tools: [{ type: "web_search" }] }),
       adapter,
@@ -888,6 +985,8 @@ describe("BUG-R86 routed web-search timeout semantics", () => {
       selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
       settings: { model: "gpt-5.6-luna", reasoning: "low", timeoutMs: 30_000 },
       maxSearches: 1,
+      onIterationUsage: usage => iterations.push(usage),
+      onUsage: usage => aggregate.push(usage),
     });
 
     expect(response.status).toBe(200);
@@ -895,6 +994,8 @@ describe("BUG-R86 routed web-search timeout semantics", () => {
     expect(sidecarCalls).toBe(0);
     expect(frames.filter(frame => frame.event === "response.failed")).toHaveLength(1);
     expect(frames.some(frame => frame.event === "response.completed")).toBe(false);
+    expect(iterations).toEqual([{ inputTokens: 7, outputTokens: 1 }]);
+    expect(aggregate).toEqual([{ inputTokens: 7, outputTokens: 1 }]);
   });
 });
 
@@ -959,7 +1060,7 @@ describe("web-search sidecar native web_search_call emission", () => {
         rotations++;
         expect(retryAfter).toBe("30");
         await Promise.resolve();
-        return rotatedAdapter;
+        return { adapter: rotatedAdapter, recoveryKind: "key-429" };
       },
     });
     expect(response.status).toBe(200);
@@ -1003,23 +1104,24 @@ describe("web-search sidecar native web_search_call emission", () => {
           body: "{}",
         };
       },
-      fetchResponse: async () => {
-        sends += 1;
-        if (sends === 1) {
-          return new Response("rate limited", { status: 429, headers: { "retry-after": "30" } });
-        }
-        return new Response("{}", { status: 200 });
-      },
+      fetchResponse: dispatchAdapterRequest,
       async *parseStream() {
         yield { type: "text_delta", text: "answer after same-key retry" };
         yield { type: "done" };
       },
       async parseResponse() { throw new Error("parseResponse must be unreachable"); },
     };
+    const fetchImpl = async (): Promise<Response> => {
+      sends += 1;
+      return sends === 1
+        ? new Response("rate limited", { status: 429, headers: { "retry-after": "30" } })
+        : new Response("{}", { status: 200 });
+    };
 
     const response = await runWithWebSearch({
       parsed: parseRequest({ model: "routed/model", input: "hi", stream: true, tools: [{ type: "web_search" }] }),
       adapter: retryingAdapter,
+      fetchImpl,
       forwardProvider,
       hostedTool: { type: "web_search" },
       selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
@@ -1131,6 +1233,95 @@ describe("web-search sidecar native web_search_call emission", () => {
     expect(frames.find(f => f.event === "response.failed")).toBeUndefined();
   }, 5_000);
 
+  test("adapter-owned retry pacing starts a fresh header deadline", async () => {
+    let sends = 0;
+    let pacingReservations = 0;
+    const attemptSignals: (AbortSignal | undefined)[] = [];
+    const abortedAtFetch: boolean[] = [];
+    const retryingAdapter: ProviderAdapter = {
+      name: "mock-adapter-retry",
+      buildRequest: () => ({ url: "https://routed.test/v1", method: "POST", headers: {}, body: "{}" }),
+      fetchResponse: async (request, ctx) => {
+        if (!ctx?.executor) throw new Error("adapter executor missing");
+        const init = {
+          method: request.method,
+          headers: request.headers,
+          body: request.body,
+          signal: ctx.abortSignal,
+        };
+        await ctx.executor(request.url, init);
+        ctx.onRetry?.("connection-reset");
+        return ctx.executor(request.url, init);
+      },
+      async *parseStream() {
+        yield { type: "text_delta", text: "answer after adapter retry" };
+        yield { type: "done" };
+      },
+      async parseResponse() { throw new Error("parseResponse must be unreachable"); },
+    };
+    const fetchImpl = async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      sends += 1;
+      attemptSignals.push(init?.signal ?? undefined);
+      abortedAtFetch.push(init?.signal?.aborted ?? true);
+      init?.signal?.throwIfAborted();
+      if (sends === 1) {
+        await Bun.sleep(120);
+        init?.signal?.throwIfAborted();
+      }
+      return new Response("{}", { status: 200 });
+    };
+
+    const response = await runWithWebSearch({
+      parsed: parseRequest({ model: "routed/model", input: "hi", stream: true, tools: [{ type: "web_search" }] }),
+      adapter: retryingAdapter,
+      fetchImpl,
+      forwardProvider,
+      hostedTool: { type: "web_search" },
+      selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
+      settings: { model: "gpt-5.4-mini", reasoning: "low", timeoutMs: 30_000 },
+      maxSearches: 1,
+      connectTimeoutMs: 200,
+      waitForRequestSlot: async signal => {
+        pacingReservations += 1;
+        if (pacingReservations === 2) {
+          await Bun.sleep(120);
+          signal?.throwIfAborted();
+        }
+      },
+    });
+
+    expect(response.status).toBe(200);
+    const frames = await collectSse(response.body!);
+    expect(sends).toBe(2);
+    expect(pacingReservations).toBe(2);
+    expect(attemptSignals).toHaveLength(2);
+    expect(attemptSignals[1]).not.toBe(attemptSignals[0]);
+    expect(abortedAtFetch).toEqual([false, false]);
+    expect(frames.find(frame => frame.event === "response.completed")).toBeDefined();
+  }, 5_000);
+
+  test("pacing queue overload remains typed for outer 429 handling", async () => {
+    const overload = new RequestPacingQueueOverloadError("routed", "queue_full", 2);
+    const adapter: ProviderAdapter = {
+      name: "mock-overload",
+      buildRequest: () => ({ url: "https://routed.test/v1", method: "POST", headers: {}, body: "{}" }),
+      fetchResponse: dispatchAdapterRequest,
+      async *parseStream() { yield { type: "done" }; },
+      async parseResponse() { throw new Error("parseResponse must be unreachable"); },
+    };
+
+    await expect(runWithWebSearch({
+      parsed: parseRequest({ model: "routed/model", input: "hi", stream: true, tools: [{ type: "web_search" }] }),
+      adapter,
+      forwardProvider,
+      hostedTool: { type: "web_search" },
+      selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
+      settings: { model: "gpt-5.4-mini", reasoning: "low", timeoutMs: 30_000 },
+      maxSearches: 1,
+      waitForRequestSlot: async () => { throw overload; },
+    })).rejects.toBe(overload);
+  });
+
   test("retryOn429 budget is shared across iterations (per request, not per round)", async () => {
     globalThis.fetch = ((input) => {
       const url = String(input);
@@ -1148,13 +1339,7 @@ describe("web-search sidecar native web_search_call emission", () => {
     const retryingAdapter: ProviderAdapter = {
       name: "mock-retry429",
       buildRequest: () => ({ url: "https://routed.test/v1", method: "POST", headers: {}, body: "{}" }),
-      fetchResponse: async () => {
-        sends += 1;
-        if (sends === 1 || sends === 3) {
-          return new Response("rate limited", { status: 429, headers: { "retry-after": "30" } });
-        }
-        return new Response("{}", { status: 200 });
-      },
+      fetchResponse: dispatchAdapterRequest,
       async *parseStream() {
         if (sends === 2) {
           // Round 0 success carries a web_search call so the loop advances to a forced-answer round.
@@ -1168,10 +1353,17 @@ describe("web-search sidecar native web_search_call emission", () => {
       },
       async parseResponse() { throw new Error("parseResponse must be unreachable"); },
     };
+    const fetchImpl = async (): Promise<Response> => {
+      sends += 1;
+      return sends === 1 || sends === 3
+        ? new Response("rate limited", { status: 429, headers: { "retry-after": "30" } })
+        : new Response("{}", { status: 200 });
+    };
 
     const response = await runWithWebSearch({
       parsed: parseRequest({ model: "routed/model", input: "hi", stream: true, tools: [{ type: "web_search" }] }),
       adapter: retryingAdapter,
+      fetchImpl,
       forwardProvider,
       hostedTool: { type: "web_search" },
       selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
@@ -1272,7 +1464,7 @@ describe("web-search sidecar native web_search_call emission", () => {
       settings: { model: "gpt-5.4-mini", reasoning: "low", timeoutMs: 30_000 },
       maxSearches: 1,
       connectTimeoutMs: 100,
-      on429: () => rotatedAdapter,
+      on429: () => ({ adapter: rotatedAdapter, recoveryKind: "key-429" }),
     });
     expect(response.status).toBe(504);
     const body = await response.json() as { error?: { message?: string } };

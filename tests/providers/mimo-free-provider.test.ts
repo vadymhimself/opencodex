@@ -258,34 +258,41 @@ describe("mimo-free auth retry predicate", () => {
     return createMimoFreeAdapter(provider);
   }
 
-  test("401 retries exactly once with a fresh JWT after draining the first body", async () => {
+  test("401 retries exactly once with a fresh JWT through the request executor", async () => {
     const fakeJwt = "h." + Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString("base64") + ".s";
     const calls: string[] = [];
+    const recoveries: Array<string | undefined> = [];
+    let nextRecovery: string | undefined;
     const originalFetch = globalThis.fetch;
-    globalThis.fetch = mock(async (url: string | URL | Request, init?: RequestInit) => {
-      const u = String(url);
-      if (u.includes("/bootstrap")) {
-        calls.push("bootstrap");
-        return new Response(JSON.stringify({ jwt: fakeJwt }), { status: 200 });
-      }
+    globalThis.fetch = mock(async (url: string | URL | Request) => {
+      if (!String(url).includes("/bootstrap")) throw new Error("chat bypassed the request executor");
+      calls.push("bootstrap");
+      return new Response(JSON.stringify({ jwt: fakeJwt }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const executor = mock(async (_url: string | URL | Request, init?: RequestInit) => {
+      recoveries.push(nextRecovery);
+      nextRecovery = undefined;
       calls.push(`chat:${(init?.headers as Record<string, string>)?.["Authorization"] ?? "none"}`);
-      if (calls.filter(c => c.startsWith("chat:")).length === 1) {
-        return new Response("expired", { status: 401 });
-      }
-      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      return recoveries.length === 1
+        ? new Response("expired", { status: 401 })
+        : new Response(JSON.stringify({ ok: true }), { status: 200 });
     }) as unknown as typeof fetch;
     try {
       const adapter = adapterForRetry();
       const res = await adapter.fetchResponse!(
         { url: MIMO_CHAT_URL, method: "POST", headers: { "Authorization": "Bearer stale" }, body: "{}" },
-        {} as never,
+        {
+          executor,
+          onRetry: recovery => { nextRecovery = recovery; },
+        },
       );
       expect(res.status).toBe(200);
-      // Sequence: first chat with stale token -> 401 -> bootstrap -> retry with fresh JWT.
-      expect(calls[0]).toBe("chat:Bearer stale");
-      expect(calls[1]).toBe("bootstrap");
-      expect(calls[2]).toBe(`chat:Bearer ${fakeJwt}`);
-      expect(calls.length).toBe(3);
+      expect(calls).toEqual([
+        "chat:Bearer stale",
+        "bootstrap",
+        `chat:Bearer ${fakeJwt}`,
+      ]);
+      expect(recoveries).toEqual([undefined, "oauth-401"]);
     } finally {
       globalThis.fetch = originalFetch;
       resetMimoJwtCache();

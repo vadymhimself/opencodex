@@ -147,7 +147,7 @@ export function buildWsErrorFrame(
 
 function parseSseBlock(block: string): string | null {
   const data: string[] = [];
-  for (const line of block.split(/\r?\n/)) {
+  for (const line of block.split(/\r\n|\r|\n/)) {
     if (line.startsWith("data:")) {
       const value = line.slice(5);
       data.push(value.startsWith(" ") ? value.slice(1) : value);
@@ -255,7 +255,11 @@ export async function pumpResponsesSseToWebSocket(
         if (payload && handlePayload(payload)) break;
       }
     }
-    const tail = framer.finish();
+    const { frames, tail } = framer.finishFrames();
+    for (const frame of frames) {
+      const payload = parseSseBlock(decoder.decode(frame.block));
+      if (payload && handlePayload(payload)) break;
+    }
     if (!terminalSeen && tail.byteLength > 0) {
       const payload = parseSseBlock(decoder.decode(tail));
       if (payload) handlePayload(payload);

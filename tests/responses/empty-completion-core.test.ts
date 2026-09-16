@@ -60,9 +60,16 @@ function fixtureAdapter(provider: OcxProviderConfig): ProviderAdapter & { passth
         } : {}),
       };
     },
-    async fetchResponse() {
+    async fetchResponse(request, context) {
       const index = httpCalls;
       httpCalls += 1;
+      if (!context?.executor) throw new Error("missing provider executor");
+      await context.executor(request.url, {
+        method: request.method,
+        headers: request.headers,
+        body: request.body,
+        signal: context.abortSignal,
+      });
       return new Response("", { headers: { "x-fixture-attempt": String(index) } });
     },
     async *parseStream(response) {
@@ -74,9 +81,11 @@ function fixtureAdapter(provider: OcxProviderConfig): ProviderAdapter & { passth
       return attemptAt(index);
     },
     ...(runTurn ? {
-      async runTurn(parsed: OcxParsedRequest, _incoming: unknown, emit: (event: AdapterEvent) => void) {
+      async runTurn(parsed: OcxParsedRequest, incoming, emit: (event: AdapterEvent) => void) {
+        if (!incoming.providerFetch) throw new Error("missing provider fetch");
+        await incoming.providerFetch(provider.baseUrl, { method: "POST" });
         if (customRunTurn) {
-          await customRunTurn(parsed, _incoming as never, emit);
+          await customRunTurn(parsed, incoming, emit);
           return;
         }
         const index = runTurnCalls;
@@ -119,6 +128,7 @@ function config(
         apiKey: "fixture-key",
         authMode: "key",
         models: ["model"],
+        fetch: async () => new Response(),
       },
     },
     ...extra,

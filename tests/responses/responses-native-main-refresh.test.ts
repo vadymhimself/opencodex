@@ -184,15 +184,20 @@ describe("native main 401 refresh and replay", () => {
 
   test("Responses refreshes and performs exactly one physical replay", async () => {
     const harness = install401ThenRefreshHarness();
+    const logCtx = { model: "", provider: "" } as RequestLogContext;
     const response = await handleResponses(
       request("/v1/responses"),
       config(),
-      { model: "", provider: "" } as RequestLogContext,
+      logCtx,
     );
 
     expect(response.status).toBe(200);
     expect(harness.sends).toEqual(["Bearer rejected-access", "Bearer refreshed-access"]);
     expect(harness.refreshes).toEqual(["refresh-grant"]);
+    expect(logCtx.attempts).toMatchObject([
+      { status: 401, sendCount: 1 },
+      { sendCount: 1, recoveryKinds: ["oauth-401"] },
+    ]);
     expect(JSON.parse(readFileSync(join(home, "auth.json"), "utf8")).tokens.refresh_token)
       .toBe("rotated-refresh");
   });

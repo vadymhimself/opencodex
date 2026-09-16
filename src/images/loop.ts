@@ -19,15 +19,13 @@ import { namespacedToolName, toolChoiceToolPredicate } from "../types";
 import { cloneProviderOpaqueToolCallMetadata } from "../responses/provider-opaque-metadata";
 import type { AttemptRecoveryKind } from "../usage/log";
 import { bridgeToResponsesSSE } from "../bridge";
+import { mergeUsage } from "../server/responses/empty-completion-guard";
 import { clearableDeadline, idleDeadline } from "../lib/abort";
 import { readBoundedResponseBody } from "../lib/bounded-body";
 import { applyUpstreamRecoveryInit, fetchWithResetRetry, prepareSameTarget429Wait } from "../lib/upstream-retry";
 import { rateLimitRetryDelayMs } from "../providers/key-failover";
-import {
-  isTranslatorBudgetExceededError,
-  TRANSLATOR_MAX_TURN_BYTES,
-  TranslatorBudgetExceededError,
-} from "../lib/translator-budget";
+import { RequestPacingQueueOverloadError } from "../providers/request-pacing";
+import { isTranslatorBudgetExceededError } from "../lib/translator-budget";
 import { parseStreamWithProgress, RoutedModelInactivityError, WebSearchStreamProtocolError } from "../web-search/progress-stream";
 import { fulfillImageCall } from "./fulfill";
 import { parseVideoCallArgs, pollVideoWithHeartbeats, buildVideoResult, createVideoBudget } from "./fulfill-video";
@@ -255,14 +253,23 @@ export interface ImageBridgeDeps {
   fetchImpl?: typeof globalThis.fetch;
   /** Reserve the routed provider's next request-start slot before each adapter dispatch. */
   waitForRequestSlot?: (signal?: AbortSignal) => Promise<void>;
-  /** Raw adapter usage at the terminal event, pre wire-normalization (see bridgeToResponsesSSE onUsage). */
+  /** Raw adapter usage for each completed routed-model iteration, before a later iteration can rotate credentials. */
+  onIterationUsage?: (usage: OcxUsage | undefined) => void;
+  /** Aggregate raw adapter usage at the final terminal event, pre wire-normalization (see bridgeToResponsesSSE onUsage). */
   onUsage?: (usage: OcxUsage | undefined) => void;
   /**
-   * Optional 429 failover for the routed (non-xAI) model. Return a rebuilt adapter for the
-   * rotated credential, or null when the pool is exhausted. Async hooks support OAuth refresh;
-   * existing synchronous key-pool hooks remain valid.
+   * Optional 429 failover for the routed (non-xAI) model. Return the rebuilt adapter plus its
+   * physical-attempt recovery kind, or null when the credential pool is exhausted.
    */
-  on429?: (retryAfterHeader: string | null) => ProviderAdapter | null | Promise<ProviderAdapter | null>;
+  on429?: (retryAfterHeader: string | null) =>
+    | { adapter: ProviderAdapter; recoveryKind: AttemptRecoveryKind }
+    | null
+    | Promise<{ adapter: ProviderAdapter; recoveryKind: AttemptRecoveryKind } | null>;
+  /** Optional fail-closed credential recovery. The callback must inspect a clone and return null for unrecognized responses. */
+  onCredentialError?: (response: Response, signal: AbortSignal) =>
+    | { adapter: ProviderAdapter; recoveryKind: AttemptRecoveryKind }
+    | null
+    | Promise<{ adapter: ProviderAdapter; recoveryKind: AttemptRecoveryKind } | null>;
   /** Opt-in same-target 429 policy (key-auth providers). When present, 429 replays on the SAME key before on429 rotation. */
   retryOn429Policy?: Required<RateLimitRetryPolicy> | null;
   /** Called when the bridged Responses stream completes (parity with runTurn / routed paths). */
@@ -294,34 +301,10 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
   let paidVideoCalls = 0;
   let hiddenUsage: OcxUsage | undefined;
 
-  const addUsage = (a: OcxUsage | undefined, b: OcxUsage | undefined): OcxUsage | undefined => {
-    if (!a) return b;
-    if (!b) return a;
-    return {
-      inputTokens: a.inputTokens + b.inputTokens,
-      outputTokens: a.outputTokens + b.outputTokens,
-      ...(a.contextTotalTokens !== undefined || b.contextTotalTokens !== undefined
-        ? { contextTotalTokens: Math.max(a.contextTotalTokens ?? 0, b.contextTotalTokens ?? 0) }
-        : {}),
-      ...(a.cachedInputTokens !== undefined || b.cachedInputTokens !== undefined
-        ? { cachedInputTokens: (a.cachedInputTokens ?? 0) + (b.cachedInputTokens ?? 0) }
-        : {}),
-      ...(a.cacheReadInputTokens !== undefined || b.cacheReadInputTokens !== undefined
-        ? { cacheReadInputTokens: (a.cacheReadInputTokens ?? 0) + (b.cacheReadInputTokens ?? 0) }
-        : {}),
-      ...(a.cacheCreationInputTokens !== undefined || b.cacheCreationInputTokens !== undefined
-        ? { cacheCreationInputTokens: (a.cacheCreationInputTokens ?? 0) + (b.cacheCreationInputTokens ?? 0) }
-        : {}),
-      ...(a.reasoningOutputTokens !== undefined || b.reasoningOutputTokens !== undefined
-        ? { reasoningOutputTokens: (a.reasoningOutputTokens ?? 0) + (b.reasoningOutputTokens ?? 0) }
-        : {}),
-      ...(a.estimated || b.estimated ? { estimated: true } : {}),
-    };
-  };
   const takeUsageFrom = (events: AdapterEvent[]): void => {
     for (const e of events) {
-      if ((e.type === "done" || e.type === "incomplete") && e.usage) {
-        hiddenUsage = addUsage(hiddenUsage, e.usage);
+      if ((e.type === "done" || e.type === "incomplete" || e.type === "error") && e.usage) {
+        hiddenUsage = mergeUsage(hiddenUsage, e.usage);
       }
     }
   };
@@ -389,12 +372,20 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
     // expose buildRequest/fetchResponse/parseStream to the bridge, so collect their events through
     // an AdapterEventQueue and wrap them in a pseudo-response whose parseStream replays them.
     if (adapter.runTurn) {
-      await deps.waitForRequestSlot?.(signal);
       const queue = createAdapterEventQueue({
         onBacklogExceeded: () => internalAbort.abort("runTurn backlog exceeded"),
       });
-      // Attempt telemetry must fire at dispatch time (parity with fetchOnce), not after collect.
-      deps.onAttemptSend?.();
+      const runTurnProviderFetch = Object.assign(
+        async (
+          input: Parameters<typeof globalThis.fetch>[0],
+          init?: RequestInit,
+        ): Promise<Response> => {
+          await deps.waitForRequestSlot?.(signal);
+          deps.onAttemptSend?.();
+          return fetchImpl(input, init);
+        },
+        { preconnect: fetchImpl.preconnect },
+      );
       void adapter
         .runTurn(
           iterParsed,
@@ -402,6 +393,7 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
             headers: deps.forwardHeaders ? new Headers(deps.forwardHeaders) : new Headers(),
             abortSignal: signal,
             translatorBudget,
+            providerFetch: runTurnProviderFetch,
           },
           queue.push,
         )
@@ -448,15 +440,6 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
         parsed._cursorConversationId = iterParsed._cursorConversationId;
       }
 
-      // runTurn adapters signal errors via {type:"error"} events, not HTTP status codes.
-      const errorEvent = events.find(e => e.type === "error");
-      if (errorEvent && errorEvent.type === "error") {
-        if (errorEvent.code === "translation_buffer_limit") {
-          throw new TranslatorBudgetExceededError("retained_collectors", TRANSLATOR_MAX_TURN_BYTES);
-        }
-        throw new LoopError(502, errorEvent.message);
-      }
-
       const wrappedAdapter: ProviderAdapter = {
         ...adapter,
         async *parseStream() {
@@ -471,6 +454,15 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
       headerDeadline.clear();
       await deps.waitForRequestSlot?.(signal);
       headerDeadline = clearableDeadline(connectTimeoutMs, signal);
+    };
+    let firstPacingSlot = true;
+    const reserveDispatchSlot = async (): Promise<void> => {
+      if (firstPacingSlot) {
+        firstPacingSlot = false;
+        await paceThenResetHeaderDeadline();
+      } else {
+        await deps.waitForRequestSlot?.(headerDeadline.signal);
+      }
     };
     try {
       /**
@@ -502,19 +494,36 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
         let response: Response;
         try {
           if (requestAdapter.fetchResponse) {
-            await paceThenResetHeaderDeadline();
-            deps.onAttemptSend?.(recovery);
+            await reserveDispatchSlot();
+            let firstDispatch = true;
+            let nextRecovery = recovery;
+            const executor = async (
+              input: Parameters<typeof globalThis.fetch>[0],
+              init?: RequestInit,
+            ): Promise<Response> => {
+              let dispatchInit = init;
+              if (firstDispatch) firstDispatch = false;
+              else {
+                await paceThenResetHeaderDeadline();
+                dispatchInit = { ...init, signal: headerDeadline.signal };
+              }
+              const dispatchRecovery = nextRecovery;
+              nextRecovery = undefined;
+              deps.onAttemptSend?.(dispatchRecovery);
+              return fetchImpl(input, dispatchInit);
+            };
             response = await requestAdapter.fetchResponse(request, {
               abortSignal: headerDeadline.signal,
               timeoutMs: connectTimeoutMs,
               returnRawErrors: true,
               stream: true,
-              executor: fetchImpl,
+              executor: Object.assign(executor, { preconnect: fetchImpl.preconnect }),
+              onRetry: retryRecovery => { nextRecovery = retryRecovery; },
             });
           } else {
             response = await fetchWithResetRetry(
               async (retryRecovery) => {
-                await paceThenResetHeaderDeadline();
+                await reserveDispatchSlot();
                 // Record every helper-driven send (the callback runs for the first attempt and
                 // each connection-reset replay); preserve the caller's recovery kind
                 // (rate-limit-429 / key-429) when the retry layer supplies none.
@@ -541,6 +550,14 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
       };
 
       let prepared = await fetchOnce(adapter);
+      while (prepared.response.status === 403 && deps.onCredentialError) {
+        const rotated = await deps.onCredentialError(prepared.response, signal);
+        if (!rotated) break;
+        try { void prepared.response.body?.cancel().catch(() => {}); } catch { /* already closed */ }
+        adapter = rotated.adapter;
+        yield { type: "heartbeat" };
+        prepared = await fetchOnce(adapter, rotated.recoveryKind);
+      }
       // Same-target 429 wait-and-retry (opt-in `retryOn429`) BEFORE key rotation: a primary-key
       // rate-limit blip replays on the SAME key; rotation only runs after attempts exhaust.
       while (
@@ -579,9 +596,9 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
         const rotated = await deps.on429(prepared.response.headers.get("retry-after"));
         if (!rotated) break;
         try { void prepared.response.body?.cancel().catch(() => {}); } catch { /* already closed */ }
-        adapter = rotated;
+        adapter = rotated.adapter;
         yield { type: "heartbeat" };
-        prepared = await fetchOnce(adapter, "key-429");
+        prepared = await fetchOnce(adapter, rotated.recoveryKind);
       }
 
       // Final headers have arrived. Clear only the deadline timer before ANY body read.
@@ -614,6 +631,7 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
         throw new LoopError(504, `Provider response-header timeout after ${connectTimeoutMs}ms during image-bridge`);
       }
       if (signal.aborted) throw new LoopError(499, "client closed request during image-bridge");
+      if (error instanceof RequestPacingQueueOverloadError) throw error;
       if (error instanceof LoopError) throw error;
       throw new LoopError(502, `Provider unreachable: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
@@ -654,13 +672,6 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
       event.type === "done" || event.type === "incomplete" || event.type === "error" ? [index] : []);
     if (terminalIndexes.length !== 1 || terminalIndexes[0] !== events.length - 1) {
       throw new LoopError(502, `Image-bridge adapter stream protocol error: expected one final terminal event, received ${terminalIndexes.length}`);
-    }
-    const terminal = events[terminalIndexes[0]!];
-    if (terminal.type === "error") {
-      if (terminal.code === "translation_buffer_limit") {
-        throw new TranslatorBudgetExceededError("retained_collectors", TRANSLATOR_MAX_TURN_BYTES);
-      }
-      throw new LoopError(502, terminal.message);
     }
     return scanEventsForImageCall(events, mediaToolNames);
   };
@@ -714,7 +725,24 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
           }
           // Raw-byte progress heartbeats reach the bridge; semantic events remain buffered.
           const split = yield* consumeIterationEvents(prepared);
+          const terminal = split.passthrough.at(-1);
+          if ((terminal?.type === "done" || terminal?.type === "incomplete" || terminal?.type === "error") && terminal.usage) {
+            deps.onIterationUsage?.(terminal.usage);
+          }
           prepared = undefined;
+
+          // An adapter error is already a final terminal. Never fulfill an earlier buffered media
+          // call after that failure; only merge prior hidden iterations into request-level usage.
+          if (terminal?.type === "error") {
+            if (hiddenUsage) {
+              split.passthrough[split.passthrough.length - 1] = {
+                ...terminal,
+                usage: mergeUsage(hiddenUsage, terminal.usage),
+              };
+            }
+            yield* replay(split.passthrough);
+            return;
+          }
 
           // Loop (fulfill + re-ask) ONLY when the model's actionable output is purely image_gen. A
           // real tool call means this turn is terminal for Codex — finalize so those calls reach
@@ -725,7 +753,7 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
               for (let i = split.passthrough.length - 1; i >= 0; i--) {
                 const e = split.passthrough[i];
                 if (e?.type === "done" || e?.type === "incomplete") {
-                  split.passthrough[i] = { ...e, usage: addUsage(hiddenUsage, e.usage) };
+                  split.passthrough[i] = { ...e, usage: mergeUsage(hiddenUsage, e.usage) };
                   break;
                 }
               }

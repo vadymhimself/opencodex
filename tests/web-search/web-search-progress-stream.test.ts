@@ -252,21 +252,23 @@ describe("web-search streamed-body progress collector", () => {
     expect(error).toBeInstanceOf(WebSearchStreamProtocolError);
   });
 
-  test("an adapter error event rejects immediately and is never yielded", async () => {
+  test("an adapter error remains a validated terminal event", async () => {
     let finalized = false;
+    const terminal: AdapterEvent = {
+      type: "error",
+      message: "provider exploded",
+      usage: { inputTokens: 7, outputTokens: 1 },
+    };
     const parser: ParseStream = async function* () {
       try {
-        yield { type: "error", message: "provider exploded" };
-        await sleep(100);
-        yield { type: "done" };
+        yield terminal;
       } finally {
         finalized = true;
       }
     };
-    await expect(collect(parseStreamWithProgress(new Response(chunkStream([])), parser, {
+    expect(await collect(parseStreamWithProgress(new Response(chunkStream([])), parser, {
       inactivityTimeoutMs: 200,
-    }))).rejects.toThrow("provider exploded");
-    await waitFor(() => finalized);
+    }))).toEqual([terminal]);
     expect(finalized).toBe(true);
   });
 

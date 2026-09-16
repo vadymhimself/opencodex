@@ -224,12 +224,43 @@ describe("createSseInspector frame bounds", () => {
     expect(getInspectionCounters().frameCapOverflows).toBe(0);
   });
 
-  for (const delimiter of ["\n\n", "\r\n\r\n", "\r\n\n", "\n\r\n"] as const) {
+  test("one strict feed retains at most 4,096 validated frames", () => {
+    const errors: string[] = [];
+    let validated = 0;
+    const inspector = createSseInspector({
+      strictJsonRecords: true,
+      onValidatedFrame: () => { validated += 1; },
+      onProtocolError: message => errors.push(message),
+    });
+
+    inspector.feed(encoder.encode('data: {"type":"ping"}\n\n'.repeat(4_097)));
+
+    expect(validated).toBe(4_096);
+    expect(errors).toEqual(["upstream SSE chunk exceeded 4,096 complete frames"]);
+  });
+
+  test("one observational feed stops after 4,096 frames without a protocol error", () => {
+    const errors: string[] = [];
+    let parsed = 0;
+    const inspector = createSseInspector({
+      onParsedPayload: () => { parsed += 1; },
+      onProtocolError: message => errors.push(message),
+    });
+
+    inspector.feed(encoder.encode('data: {"type":"ping"}\n\n'.repeat(4_097)));
+    inspector.feed(frame(completedEvent("must-not-be-inspected")));
+
+    expect(parsed).toBe(4_096);
+    expect(errors).toEqual([]);
+  });
+
+  for (const delimiter of ["\n\n", "\r\r", "\r\n\r\n", "\r\n\n", "\n\r\n"] as const) {
     test(`delimiter ${JSON.stringify(delimiter)} retains regex parity when split across chunks`, () => {
       const terminals: string[] = [];
       const inspector = createSseInspector({ onTerminal: status => terminals.push(status) });
       inspector.feed(encoder.encode(candidate(completedEvent(`delimiter-${delimiter.length}`))));
       for (const byte of encoder.encode(delimiter)) inspector.feed(Uint8Array.of(byte));
+      inspector.feed(encoder.encode(":"));
       expect(terminals).toEqual(["completed"]);
       expect(getInspectionCounters().frameCapOverflows).toBe(0);
     });

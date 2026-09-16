@@ -96,6 +96,30 @@ describe("combo failure cooldown scope", () => {
     expect(comboFailureCooldownScope(429, "monthly usage limit reached")).toBe("provider");
   });
 
+  test("Codex account exhaustion cools the provider whatever status it arrives under", () => {
+    // Measured on the live ChatGPT Codex backend: a depleted plan window returns HTTP 502
+    // `upstream_server_error` carrying this exact prose, never the documented 429. Matching on
+    // 429 plus the literal "monthly usage limit reached" missed it, so the empty account stayed
+    // selectable and every later turn re-sent to it for the life of the window.
+    for (const status of [502, 500, 429, 402]) {
+      expect(comboFailureCooldownScope(status, "The usage limit has been reached")).toBe("provider");
+    }
+    expect(comboFailureCooldownScope(502, "upstream failed", {
+      code: "usage_limit_reached",
+    })).toBe("provider");
+    expect(comboFailureCooldownScope(429, "upstream failed", {
+      code: "usage_limit_exceeded",
+    })).toBe("provider");
+  });
+
+  test("INVARIANT: a free-tier per-request cap still outranks exhaustion prose", () => {
+    // The free-tier carve-out is evaluated first on purpose. Widening the exhaustion match must
+    // not let one oversized free-tier prompt cool a provider that would serve shorter requests.
+    expect(comboFailureCooldownScope(400, "free tier single request usage limit reached", {
+      code: "free_rate_limited",
+    })).toBe("none");
+  });
+
   test("an ordinary target failure still cools only that target", () => {
     expect(comboFailureCooldownScope(500, "internal server error")).toBe("target");
     expect(comboFailureCooldownScope(429, "rate limit reached for requests")).toBe("target");
@@ -191,5 +215,46 @@ describe("malformed upstream bytes are a provider failure", () => {
       httpStatus: 502,
       error: { type: "server_error", code: "upstream_server_error" },
     });
+  });
+});
+
+describe("exhausted account windows stay cooled", () => {
+  test("prose-only exhaustion holds the target for ten minutes, not one", () => {
+    // The generic 60s default re-offered a provably empty account roughly every minute. 72h of
+    // production ledger showed 942 such doomed sends on one depleted Codex window.
+    const now = 100_000;
+    coolComboTarget("free", first, {
+      now,
+      status: 502,
+      code: "upstream_server_error",
+      message: "The usage limit has been reached",
+    });
+    expect(isComboTargetInCooldown("free", first, now + 9 * 60_000)).toBe(true);
+    expect(isComboTargetInCooldown("free", first, now + 10 * 60_000 + 1)).toBe(false);
+  });
+
+  test("INVARIANT: a far-future reset is still clamped to the ceiling (#433)", () => {
+    // Quota commonly frees before the advertised reset, so exhaustion must not pin a provider
+    // for hours. The widened match changes WHICH failures are recognized, never the ceiling.
+    const now = 100_000;
+    coolComboTarget("free", first, {
+      now,
+      status: 502,
+      code: "upstream_server_error",
+      message: "The usage limit has been reached",
+      retryAfter: String(2 * 60 * 60),
+    });
+    expect(isComboTargetInCooldown("free", first, now + 10 * 60_000 + 1)).toBe(false);
+  });
+
+  test("INVARIANT: an explicit combo cooldown still wins over the exhaustion default", () => {
+    const now = 100_000;
+    coolComboTarget("free", first, {
+      now,
+      cooldownMs: 30_000,
+      status: 502,
+      message: "The usage limit has been reached",
+    });
+    expect(isComboTargetInCooldown("free", first, now + 30_000 + 1)).toBe(false);
   });
 });

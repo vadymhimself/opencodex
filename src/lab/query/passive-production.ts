@@ -1,5 +1,6 @@
 import {
   isLabRouteSubjectId,
+  physicalUsageAttempts,
   readRecentUsageEntries,
   type PersistedUsageAttempt,
   type PersistedUsageEntry,
@@ -67,8 +68,7 @@ function boundedLimit(value: number | undefined): number {
 }
 
 function isFinalAttempt(entry: PersistedUsageEntry, attempt: PersistedUsageAttempt): boolean {
-  const attempts = entry.attempts ?? [];
-  return attempts.length > 0 && attempts[attempts.length - 1]?.ordinal === attempt.ordinal;
+  return physicalUsageAttempts(entry.attempts ?? []).at(-1) === attempt;
 }
 
 function classifyOutcome(entry: PersistedUsageEntry, attempt: PersistedUsageAttempt): PassiveProductionOutcome {
@@ -111,7 +111,7 @@ export function derivePassiveProductionSignals(
 
   scan: for (let rowIndex = scanRows.length - 1; rowIndex >= 0; rowIndex--) {
     const entry = scanRows[rowIndex]!;
-    const attempts = entry.attempts ?? [];
+    const attempts = physicalUsageAttempts(entry.attempts ?? []);
     for (let attemptIndex = attempts.length - 1; attemptIndex >= 0; attemptIndex--) {
       const signal = signalFor(entry, attempts[attemptIndex]!);
       if (signal?.subjectId !== subjectId) continue;

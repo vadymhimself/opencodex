@@ -129,6 +129,7 @@ export function isContentEvent(event: AdapterEvent): boolean {
     case "tool_call_end":
     case "web_search_call_begin":
     case "web_search_call_end":
+    case "anthropic_server_block":
       return true;
     default:
       return false;
@@ -176,6 +177,14 @@ export function mergeUsage(
   const contextTotalTokens = second.contextTotalTokens ?? first.contextTotalTokens;
   const inputTokens = first.inputTokens + second.inputTokens;
   const outputTokens = first.outputTokens + second.outputTokens;
+  const anthropicServerToolUse: Record<string, number> = {};
+  for (const usage of [first, second]) {
+    for (const [name, value] of Object.entries(usage.anthropicServerToolUse ?? {})) {
+      if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+        anthropicServerToolUse[name] = (anthropicServerToolUse[name] ?? 0) + value;
+      }
+    }
+  }
   // The attempt that produced the content owns the raw wire usage (openai/codex#41980);
   // an empty first attempt may still be the only one that saw it.
   const rawUsage = second.rawUsage ?? first.rawUsage;
@@ -188,6 +197,7 @@ export function mergeUsage(
     ...(cacheReadInputTokens !== undefined ? { cacheReadInputTokens } : {}),
     ...(cacheCreationInputTokens !== undefined ? { cacheCreationInputTokens } : {}),
     ...(reasoningOutputTokens !== undefined ? { reasoningOutputTokens } : {}),
+    ...(Object.keys(anthropicServerToolUse).length > 0 ? { anthropicServerToolUse } : {}),
     ...(first.estimated || second.estimated ? { estimated: true } : {}),
     ...(rawUsage !== undefined ? { rawUsage } : {}),
   };
@@ -239,6 +249,16 @@ export async function* guardEmptyCompletionEventStream(
     heldBytes = 0;
     return released;
   };
+  const queueAttemptBoundary = (): boolean => {
+    if (held.length === 0 || held.at(-1)?.type === "assistant_boundary") return true;
+    const boundary: AdapterEvent = { type: "assistant_boundary" };
+    const boundaryBytes = retainedEventBytes(boundary);
+    if (held.length + 1 > EMPTY_COMPLETION_MAX_BUFFERED_EVENTS
+      || heldBytes + boundaryBytes > EMPTY_COMPLETION_MAX_BUFFERED_BYTES) return false;
+    held.push(boundary);
+    heldBytes += boundaryBytes;
+    return true;
+  };
 
   while (true) {
     let terminalSeen = false;
@@ -281,6 +301,11 @@ export async function* guardEmptyCompletionEventStream(
           } catch {
             yield emptyCompletionRetryFailedEvent(usage, true);
             return;
+          }
+          if (!queueAttemptBoundary()) {
+            yield* releaseHeld();
+            yield { type: "assistant_boundary" };
+            passthrough = true;
           }
           terminalSeen = true;
           break;
@@ -337,6 +362,11 @@ export async function* guardEmptyCompletionEventStream(
         } catch {
           yield emptyCompletionRetryFailedEvent(usage, true);
           return;
+        }
+        if (!queueAttemptBoundary()) {
+          yield* releaseHeld();
+          yield { type: "assistant_boundary" };
+          passthrough = true;
         }
         continue;
       }

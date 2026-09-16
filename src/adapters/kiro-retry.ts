@@ -171,7 +171,7 @@ async function fetchWithResetRecovery(
         headers,
         body: request.body,
         ...(recovered ? { keepalive: false } : {}),
-      }, timeoutMs, ctx.abortSignal, ctx.stream);
+      }, timeoutMs, ctx.abortSignal, ctx.stream, ctx.executor);
     } catch (error) {
       if (ctx.abortSignal?.aborted || !isConnectionResetError(error) || attempt === RESET_ATTEMPTS - 1) throw error;
       lastError = error;
@@ -179,6 +179,7 @@ async function fetchWithResetRecovery(
         baseDelayMs: RESET_RETRY_BASE_MS,
         maxDelayMs: RESET_RETRY_MAX_MS,
       }), ctx.abortSignal);
+      ctx.onRetry?.("connection-reset");
     }
   }
   throw lastError ?? new Error("Kiro fetch failed");
@@ -251,6 +252,7 @@ async function fetchKiroAttempt(
     response = await fetchWithResetRecovery(request, request.url, ctx, timeoutMs);
   } catch (error) {
     if (!legacy || !endpointConnectFailure(error)) throw error;
+    ctx.onRetry?.("adapter-retry");
     return fetchWithResetRecovery(request, legacy, ctx, timeoutMs);
   }
 
@@ -259,6 +261,7 @@ async function fetchKiroAttempt(
     response = inspected.response;
     if (inspected.fallback) {
       cancelResponseBodyBestEffort(response);
+      ctx.onRetry?.("adapter-retry");
       response = await fetchWithResetRecovery(request, legacy, ctx, timeoutMs);
     }
   }
@@ -293,6 +296,7 @@ export async function fetchKiroWithRetry(request: AdapterRequest, ctx: AdapterFe
         cancelResponseBodyBestEffort(throttle.response);
         await waitWithAbort(claim.wait!, ctx.abortSignal);
         probeToken = undefined;
+        ctx.onRetry?.("rate-limit-429");
         continue;
       }
       probeToken = claim.token;
@@ -303,6 +307,7 @@ export async function fetchKiroWithRetry(request: AdapterRequest, ctx: AdapterFe
           : normalizeFinalKiroHttpError(throttle.response, ctx.abortSignal);
       }
       cancelResponseBodyBestEffort(throttle.response);
+      ctx.onRetry?.("rate-limit-429");
     }
     throw new Error("Kiro throttle retry loop exhausted without a response");
   } catch (error) {

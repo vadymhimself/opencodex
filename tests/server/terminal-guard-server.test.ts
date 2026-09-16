@@ -1,9 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { clearPoolRotationState } from "../../src/codex/pool-rotation";
+import { clearAnthropicAccountPoolState } from "../../src/oauth/anthropic-routing";
 import { saveConfig } from "../../src/config";
 import { clearKeyCooldowns } from "../../src/providers/key-failover";
+import type { RequestLogContext } from "../../src/server/request-log";
 import { handleResponses } from "../../src/server/responses";
 import type { OcxConfig } from "../../src/types";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
@@ -121,6 +124,219 @@ describe("server terminal guard integration", () => {
     const messages = requestBodies[1]?.messages as Array<{ role?: string; content?: Array<{ text?: string }> }>;
     expect(messages.at(-1)?.role).toBe("user");
     expect(messages.at(-1)?.content?.[0]?.text).toContain("你刚才只描述了计划");
+  });
+
+  test("terminal-guard Anthropic account rotation opens a new physical attempt", async () => {
+    const home = mkdtempSync(join(tmpdir(), "ocx-terminal-anthropic-pool-"));
+    const previousHome = process.env.OPENCODEX_HOME;
+    process.env.OPENCODEX_HOME = home;
+    clearAnthropicAccountPoolState();
+    clearPoolRotationState();
+    try {
+      writeFileSync(join(home, "auth.json"), JSON.stringify({
+        anthropic: {
+          activeAccountId: "account-a",
+          accounts: [
+            {
+              id: "account-a",
+              credential: {
+                access: "synthetic-access-a",
+                refresh: "synthetic-refresh-a",
+                expires: 9999999999999,
+                accountId: "synthetic-account-a",
+              },
+            },
+            {
+              id: "account-b",
+              credential: {
+                access: "synthetic-access-b",
+                refresh: "synthetic-refresh-b",
+                expires: 9999999999999,
+                accountId: "synthetic-account-b",
+              },
+            },
+          ],
+        },
+      }), { mode: 0o600 });
+      const poolConfig = {
+        port: 0,
+        defaultProvider: "anthropic",
+        providers: {
+          anthropic: {
+            adapter: "anthropic",
+            baseUrl: "https://example.test",
+            authMode: "oauth",
+          },
+        },
+        anthropicAccountPool: { enabled: true, autoSwitchThreshold: 100 },
+      } as unknown as OcxConfig;
+      const authorizations: string[] = [];
+      globalThis.fetch = (async (_input, init) => {
+        authorizations.push(new Headers(init?.headers).get("authorization") ?? "");
+        if (authorizations.length === 1) return anthropicSse(firstTurn);
+        if (authorizations.length === 2) {
+          return Response.json(
+            { type: "error", error: { type: "rate_limit_error", message: "rate limited" } },
+            { status: 429, headers: { "retry-after": "30" } },
+          );
+        }
+        return anthropicSse(continuationTurn);
+      }) as typeof fetch;
+      const logCtx: RequestLogContext = { model: "", provider: "" };
+
+      const response = await handleResponses(new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "anthropic/claude-opus-4.8",
+          input: "请检查这个问题并修复代码",
+          stream: true,
+          tools: [{ type: "function", name: "exec_command", description: "run a command", parameters: { type: "object" } }],
+        }),
+      }), poolConfig, logCtx);
+
+      expect(await response.text()).toContain("response.completed");
+      expect(authorizations).toEqual([
+        "Bearer synthetic-access-a",
+        "Bearer synthetic-access-a",
+        "Bearer synthetic-access-b",
+      ]);
+      expect(logCtx.attempts).toHaveLength(2);
+      expect(logCtx.attempts?.[0]).toMatchObject({ status: 429, sendCount: 2 });
+      expect(logCtx.attempts?.[1]).toMatchObject({
+        sendCount: 1,
+        recoveryKinds: ["anthropic-oauth-429"],
+      });
+      expect(logCtx.attempts?.[1]?.provider).not.toBe(logCtx.attempts?.[0]?.provider);
+    } finally {
+      clearAnthropicAccountPoolState();
+      clearPoolRotationState();
+      if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
+      else process.env.OPENCODEX_HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("Anthropic rotates on initial and terminal-guard continuation 403 denials", async () => {
+    const home = mkdtempSync(join(tmpdir(), "ocx-terminal-anthropic-denial-"));
+    const previousHome = process.env.OPENCODEX_HOME;
+    process.env.OPENCODEX_HOME = home;
+    clearAnthropicAccountPoolState();
+    clearPoolRotationState();
+    try {
+      writeFileSync(join(home, "auth.json"), JSON.stringify({
+        anthropic: {
+          activeAccountId: "account-a",
+          accounts: [
+            {
+              id: "account-a",
+              credential: {
+                access: "synthetic-access-a",
+                refresh: "synthetic-refresh-a",
+                expires: 9999999999999,
+                accountId: "synthetic-account-a",
+              },
+            },
+            {
+              id: "account-b",
+              credential: {
+                access: "synthetic-access-b",
+                refresh: "synthetic-refresh-b",
+                expires: 9999999999999,
+                accountId: "synthetic-account-b",
+              },
+            },
+            {
+              id: "account-c",
+              credential: {
+                access: "synthetic-access-c",
+                refresh: "synthetic-refresh-c",
+                expires: 9999999999999,
+                accountId: "synthetic-account-c",
+              },
+            },
+          ],
+        },
+      }), { mode: 0o600 });
+      const poolConfig = {
+        port: 0,
+        defaultProvider: "anthropic",
+        providers: {
+          anthropic: {
+            adapter: "anthropic",
+            baseUrl: "https://example.test",
+            authMode: "oauth",
+          },
+        },
+        anthropicAccountPool: { enabled: true, autoSwitchThreshold: 100 },
+      } as unknown as OcxConfig;
+      const sends: Array<{ authorization: string; body: string }> = [];
+      globalThis.fetch = (async (_input, init) => {
+        sends.push({
+          authorization: new Headers(init?.headers).get("authorization") ?? "",
+          body: String(init?.body ?? ""),
+        });
+        if (sends.length === 2) return anthropicSse(firstTurn);
+        if (sends.length === 1 || sends.length === 3) {
+          return Response.json({
+            type: "error",
+            error: {
+              type: "oauth_org_not_allowed",
+              message: "Your organization has disabled Claude subscription access for Claude Code. Use an Anthropic API key instead, or ask your admin to enable access.",
+            },
+          }, { status: 403 });
+        }
+        return anthropicSse(continuationTurn);
+      }) as typeof fetch;
+      const logCtx: RequestLogContext = { model: "", provider: "" };
+
+      const response = await handleResponses(new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "anthropic/claude-opus-4.8",
+          input: "请检查这个问题并修复代码",
+          stream: true,
+          tools: [{ type: "function", name: "exec_command", description: "run a command", parameters: { type: "object" } }],
+        }),
+      }), poolConfig, logCtx);
+
+      const text = await response.text();
+      expect(response.status).toBe(200);
+      expect(text).toContain("response.completed");
+      expect(text).toContain("exec_command");
+      expect(sends.map(send => send.authorization)).toEqual([
+        "Bearer synthetic-access-a",
+        "Bearer synthetic-access-b",
+        "Bearer synthetic-access-b",
+        "Bearer synthetic-access-c",
+      ]);
+      expect(sends[1]!.body).toBe(sends[0]!.body);
+      expect(sends[3]!.body).toBe(sends[2]!.body);
+      expect(logCtx.attempts).toHaveLength(3);
+      expect(logCtx.attempts?.[0]).toMatchObject({ status: 403, sendCount: 1 });
+      expect(logCtx.attempts?.[1]).toMatchObject({
+        status: 403,
+        sendCount: 2,
+        recoveryKinds: ["anthropic-oauth-403"],
+      });
+      expect(logCtx.attempts?.[2]).toMatchObject({
+        sendCount: 1,
+        recoveryKinds: ["anthropic-oauth-403"],
+      });
+      const auth = JSON.parse(readFileSync(join(home, "auth.json"), "utf8")) as {
+        anthropic: { accounts: Array<{ id: string; needsReauth?: boolean }> };
+      };
+      expect(auth.anthropic.accounts.find(account => account.id === "account-a")?.needsReauth).toBe(true);
+      expect(auth.anthropic.accounts.find(account => account.id === "account-b")?.needsReauth).toBe(true);
+      expect(auth.anthropic.accounts.find(account => account.id === "account-c")?.needsReauth).toBeUndefined();
+    } finally {
+      clearAnthropicAccountPoolState();
+      clearPoolRotationState();
+      if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
+      else process.env.OPENCODEX_HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   test("terminal-guard continuation 429 replays on the same key before surfacing", async () => {

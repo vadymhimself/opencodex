@@ -862,24 +862,32 @@ export function bridgeToResponsesSSE(
         returnIterator();
       };
       let handlingTranslatorOverflow = false;
-      terminateForTranslatorOverflow = _error => {
+      terminateForTranslatorOverflow = error => {
         if (handlingTranslatorOverflow || terminated || clientCancelled || closed) return;
         handlingTranslatorOverflow = true;
         abortCurrentToolCallForTranslatorOverflow();
         currentWebSearch = null;
         releasePendingWebSources();
-        const failure = adapterFailureFromEvent({
-          type: "error",
-          status: 502,
-          errorType: "upstream_error",
-          code: "translation_buffer_limit",
-          message: "upstream translation buffer exceeded the safe limit",
-        }).error;
+        const overflowEvent: Extract<AdapterEvent, { type: "error" }> =
+          isRecord(error)
+          && error.type === "error"
+          && error.code === "translation_buffer_limit"
+            ? error as Extract<AdapterEvent, { type: "error" }>
+            : {
+                type: "error",
+                status: 502,
+                errorType: "upstream_error",
+                code: "translation_buffer_limit",
+                message: "upstream translation buffer exceeded the safe limit",
+              };
+        const failure = adapterFailureFromEvent(overflowEvent).error;
+        if (overflowEvent.usage) options?.onUsage?.(overflowEvent.usage);
         const failedFrame = sseEvent("response.failed", {
           type: "response.failed",
           sequence_number: seq++,
           response: {
             ...responseSnapshot("failed", finishedItems),
+            ...(overflowEvent.usage ? { usage: responsesUsage(overflowEvent.usage) } : {}),
             error: failure,
             last_error: failure,
           },
@@ -944,6 +952,15 @@ export function bridgeToResponsesSSE(
               continue;
             }
             if (event.type !== "done" && event.type !== "incomplete" && event.type !== "error") continue;
+          }
+          if (
+            event.type !== "redacted_thinking"
+            && pendingRedacted.length > 0
+            && !pendingSignature
+            && !currentReasoning
+            && !hiddenThinkingText
+          ) {
+            flushHiddenReasoningEnvelope();
           }
           switch (event.type) {
             case "assistant_boundary": {
@@ -1054,10 +1071,10 @@ export function bridgeToResponsesSSE(
             case "thinking_signature": {
               pendingSignatureBytes = replaceRetainedString(pendingSignatureBytes, event.signature, "reasoning");
               pendingSignature = event.signature;
-              // Signature arrives at the end of the thinking block. With a visible reasoning item
-              // open, closeCurrentReasoning attaches the envelope; hidden/suppressed blocks flush
-              // an envelope-only reasoning item now.
-              if (!currentReasoning) flushHiddenReasoningEnvelope();
+              // Signature terminates its thinking block. Close now so later redacted/thinking blocks
+              // cannot replace this signature or merge into its replay envelope.
+              if (currentReasoning) closeCurrentReasoning();
+              else flushHiddenReasoningEnvelope();
               break;
             }
             case "redacted_thinking": {
@@ -1815,6 +1832,14 @@ function buildResponseJSONWithBudget(
       }
       if (budget) releaseTranslatedEvent(e, budget);
       continue;
+    }
+    if (
+      e.type !== "redacted_thinking"
+      && batchRedacted.length > 0
+      && !batchSignature
+      && !currentSummaryReasoning
+    ) {
+      flushSummaryReasoning();
     }
     switch (e.type) {
       case "assistant_boundary":

@@ -15,7 +15,14 @@
  * store (existing OAuth path) so the account is excluded from eligibility.
  */
 import { createHash } from "node:crypto";
-import { setActiveAccount, getAccountSet, getAccountCredential } from "./store";
+import {
+  credentialGeneration,
+  getAccountCredential,
+  getAccountSet,
+  markAccountNeedsReauthIfGeneration,
+  setActiveAccount,
+} from "./store";
+import type { OAuthAccessSnapshot } from "./index";
 import { getCachedProviderAccountQuota } from "../providers/quota";
 import { fallbackCodexAccountLogLabel } from "../codex/account-label";
 import {
@@ -695,6 +702,48 @@ export function rotateAnthropicAccountOn429(
   return next;
 }
 
+export async function rotateAnthropicAccountOnCredentialDenial(
+  config: OcxConfig,
+  rejected: Pick<OAuthAccessSnapshot, "accountId" | "generation">,
+  sessionKey?: string | null,
+  now = Date.now(),
+): Promise<string | null> {
+  await markAccountNeedsReauthIfGeneration(
+    PROVIDER,
+    rejected.accountId,
+    rejected.generation,
+  );
+  clearAnthropicSessionAffinityForAccount(rejected.accountId);
+  notePoolRotationFailure(POOL_KEY_ANTHROPIC, rejected.accountId);
+  quorumCache = null;
+
+  const current = getAccountCredential(PROVIDER, rejected.accountId);
+  const currentGenerationReplaced = current !== null
+    && credentialGeneration(current) !== rejected.generation
+    && getEligibleAnthropicAccounts(now).includes(rejected.accountId);
+  const next = currentGenerationReplaced
+    ? rejected.accountId
+    : isAnthropicAccountPoolEnabled(config)
+      ? pickAlternateAnthropicAccount(config, rejected.accountId, now)
+      : pickLowestUsage(config, rejected.accountId, now);
+  if (!next) {
+    console.warn("[anthropic-pool] no eligible Anthropic OAuth account after credential denial; returning 403");
+    return null;
+  }
+
+  const affinityKey = normalizeAffinityComponent(sessionKey);
+  if (affinityKey && normalizeAffinityComponent(next)) {
+    sessionAffinity.set(affinityKey, { accountId: next, lastUsedAt: now });
+    pruneExpiredAffinity(now);
+  }
+  console.warn(
+    currentGenerationReplaced
+      ? `[anthropic-pool] credential denial on stale ${formatAnthropicAccountOrdinal(rejected.accountId)} credential; retrying its refreshed credential`
+      : `[anthropic-pool] credential denial on ${formatAnthropicAccountOrdinal(rejected.accountId)}; failing over to ${formatAnthropicAccountOrdinal(next)}`,
+  );
+  return next;
+}
+
 /** Promote dashboard active account after a validated failover target is usable. */
 export function promoteAnthropicActiveAccount(accountId: string): void {
   void setActiveAccount(PROVIDER, accountId).catch(() => { /* best-effort */ });
@@ -717,18 +766,29 @@ export function resetAnthropicRoutingForManualSelection(accountId: string): void
  * credential into a background multiauth `local-cli` slot (same fail-closed rule
  * as quota probes).
  */
-export async function getAnthropicPoolAccessToken(accountId: string): Promise<string> {
+export async function getAnthropicPoolAccessSnapshot(accountId: string): Promise<OAuthAccessSnapshot> {
   const stored = getAccountCredential(PROVIDER, accountId);
   if (!stored) {
     const { OAuthLoginRequiredError } = await import("./index");
     throw new OAuthLoginRequiredError(PROVIDER);
   }
-  if (stored.expires > Date.now() + TOKEN_SKEW_MS) return stored.access;
+  if (stored.expires > Date.now() + TOKEN_SKEW_MS) {
+    return {
+      provider: PROVIDER,
+      accountId,
+      accessToken: stored.access,
+      generation: credentialGeneration(stored),
+    };
+  }
   if (!canRefreshAnthropicPoolAccount(accountId)) {
     throw new Error("background local-cli token expired; refuse CLI-adopting refresh for pool");
   }
-  const { getValidAccessTokenForAccount } = await import("./index");
-  return getValidAccessTokenForAccount(PROVIDER, accountId);
+  const { getValidAccessSnapshotForAccount } = await import("./index");
+  return getValidAccessSnapshotForAccount(PROVIDER, accountId, { requireUsableAccount: true });
+}
+
+export async function getAnthropicPoolAccessToken(accountId: string): Promise<string> {
+  return (await getAnthropicPoolAccessSnapshot(accountId)).accessToken;
 }
 
 /**

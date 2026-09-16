@@ -41,6 +41,24 @@ describe("readBoundedResponseBody", () => {
 		});
 	});
 
+	test("retains exact bytes only after complete safe EOF", async () => {
+		const expected = new Uint8Array([0x61, 0xc3, 0xa9]);
+		const complete = await readBoundedResponseBody(
+			responseFromChunks(expected.subarray(0, 2), expected.subarray(2)),
+			{ retainBytes: true },
+		);
+		expect(Array.from(complete.bytes ?? [])).toEqual(Array.from(expected));
+
+		const timedOut = await readBoundedResponseBody(
+			new Response(new ReadableStream<Uint8Array>({
+				start(controller) { controller.enqueue(expected.subarray(0, 1)); },
+			})),
+			{ retainBytes: true, totalTimeoutMs: 10, inactivityTimeoutMs: 10 },
+		);
+		expect(timedOut.displaySafe).toBe(false);
+		expect(timedOut.bytes).toBeUndefined();
+	});
+
 	test("empty chunks do not reset the inactivity deadline", async () => {
 		let timer: ReturnType<typeof setInterval> | undefined;
 		let cancelled = false;

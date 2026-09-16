@@ -42,12 +42,26 @@ function mediaTypeOf(ref: ImageBlockRef): string {
   return typeof mt === "string" ? mt.toLowerCase() : "";
 }
 
+function cacheControlOf(ref: ImageBlockRef): unknown {
+  return (ref.container[ref.index] as { cache_control?: unknown })?.cache_control;
+}
+
 function textify(ref: ImageBlockRef, text: string): void {
-  ref.container[ref.index] = { type: "text", text };
+  const cacheControl = cacheControlOf(ref);
+  ref.container[ref.index] = {
+    type: "text",
+    text,
+    ...(cacheControl !== undefined ? { cache_control: cacheControl } : {}),
+  };
 }
 
 function replaceImage(ref: ImageBlockRef, data: string, mediaType: string): void {
-  ref.container[ref.index] = { type: "image", source: { type: "base64", media_type: mediaType, data } };
+  const cacheControl = cacheControlOf(ref);
+  ref.container[ref.index] = {
+    type: "image",
+    source: { type: "base64", media_type: mediaType, data },
+    ...(cacheControl !== undefined ? { cache_control: cacheControl } : {}),
+  };
 }
 
 function initialPosition(newestFirstIndex: number, bias: number): number {

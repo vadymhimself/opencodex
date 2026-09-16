@@ -6,16 +6,26 @@
  * internal Request, so routing/OAuth/account-pool/failover/sidecars are inherited
  * unchanged. The Responses output (SSE or JSON) is converted back to Anthropic shape.
  */
+import {
+  anthropicMessagesUrl,
+  canReplayAnthropicSource,
+  isAnthropicMessageResponse,
+  isExactCanonicalAnthropicMessagesUrl,
+  usageFromAnthropic,
+} from "../adapters/anthropic";
+import type { AdapterRequest, AnthropicMessagesSource } from "../adapters/base";
 import { FORWARD_HEADERS } from "../adapters/openai-responses";
-import { sseFieldValue } from "../lib/sse-decoder";
 import { enforceAnthropicImageLimits, sniffImageDimensions } from "../adapters/anthropic-image-guard";
 import { normalizeAnthropicImages } from "../adapters/anthropic-image-normalize";
-import { AnthropicRequestError, anthropicToResponsesTranslation, extractOcxEffortDirective, extractOcxRouteDirective, resolveInboundModel, type ClaudeCacheKeySource } from "../claude/inbound";
+import { AnthropicRequestError, anthropicRequestCorrelationKey, anthropicToResponsesTranslation, extractOcxEffortDirective, extractOcxRouteDirective, resolveInboundModel, type ClaudeCacheKeySource } from "../claude/inbound";
 import { resolveDesktop3pAlias } from "../claude/desktop-3p";
 import { recordDesktopRequest } from "../claude/desktop-health";
 import { stripOneMillionMarker } from "../claude/context-windows";
 import { captureClaudeInbound } from "../claude/inbound-debug";
-import { isTransientUpstreamStatus } from "../lib/upstream-retry";
+import {
+  applyUpstreamRecoveryInit,
+  isTransientUpstreamStatus,
+} from "../lib/upstream-retry";
 import { resolveClientRetryAfter } from "../lib/retry-after";
 import {
   anthropicErrorBody,
@@ -25,16 +35,56 @@ import {
   responsesSseToAnthropicSse,
 } from "../claude/outbound";
 import { clearableDeadline, idleDeadline } from "../lib/abort";
+import {
+  boundedBodyBufferGrowthsForTests,
+  readBoundedResponseBytes,
+} from "../lib/bounded-body";
 import { estimateTokens } from "../lib/token-estimate";
-import { NoEligiblePolicyCandidateError, UnknownRoutingPolicyError, routeModel } from "../router";
+import {
+  NoEligiblePolicyCandidateError,
+  UnknownRoutingPolicyError,
+  routeConcreteModel,
+  routeModel,
+} from "../router";
+import {
+  comboRequestHasImageInput,
+  getCombo,
+  pickComboTarget,
+  resolveComboId,
+} from "../combos";
+import { parseRequest } from "../responses/parser";
 import { evidenceFromBody } from "../routing/request-evidence";
-import { resolveWireProtocolOverride } from "./adapter-resolve";
+import { isCanonicalOpenAiForwardProvider } from "../providers/openai-tiers-destination";
+import { resolveProviderTransport } from "../providers/xai-transport";
+import { resolveAdapter, resolveWireProtocolOverride } from "./adapter-resolve";
+import { providerFetch } from "./responses/fetch-helpers";
+import {
+  getValidAccessTokenSnapshot,
+  publicOAuthAuthenticationErrorMessage,
+} from "../oauth";
+import {
+  anthropicSessionKeyFromParts,
+  bindAnthropicSessionAffinity,
+  getAnthropicPoolAccessToken,
+  getAnthropicPoolRetryAfterSeconds,
+  isAnthropicAccountPoolEnabled,
+  promoteAnthropicActiveAccount,
+  resolveAnthropicAccountForSession,
+} from "../oauth/anthropic-routing";
 import type { OcxConfig } from "../types";
 import { readJsonRequestBody } from "./request-decompress";
-import { addFinalRequestLog, httpStatusForRequestLogTerminal, recordFirstOutput, type RequestLogContext, type RequestLogEntry } from "./request-log";
-import { conversationIdFromClaudeMetadata } from "./request-log-conversation";
-import { responseWithDeferredRequestLog } from "./relay";
+import { addFinalRequestLog, httpStatusForRequestLogTerminal, httpStatusFromTerminalError, recordFirstOutput, type RequestLogContext, type RequestLogEntry } from "./request-log";
+import {
+  conversationIdFromClaudeMetadata,
+  sessionIdHeaderFromRequest,
+} from "./request-log-conversation";
+import {
+  createSseInspector,
+  isAnthropicSourceReplayResponse,
+  responseWithDeferredRequestLog,
+} from "./relay";
 import { handleResponses } from "./responses";
+import { comboTargetAcceptsAnthropicSource } from "./responses/core";
 import {
   isApiAuthRequired,
   isDataPlaneAdmissionSecret,
@@ -182,25 +232,6 @@ function uuidFromHex(hex32: string): string {
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-8${h.slice(17, 20)}-${h.slice(20, 32)}`;
 }
 
-function anthropicUsageToOcx(usage: Rec | undefined): { inputTokens: number; outputTokens: number; cachedInputTokens?: number; cacheReadInputTokens?: number; cacheCreationInputTokens?: number } | undefined {
-  if (!usage) return undefined;
-  const num = (v: unknown) => typeof v === "number" ? v : 0;
-  const hasCache = usage.cache_read_input_tokens !== undefined || usage.cache_creation_input_tokens !== undefined;
-  const read = num(usage.cache_read_input_tokens);
-  const write = num(usage.cache_creation_input_tokens);
-  // Anthropic input_tokens excludes cache read/write; normalize to the canonical
-  // inclusive convention (types.ts OcxUsage / devlog 070). cached = READS only.
-  return {
-    inputTokens: num(usage.input_tokens) + read + write,
-    outputTokens: num(usage.output_tokens),
-    ...(hasCache ? {
-      cachedInputTokens: read,
-      cacheReadInputTokens: read,
-      cacheCreationInputTokens: write,
-    } : {}),
-  };
-}
-
 /** Body-occupancy guard for the native passthrough (devlog 260716_passthrough_followups/010). */
 export interface PassthroughBodyGuard {
   /** Idle window in ms — raw upstream-byte inactivity while a read is pending. 0 disables. */
@@ -212,89 +243,121 @@ export interface PassthroughBodyGuard {
 }
 
 type PassthroughCloseReason = "terminal" | "client_cancel" | "body_stall" | "body_overflow";
+type AnthropicTapFinalMeta = {
+  closeReason: PassthroughCloseReason;
+  terminalStatus?: RequestLogEntry["terminalStatus"];
+};
 
 /**
- * Tap an Anthropic-vocabulary SSE stream for the request log (usage + terminal),
- * bounding body occupancy: idle (silence-only, timed ONLY while a reader.read() is
- * pending so downstream backpressure never counts as upstream inactivity) and a
- * cumulative byte cap. On stall/overflow it appends a protocol-compatible Anthropic
- * `event: error` terminal frame after a blank-line boundary, closes, and cancels the
- * upstream reader — never a total-wall-clock bound (slow-but-alive streams live).
- * Exported for deterministic unit tests.
+ * Tap an Anthropic-vocabulary SSE stream for usage and terminal logging while
+ * forwarding successful bytes unchanged. Transport failures get one Anthropic
+ * error frame because response headers may already be committed.
  */
 export function tapAnthropicSseForLog(
   upstream: ReadableStream<Uint8Array>,
   logCtx: RequestLogContext,
-  finalize: (status: number, meta: { closeReason: PassthroughCloseReason }) => void,
+  finalize: (status: number, meta: AnthropicTapFinalMeta) => void,
   guard?: PassthroughBodyGuard,
+  onFirstOutput?: () => void,
 ): ReadableStream<Uint8Array> {
-  const decoder = new TextDecoder();
   const encoder = new TextEncoder();
-  let buffer = "";
   let usageAcc: Rec = {};
-  const inspect = (chunk: Uint8Array) => {
-    buffer += decoder.decode(chunk, { stream: true });
-    let sep: number;
-    while ((sep = buffer.indexOf("\n\n")) !== -1) {
-      const frame = buffer.slice(0, sep);
-      buffer = buffer.slice(sep + 2);
-      const dataLine = frame
-        .split("\n")
-        .map(l => sseFieldValue(l, "data"))
-        .filter((v): v is string => v !== null)
-        .join("");
-      if (!dataLine) continue;
-      let data: unknown;
-      try { data = JSON.parse(dataLine); } catch { continue; }
-      if (!isRec(data)) continue;
-      if (data.type === "message_start" && isRec(data.message) && isRec(data.message.usage)) {
-        usageAcc = { ...usageAcc, ...data.message.usage };
-      } else if (data.type === "message_delta" && isRec(data.usage)) {
-        usageAcc = { ...usageAcc, ...data.usage };
+  let terminalStatus: RequestLogEntry["terminalStatus"];
+  let firstOutputRecorded = false;
+  let pendingValidatedFrame: Uint8Array | undefined;
+  let pendingUpstreamChunk: Uint8Array | undefined;
+  let pendingUpstreamOffset = 0;
+  let protocolError: string | undefined;
+  const inspector = createSseInspector({
+    classifyTerminal: payload => {
+      if (!isRec(payload)) return null;
+      if (payload.type === "message_stop") return "completed";
+      if (payload.type === "error") return "failed";
+      return null;
+    },
+    stopAtTerminal: true,
+    strictJsonRecords: true,
+    onValidatedFrame: frame => {
+      if (protocolError) return false;
+      pendingValidatedFrame = frame;
+      return false;
+    },
+    onProtocolError: message => { protocolError = message; },
+    onTerminal: status => { terminalStatus = status; },
+    onParsedPayload: payload => {
+      if (!isRec(payload)) return;
+      if (typeof payload.type === "string" && payload.type.startsWith("response.")) {
+        protocolError = `unexpected Responses event on Anthropic stream: ${payload.type}`;
+        return;
       }
-    }
-  };
+      if (payload.type === "message_start" && isRec(payload.message) && isRec(payload.message.usage)) {
+        usageAcc = { ...usageAcc, ...payload.message.usage };
+      } else if (payload.type === "message_delta" && isRec(payload.usage)) {
+        usageAcc = { ...usageAcc, ...payload.usage };
+      }
+      if (!firstOutputRecorded
+        && (payload.type === "content_block_start" || payload.type === "content_block_delta")) {
+        firstOutputRecorded = true;
+        onFirstOutput?.();
+      }
+    },
+  });
   const reader = upstream.getReader();
   let settled = false;
   let bodyBytes = 0;
   let tapController: ReadableStreamDefaultController<Uint8Array> | undefined;
 
   const recordUsage = () => {
-    logCtx.usage = anthropicUsageToOcx(Object.keys(usageAcc).length > 0 ? usageAcc : undefined);
+    logCtx.usage = usageFromAnthropic(Object.keys(usageAcc).length > 0 ? usageAcc : undefined);
   };
-  const failBody = (closeReason: "body_stall" | "body_overflow", errType: string, message: string) => {
-    if (settled) return;
+  const settle = (status: number, meta: AnthropicTapFinalMeta) => {
+    if (settled) return false;
     settled = true;
     idle.cancel();
     detachAbort();
+    inspector.dispose();
+    pendingValidatedFrame = undefined;
+    pendingUpstreamChunk = undefined;
+    pendingUpstreamOffset = 0;
     recordUsage();
-    finalize(200, { closeReason });
+    finalize(status, meta);
+    return true;
+  };
+  const failBody = (
+    status: number,
+    closeReason: "terminal" | "body_stall" | "body_overflow",
+    terminal: "failed" | "incomplete",
+    errType: string,
+    message: string,
+  ) => {
+    if (!settle(status, { closeReason, terminalStatus: terminal })) return;
     const payload = JSON.stringify({ type: "error", error: { type: errType, message } });
     try {
-      // Leading blank line terminates any partial SSE block so the frame parses cleanly
-      // (relaySseWithFailedTail policy, Anthropic wire shape).
       tapController?.enqueue(encoder.encode(`\n\nevent: error\ndata: ${payload}\n\n`));
       tapController?.close();
     } catch { /* client already torn down */ }
-    reader.cancel(new DOMException(message, closeReason === "body_stall" ? "TimeoutError" : "QuotaExceededError")).catch(() => {});
+    reader.cancel(new DOMException(message, closeReason === "body_stall" ? "TimeoutError" : "Error")).catch(() => {});
+  };
+  const flushValidatedFrame = (
+    controller: ReadableStreamDefaultController<Uint8Array>,
+  ): boolean => {
+    const frame = pendingValidatedFrame;
+    pendingValidatedFrame = undefined;
+    if (!frame) return false;
+    controller.enqueue(frame);
+    return true;
   };
   const idle = idleDeadline(guard?.stallMs ?? 0, () => {
     failBody(
+      504,
       "body_stall",
+      "failed",
       "timeout_error",
       `anthropic passthrough body stalled: no upstream bytes for ${Math.round((guard?.stallMs ?? 0) / 1000)}s`,
     );
   });
-  // Deterministic client-cancel classification: Bun may surface a client abort as a
-  // reader.read() rejection OR a resolved done (src/lib/abort.ts cancelBodyOnAbort
-  // rationale), so the listener performs first-wins settlement itself instead of
-  // relying on which shape the read takes.
   const onClientAbort = () => {
-    if (settled) return;
-    settled = true;
-    idle.cancel();
-    detachAbort();
-    finalize(499, { closeReason: "client_cancel" });
+    if (!settle(499, { closeReason: "client_cancel" })) return;
     try { tapController?.close(); } catch { /* downstream already torn down */ }
     reader.cancel(guard?.reqSignal?.reason).catch(() => {});
   };
@@ -316,49 +379,104 @@ export function tapAnthropicSseForLog(
     async pull(controller) {
       if (settled) return;
       try {
-        idle.reset();
-        const { done, value } = await reader.read();
-        idle.pause();
-        if (settled) return; // stall/overflow/abort won the race while we awaited
-        if (done) {
-          settled = true;
-          idle.cancel();
-          detachAbort();
-          recordUsage();
-          finalize(200, { closeReason: "terminal" });
-          controller.close();
-          return;
-        }
-        if (value.byteLength > 0) {
-          bodyBytes += value.byteLength;
-          if (guard && guard.maxBytes > 0 && bodyBytes > guard.maxBytes) {
+        while (!settled) {
+          if (!pendingUpstreamChunk) {
+            idle.reset();
+            const { done, value } = await reader.read();
+            idle.pause();
+            if (settled) return;
+            if (done) {
+              inspector.finish();
+              flushValidatedFrame(controller);
+              if (protocolError) {
+                failBody(
+                  502,
+                  "terminal",
+                  "failed",
+                  "api_error",
+                  `anthropic passthrough protocol error: ${protocolError}`,
+                );
+                return;
+              }
+              if (terminalStatus === "completed") {
+                settle(200, { closeReason: "terminal", terminalStatus });
+                controller.close();
+              } else if (terminalStatus === "failed") {
+                settle(502, { closeReason: "terminal", terminalStatus });
+                controller.close();
+              } else {
+                failBody(
+                  502,
+                  "terminal",
+                  "incomplete",
+                  "api_error",
+                  "upstream response was incomplete (adapter_eof)",
+                );
+              }
+              return;
+            }
+            bodyBytes += value.byteLength;
+            if (guard && guard.maxBytes > 0 && bodyBytes > guard.maxBytes) {
+              failBody(
+                502,
+                "body_overflow",
+                "failed",
+                "api_error",
+                `anthropic passthrough body exceeded ${guard.maxBytes} bytes`,
+              );
+              return;
+            }
+            pendingUpstreamChunk = value;
+            pendingUpstreamOffset = 0;
+          }
+
+          const consumed = inspector.feed(
+            pendingUpstreamChunk.subarray(pendingUpstreamOffset),
+          );
+          if (consumed === undefined) {
+            pendingUpstreamChunk = undefined;
+            pendingUpstreamOffset = 0;
+          } else {
+            pendingUpstreamOffset += consumed;
+            if (pendingUpstreamOffset >= pendingUpstreamChunk.byteLength) {
+              pendingUpstreamChunk = undefined;
+              pendingUpstreamOffset = 0;
+            }
+          }
+          const emitted = flushValidatedFrame(controller);
+          if (protocolError) {
             failBody(
-              "body_overflow",
+              502,
+              "terminal",
+              "failed",
               "api_error",
-              `anthropic passthrough body exceeded ${guard.maxBytes} bytes`,
+              `anthropic passthrough protocol error: ${protocolError}`,
             );
             return;
           }
+          if (terminalStatus !== undefined) {
+            const status = terminalStatus === "completed" ? 200 : 502;
+            if (settle(status, { closeReason: "terminal", terminalStatus })) {
+              controller.close();
+              reader.cancel("Anthropic protocol terminal reached").catch(() => {});
+            }
+            return;
+          }
+          if (emitted) return;
         }
-        inspect(value);
-        controller.enqueue(value);
-      } catch (err) {
+      } catch (error) {
         if (settled) return;
-        settled = true;
-        idle.cancel();
-        detachAbort();
-        recordUsage();
-        finalize(200, { closeReason: "terminal" });
-        try { controller.error(err); } catch { /* torn down */ }
+        failBody(
+          502,
+          "terminal",
+          "failed",
+          "api_error",
+          `anthropic passthrough body failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
       }
     },
     cancel(reason) {
-      if (!settled) {
-        settled = true;
-        idle.cancel();
-        detachAbort();
-        finalize(499, { closeReason: "client_cancel" });
-      }
+      if (!settled) settle(499, { closeReason: "client_cancel" });
       reader.cancel(reason).catch(() => {});
     },
   });
@@ -448,7 +566,7 @@ async function anthropicNativePassthrough(
   if (upstream.ok) {
     try {
       const parsed = JSON.parse(text) as { usage?: Rec };
-      if (isRec(parsed?.usage)) logCtx.usage = anthropicUsageToOcx(parsed.usage);
+      if (isRec(parsed?.usage)) logCtx.usage = usageFromAnthropic(parsed.usage);
     } catch { /* count_tokens etc. */ }
   }
   finalize(upstream.status, { closeReason: "non_stream" });
@@ -483,73 +601,48 @@ export function resolvePassthroughBodyGuard(config: OcxConfig, reqSignal?: Abort
   return { stallMs: stallSec * 1000, maxBytes, ...(reqSignal ? { reqSignal } : {}) };
 }
 
-type BoundedPassthroughBody =
-  | { kind: "ok"; text: string }
+type BoundedPassthroughBytes =
+  | { kind: "ok"; bytes: Uint8Array }
   | { kind: "stall" }
   | { kind: "overflow" }
   | { kind: "client_cancel" };
 
-/**
- * Bounded replacement for `await upstream.text()` on the non-stream passthrough
- * branch: same idle-only + size-cap semantics as the SSE tap. NOTE: reader.cancel()
- * resolves a pending read as done rather than rejecting, so the stalled flag is
- * re-checked after every read settlement (audit round 3).
- */
+type BoundedPassthroughBody =
+  | { kind: "ok"; text: string }
+  | Exclude<BoundedPassthroughBytes, { kind: "ok" }>;
+
+export function passthroughBodyBufferGrowthsForTests(): number {
+  return boundedBodyBufferGrowthsForTests();
+}
+
+export async function readBoundedPassthroughBytes(
+  upstream: Response,
+  guard: PassthroughBodyGuard,
+): Promise<BoundedPassthroughBytes> {
+  try {
+    const result = await readBoundedResponseBytes(upstream, {
+      signal: guard.reqSignal,
+      maxBytes: guard.maxBytes > 0 ? guard.maxBytes : Number.MAX_SAFE_INTEGER,
+      ...(guard.stallMs > 0 ? { inactivityTimeoutMs: guard.stallMs } : {}),
+    });
+    return result.oversized
+      ? { kind: "overflow" }
+      : { kind: "ok", bytes: result.bytes };
+  } catch (error) {
+    if (guard.reqSignal?.aborted) return { kind: "client_cancel" };
+    if (error instanceof DOMException && error.name === "TimeoutError") return { kind: "stall" };
+    throw error;
+  }
+}
+
 export async function readBoundedPassthroughBody(
   upstream: Response,
   guard: PassthroughBodyGuard,
 ): Promise<BoundedPassthroughBody> {
-  if (!upstream.body) return { kind: "ok", text: await upstream.text() };
-  const reader = upstream.body.getReader();
-  const decoder = new TextDecoder();
-  let text = "";
-  let bytes = 0;
-  let stalled = false;
-  let aborted = false;
-  const idle = idleDeadline(guard.stallMs, () => {
-    stalled = true;
-    reader.cancel(new DOMException("anthropic passthrough body stalled", "TimeoutError")).catch(() => {});
-  });
-  // Deterministic client-abort classification (audit round 4): Bun may surface the
-  // abort as a read rejection OR a resolved done, so we cancel the reader ourselves
-  // and classify via the flag rather than the read's settlement shape.
-  const signal = guard.reqSignal;
-  const onAbort = () => {
-    aborted = true;
-    reader.cancel(signal?.reason).catch(() => {});
-  };
-  if (signal?.aborted) onAbort();
-  else signal?.addEventListener("abort", onAbort, { once: true });
-  try {
-    while (true) {
-      idle.reset();
-      let result: Awaited<ReturnType<typeof reader.read>>;
-      try {
-        result = await reader.read();
-      } catch (err) {
-        if (aborted) return { kind: "client_cancel" };
-        if (stalled) return { kind: "stall" };
-        throw err;
-      } finally {
-        idle.pause();
-      }
-      if (aborted) return { kind: "client_cancel" };
-      if (stalled) return { kind: "stall" };
-      if (result.done) break;
-      if (result.value.byteLength === 0) continue;
-      bytes += result.value.byteLength;
-      if (guard.maxBytes > 0 && bytes > guard.maxBytes) {
-        reader.cancel(new DOMException("anthropic passthrough body exceeded byte cap", "QuotaExceededError")).catch(() => {});
-        return { kind: "overflow" };
-      }
-      text += decoder.decode(result.value, { stream: true });
-    }
-    text += decoder.decode();
-    return { kind: "ok", text };
-  } finally {
-    idle.cancel();
-    signal?.removeEventListener("abort", onAbort);
-  }
+  const result = await readBoundedPassthroughBytes(upstream, guard);
+  return result.kind === "ok"
+    ? { kind: "ok", text: new TextDecoder().decode(result.bytes) }
+    : result;
 }
 
 /**
@@ -624,6 +717,9 @@ async function handleClaudeMessagesWithBudget(
   }
 
   let anthropicBody: unknown;
+  let originalAnthropicBody: Rec | undefined;
+  let anthropicMessagesSource: AnthropicMessagesSource | undefined;
+  let comboRandomSeed: string | undefined;
   let internalBody: Rec;
   let cacheKeySource: ClaudeCacheKeySource = null;
   let effortOverride: string | null = null;
@@ -702,8 +798,22 @@ async function handleClaudeMessagesWithBudget(
       };
       delete anthropicBody.thinking;
     }
+    if (isRec(anthropicBody)) {
+      originalAnthropicBody = structuredClone(anthropicBody);
+      comboRandomSeed = anthropicRequestCorrelationKey(anthropicBody);
+    }
     const translation = anthropicToResponsesTranslation(anthropicBody, config.claudeCode);
     internalBody = translation.body;
+    if (originalAnthropicBody) {
+      anthropicMessagesSource = {
+        body: originalAnthropicBody,
+        headers: {
+          anthropicVersion: req.headers.get("anthropic-version")?.trim() || undefined,
+          anthropicBeta: req.headers.get("anthropic-beta")?.trim() || undefined,
+        },
+        ...(translation.requiresExactAnthropicReplay ? { requiresExactReplay: true } : {}),
+      };
+    }
     // The Anthropic translator builds its body from model/input/store/stream plus sampling
     // fields only, so the caller intent is applied to the TRANSLATED body rather than the
     // inbound one.
@@ -732,13 +842,34 @@ async function handleClaudeMessagesWithBudget(
   // bodies: it 400s on sampling params ("Unsupported parameter: max_output_tokens",
   // verified live 2026-07-11). Strip them for that route; routed providers keep them.
   let nativeRoute = false;
+  const routeSource = anthropicMessagesSource;
+  const comboRequestCompatible = routeSource
+    ? (target: Readonly<{ provider: string; model: string }>) => comboTargetAcceptsAnthropicSource(
+        config,
+        target,
+        routeSource,
+        internalBody,
+        "anthropic",
+      )
+    : undefined;
   try {
-    const route = routeModel(config, internalBody.model as string, evidenceFromBody(internalBody));
+    const route = routeModel(
+      config,
+      internalBody.model as string,
+      evidenceFromBody(internalBody),
+      {
+        ...(comboRequestCompatible ? {
+          comboEligible: comboRequestCompatible,
+          comboRequestCompatible,
+        } : {}),
+        ...(comboRandomSeed ? { comboRandomSeed } : {}),
+      },
+    );
     // Settle the wire once so the sampling decision below reads the effective
     // adapter rather than the provider-wide default (#404).
     route.provider = resolveWireProtocolOverride(route.providerName, route.modelId, route.provider, "anthropic");
     logCtx.routeDecision = route.routeDecision;
-    if (route.provider.adapter === "openai-responses") {
+    if (isCanonicalOpenAiForwardProvider(route.provider)) {
       nativeRoute = true;
       delete internalBody.max_output_tokens;
       delete internalBody.temperature;
@@ -822,7 +953,7 @@ async function handleClaudeMessagesWithBudget(
   // BEFORE translation (the translated Anthropic stream has no response.completed
   // frame, so tapping it records a bogus 502 with no usage/cache detail).
   let nativeLogged = false;
-  const finalizeNativeLog = (status: number, meta: { terminalStatus?: RequestLogEntry["terminalStatus"]; closeReason: "terminal" | "client_cancel" }) => {
+  const finalizeNativeLog = (status: number, meta: AnthropicTapFinalMeta) => {
     if (!logIds || nativeLogged) return;
     nativeLogged = true;
     addFinalRequestLog(logIds.requestId, logIds.start, logCtx, status, meta);
@@ -838,6 +969,8 @@ async function handleClaudeMessagesWithBudget(
     // Without this the replay would look native and a Responses-scoped wire default
     // would fire, disagreeing with the pre-flight decision above.
     inboundWire: "anthropic",
+    ...(anthropicMessagesSource ? { anthropicMessagesSource } : {}),
+    ...(comboRandomSeed ? { comboRandomSeed } : {}),
     stripClaudeMainAuthForNoncanonicalForward: true,
     translatorBudget,
     ...(logIds ? { onFirstOutput: () => recordFirstOutput(logCtx, logIds.start) } : {}),
@@ -845,6 +978,88 @@ async function handleClaudeMessagesWithBudget(
     onNativePassthroughCancel: () => finalizeNativeLog(499, { closeReason: "client_cancel" }),
   });
   const response = logIds ? responseWithDeferredRequestLog(upstream, logIds.requestId, logIds.start, logCtx) : upstream;
+
+  if (isAnthropicSourceReplayResponse(response)) {
+    const finalizeSource = (status: number, meta: AnthropicTapFinalMeta) =>
+      finalizeNativeLog(status, meta);
+    if (!response.ok) {
+      finalizeSource(response.status, { closeReason: "terminal" });
+      return response;
+    }
+
+    const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+    if (stream) {
+      if (!contentType.includes("text/event-stream") || !response.body) {
+        void response.body?.cancel().catch(() => {});
+        finalizeSource(502, { terminalStatus: "failed", closeReason: "terminal" });
+        return anthropicErrorResponse(502, "canonical Anthropic returned JSON for a streaming request", "api_error");
+      }
+      return new Response(
+        tapAnthropicSseForLog(
+          response.body,
+          logCtx,
+          finalizeSource,
+          resolvePassthroughBodyGuard(config, req.signal),
+          logIds ? () => recordFirstOutput(logCtx, logIds.start) : undefined,
+        ),
+        { status: response.status, statusText: response.statusText, headers: response.headers },
+      );
+    }
+
+    if (!contentType.includes("application/json")) {
+      void response.body?.cancel().catch(() => {});
+      finalizeSource(502, { terminalStatus: "failed", closeReason: "terminal" });
+      return anthropicErrorResponse(502, "canonical Anthropic response was not valid JSON", "api_error");
+    }
+    let bytes: Uint8Array;
+    try {
+      const result = await readBoundedResponseBytes(response, {
+        signal: req.signal,
+        maxBytes: resolvePassthroughBodyGuard(config, req.signal).maxBytes || Number.MAX_SAFE_INTEGER,
+      });
+      if (result.oversized) {
+        finalizeSource(502, { terminalStatus: "failed", closeReason: "terminal" });
+        return anthropicErrorResponse(502, "canonical Anthropic response exceeded the configured body limit", "api_error");
+      }
+      bytes = result.bytes;
+    } catch {
+      finalizeSource(502, { terminalStatus: "failed", closeReason: "terminal" });
+      return anthropicErrorResponse(502, "canonical Anthropic response was not valid JSON", "api_error");
+    }
+    let payload: unknown;
+    try {
+      payload = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+    } catch {
+      finalizeSource(502, { terminalStatus: "failed", closeReason: "terminal" });
+      return anthropicErrorResponse(502, "canonical Anthropic response was not valid JSON", "api_error");
+    }
+    if (isRec(payload) && payload.type === "error" && isRec(payload.error)) {
+      const error = payload.error;
+      const status = httpStatusFromTerminalError({
+        type: typeof error.type === "string" ? error.type : undefined,
+        code: error.code === null || typeof error.code === "string" ? error.code : undefined,
+        message: typeof error.message === "string" ? error.message : undefined,
+      });
+      logCtx.terminalHttpStatus = status;
+      finalizeSource(status, { terminalStatus: "failed", closeReason: "terminal" });
+      return new Response(new Uint8Array(bytes), {
+        status,
+        ...(status === response.status ? { statusText: response.statusText } : {}),
+        headers: response.headers,
+      });
+    }
+    if (!isAnthropicMessageResponse(payload)) {
+      finalizeSource(502, { terminalStatus: "failed", closeReason: "terminal" });
+      return anthropicErrorResponse(502, "canonical Anthropic returned an invalid JSON response", "api_error");
+    }
+    logCtx.usage = usageFromAnthropic(isRec(payload.usage) ? payload.usage : undefined);
+    finalizeSource(response.status, { closeReason: "terminal" });
+    return new Response(new Uint8Array(bytes), {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
+  }
 
   if (!response.ok) {
     // Re-shape the OpenAI-style error envelope into the Anthropic one, preserving status.
@@ -973,7 +1188,7 @@ async function handleClaudeMessagesWithBudget(
     emit("content_block_start", { type: "content_block_start", index, content_block: block });
     emit("content_block_stop", { type: "content_block_stop", index });
   });
-  emit("message_delta", { type: "message_delta", delta: { stop_reason: (message as Rec).stop_reason ?? "end_turn", stop_sequence: null }, usage: (message as Rec).usage ?? {} });
+  emit("message_delta", { type: "message_delta", delta: { stop_reason: (message as Rec).stop_reason ?? "end_turn", stop_sequence: (message as Rec).stop_sequence ?? null }, usage: (message as Rec).usage ?? {} });
   emit("message_stop", { type: "message_stop" });
   return new Response(encoder.encode(frames.join("")), {
     status: 200,
@@ -1051,51 +1266,370 @@ export async function handleClaudeCountTokens(
   const disabled = claudeInboundDisabled(config);
   if (disabled) return disabled;
 
-  let body: unknown;
   const translatorBudget = createTranslatorBudget();
   try {
-    body = await readAnthropicBody(req, translatorBudget);
-  } catch (err) {
-    if (err instanceof AnthropicRequestError) return anthropicErrorResponse(400, err.message);
-    return anthropicErrorResponse(500, err instanceof Error ? err.message : String(err));
-  } finally { translatorBudget.dispose(); }
-  if (!body || typeof body !== "object" || Array.isArray(body)) {
-    return anthropicErrorResponse(400, "request body must be a JSON object");
+    let body: unknown;
+    try {
+      body = await readAnthropicBody(req, translatorBudget);
+    } catch (err) {
+      const overflow = isTranslatorBudgetExceededError(err);
+      return anthropicErrorResponse(
+        overflow ? 413 : err instanceof AnthropicRequestError ? 400 : 500,
+        overflow
+          ? "request translation buffer exceeded the safe limit"
+          : err instanceof Error ? err.message : String(err),
+        overflow ? "request_too_large" : undefined,
+        overflow ? "translation_buffer_limit" : undefined,
+      );
+    }
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      return anthropicErrorResponse(400, "request body must be a JSON object");
+    }
+    const raw = body as Rec;
+    if (typeof raw.model !== "string" || raw.model.length === 0) {
+      return anthropicErrorResponse(400, "model is required");
+    }
+    let model = raw.model;
+    const stripped = stripOneMillionMarker(model);
+    if (stripped !== model) {
+      model = stripped;
+      raw.model = model;
+    }
+    const countRoute = extractOcxRouteDirective(raw);
+    if (countRoute) {
+      model = stripOneMillionMarker(countRoute);
+      raw.model = model;
+    }
+    // Counting never requests a generation tier. Correct only synthetic Fast identity.
+    const countFastRow = parseFastOnlyRowId(
+      config, () => decodeClaudeFastSelector(model, config.claudeCode),
+    );
+    if (countFastRow) {
+      model = countFastRow.baseId;
+      raw.model = model;
+    }
+    const comboRandomSeed = anthropicRequestCorrelationKey(raw);
+    captureClaudeInbound(
+      "count_tokens",
+      raw,
+      resolveInboundModel(model, config.claudeCode),
+      req.headers.get("anthropic-beta") ?? undefined,
+    );
+    if (wantsNativePassthrough(req, config, requestPolicy, model)) {
+      return await anthropicNativePassthrough(
+        req,
+        config,
+        { model, provider: "anthropic-native", surface: "claude" },
+        undefined,
+        raw,
+        "/v1/messages/count_tokens",
+      );
+    }
+
+    let translated: ReturnType<typeof anthropicToResponsesTranslation>;
+    let parsed: ReturnType<typeof parseRequest>;
+    try {
+      translated = anthropicToResponsesTranslation(raw, config.claudeCode);
+      translatorBudget.chargeRetained(
+        new TextEncoder().encode(JSON.stringify(translated.body)).byteLength,
+        { kind: "request_copies" },
+      );
+      parsed = parseRequest(translated.body);
+    } catch (err) {
+      const overflow = isTranslatorBudgetExceededError(err);
+      return anthropicErrorResponse(
+        overflow ? 413 : 400,
+        overflow
+          ? "request translation buffer exceeded the safe limit"
+          : err instanceof Error ? err.message : String(err),
+        overflow ? "request_too_large" : "invalid_request_error",
+        overflow ? "translation_buffer_limit" : undefined,
+      );
+    }
+
+    const anthropicVersion = req.headers.get("anthropic-version")?.trim();
+    const anthropicBeta = req.headers.get("anthropic-beta")?.trim();
+    const anthropicSource: AnthropicMessagesSource = {
+      body: raw,
+      headers: {
+        ...(anthropicVersion ? { anthropicVersion } : {}),
+        ...(anthropicBeta ? { anthropicBeta } : {}),
+      },
+      ...(translated.requiresExactAnthropicReplay ? { requiresExactReplay: true } : {}),
+    };
+
+    let route: ReturnType<typeof routeModel>;
+    try {
+      const comboId = resolveComboId(config, parsed.modelId);
+      const combo = comboId ? getCombo(config, comboId) : undefined;
+      if (comboId && combo) {
+        if (combo.imageInput === "disabled" && comboRequestHasImageInput(translated.body)) {
+          return anthropicErrorResponse(
+            400,
+            `Combo "${comboId}" does not accept image input`,
+            "invalid_request_error",
+          );
+        }
+        const sourceEligible = (target: (typeof combo.targets)[number]): boolean =>
+          comboTargetAcceptsAnthropicSource(
+            config,
+            target,
+            anthropicSource,
+            translated.body,
+            "anthropic",
+          );
+        const pick = pickComboTarget(config, comboId, {
+          eligible: sourceEligible,
+          ...(comboRandomSeed === undefined ? {} : { randomSeed: comboRandomSeed }),
+        });
+        if (!pick) {
+          if (!combo.targets.some(sourceEligible)) {
+            return anthropicErrorResponse(
+              400,
+              "request cannot be replayed exactly to canonical Anthropic",
+              "invalid_request_error",
+            );
+          }
+          return anthropicErrorResponse(
+            503,
+            `No available targets for combo: ${comboId}`,
+            "api_error",
+          );
+        }
+        route = {
+          ...routeConcreteModel(config, `${pick.target.provider}/${pick.target.model}`),
+          combo: pick,
+          routeKind: "combo",
+          routeReason: "combo-pick",
+        };
+      } else {
+        route = routeModel(config, parsed.modelId, evidenceFromBody(translated.body));
+      }
+    } catch (err) {
+      if (err instanceof NoEligiblePolicyCandidateError) {
+        return anthropicErrorResponse(404, err.message, "invalid_request_error");
+      }
+      return new Response(
+        JSON.stringify({ input_tokens: estimateClaudeRequestTokens(raw, model) }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
+    route.provider = resolveProviderTransport(
+      route.providerName,
+      route.provider,
+      typeof parsed.options.promptCacheKey === "string"
+        ? parsed.options.promptCacheKey
+        : undefined,
+    );
+    let adapterProvider = resolveWireProtocolOverride(
+      route.providerName,
+      route.modelId,
+      route.provider,
+      "anthropic",
+    );
+    let adapter = resolveAdapter(adapterProvider, config.cacheRetention);
+    if (
+      adapter.name !== "anthropic"
+      || !isExactCanonicalAnthropicMessagesUrl(anthropicMessagesUrl(adapterProvider.baseUrl))
+    ) {
+      return new Response(
+        JSON.stringify({ input_tokens: estimateClaudeRequestTokens(raw, model) }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (!canReplayAnthropicSource(raw, route.modelId, adapterProvider)) {
+      return anthropicErrorResponse(
+        400,
+        "request cannot be replayed exactly to canonical Anthropic",
+        "invalid_request_error",
+      );
+    }
+
+    if (route.provider.authMode === "oauth") {
+      try {
+        if (route.providerName === "anthropic" && isAnthropicAccountPoolEnabled(config)) {
+          const sessionKey = anthropicSessionKeyFromParts({
+            sessionIdHeader: sessionIdHeaderFromRequest(req.headers),
+            threadIdHeader: req.headers.get("thread-id"),
+            promptCacheKey: typeof parsed.options.promptCacheKey === "string"
+              ? parsed.options.promptCacheKey
+              : null,
+            clientThreadId: typeof parsed._clientThreadId === "string"
+              ? parsed._clientThreadId
+              : null,
+            promptCacheKeyIsSharedCohort: translated.cacheKeySource === "system",
+          });
+          const selection = resolveAnthropicAccountForSession(sessionKey, config);
+          if (!selection.accountId) {
+            if (selection.reason === "all-cooled") {
+              const retryAfter = getAnthropicPoolRetryAfterSeconds();
+              const response = anthropicErrorResponse(
+                429,
+                "All Anthropic OAuth accounts are temporarily rate-limited",
+                "rate_limit_error",
+              );
+              if (retryAfter !== null) response.headers.set("Retry-After", String(retryAfter));
+              return response;
+            }
+            return anthropicErrorResponse(
+              401,
+              "No eligible Anthropic OAuth account available",
+              "authentication_error",
+            );
+          }
+          const accessToken = await getAnthropicPoolAccessToken(selection.accountId);
+          bindAnthropicSessionAffinity(sessionKey, selection.accountId);
+          promoteAnthropicActiveAccount(selection.accountId);
+          route.provider = { ...route.provider, apiKey: accessToken };
+        } else {
+          const snapshot = await getValidAccessTokenSnapshot(route.providerName);
+          route.provider = { ...route.provider, apiKey: snapshot.accessToken };
+        }
+      } catch (err) {
+        return anthropicErrorResponse(
+          401,
+          publicOAuthAuthenticationErrorMessage(err),
+          "authentication_error",
+        );
+      }
+      adapterProvider = resolveWireProtocolOverride(
+        route.providerName,
+        route.modelId,
+        route.provider,
+        "anthropic",
+      );
+      adapter = resolveAdapter(adapterProvider, config.cacheRetention);
+    }
+
+    parsed.modelId = route.modelId;
+    if (parsed._rawBody) (parsed._rawBody as { model?: string }).model = route.modelId;
+    let adapterRequest: AdapterRequest | undefined;
+    try {
+      adapterRequest = await adapter.buildRequest(parsed, {
+        headers: new Headers(),
+        translatorBudget,
+        abortSignal: req.signal,
+        anthropicMessagesSource: anthropicSource,
+      });
+      translatorBudget.chargeRetained(
+        new TextEncoder().encode(adapterRequest.body).byteLength,
+        { kind: "request_copies" },
+      );
+    } catch (err) {
+      adapterRequest?.releaseBodyObservation?.();
+      if (req.signal.aborted) {
+        return anthropicErrorResponse(
+          499,
+          "client closed request during Anthropic token count",
+          "api_error",
+        );
+      }
+      const overflow = isTranslatorBudgetExceededError(err);
+      return anthropicErrorResponse(
+        overflow ? 413 : 400,
+        overflow
+          ? "request translation buffer exceeded the safe limit"
+          : err instanceof Error ? err.message : String(err),
+        overflow ? "request_too_large" : "invalid_request_error",
+        overflow ? "translation_buffer_limit" : undefined,
+      );
+    }
+    try {
+      if (
+        adapterRequest.anthropicSourceReplay !== true
+        || !isExactCanonicalAnthropicMessagesUrl(adapterRequest.url)
+      ) {
+        return anthropicErrorResponse(
+          400,
+          "request cannot be replayed exactly to canonical Anthropic",
+          "invalid_request_error",
+        );
+      }
+      const countUrl = new URL(adapterRequest.url);
+      countUrl.pathname = "/v1/messages/count_tokens";
+      const countInit = applyUpstreamRecoveryInit({
+        method: adapterRequest.method,
+        headers: adapterRequest.headers,
+        body: adapterRequest.body,
+      }, "connection-reset");
+      const result = await fetchWithHeaderDeadline(
+        countUrl,
+        countInit,
+        config.connectTimeoutMs ?? 200_000,
+        req.signal,
+        clearableDeadline,
+        providerFetch(route.provider, undefined, {
+          providerName: route.providerName,
+          modelId: route.modelId,
+        }),
+      );
+      if (result.kind === "timeout") {
+        return anthropicErrorResponse(
+          504,
+          "Anthropic token count timed out waiting for response headers",
+          "timeout_error",
+        );
+      }
+      if (result.kind === "error") {
+        if (req.signal.aborted) {
+          return anthropicErrorResponse(
+            499,
+            "client closed request during Anthropic token count",
+            "api_error",
+          );
+        }
+        return anthropicErrorResponse(
+          502,
+          `Anthropic token count failed: ${result.error instanceof Error ? result.error.message : String(result.error)}`,
+          "api_error",
+        );
+      }
+      const upstream = result.upstream;
+      let bodyResult: BoundedPassthroughBytes;
+      try {
+        bodyResult = await readBoundedPassthroughBytes(
+          upstream,
+          resolvePassthroughBodyGuard(config, req.signal),
+        );
+      } catch (err) {
+        return anthropicErrorResponse(
+          502,
+          `Anthropic token count body failed: ${err instanceof Error ? err.message : String(err)}`,
+          "api_error",
+        );
+      }
+      if (bodyResult.kind === "client_cancel") {
+        return anthropicErrorResponse(
+          499,
+          "client closed request during Anthropic token count",
+          "api_error",
+        );
+      }
+      if (bodyResult.kind === "stall") {
+        return anthropicErrorResponse(504, "Anthropic token count body stalled", "timeout_error");
+      }
+      if (bodyResult.kind === "overflow") {
+        return anthropicErrorResponse(
+          502,
+          "Anthropic token count body exceeded safe limit",
+          "api_error",
+        );
+      }
+      const contentType = upstream.headers.get("content-type") ?? "application/json";
+      const retryAfter = upstream.headers.get("retry-after");
+      return new Response(Uint8Array.from(bodyResult.bytes).buffer, {
+        status: upstream.status,
+        statusText: upstream.statusText,
+        headers: {
+          "Content-Type": contentType,
+          ...(retryAfter ? { "Retry-After": retryAfter } : {}),
+        },
+      });
+    } finally {
+      adapterRequest.releaseBodyObservation?.();
+    }
+  } finally {
+    translatorBudget.dispose();
   }
-  const raw = body as Rec;
-  if (typeof raw.model !== "string" || raw.model.length === 0) {
-    return anthropicErrorResponse(400, "model is required");
-  }
-  let model = raw.model;
-  // Case-insensitive [1m] strip (audit 021 #7 — the CLI matches /\[1m\]/i).
-  const stripped = stripOneMillionMarker(model);
-  if (stripped !== model) {
-    model = stripped;
-    raw.model = model;
-  }
-  // ocx-route override (devlog 072): keep count_tokens consistent with messages.
-  const countRoute = extractOcxRouteDirective(raw);
-  if (countRoute) {
-    model = stripOneMillionMarker(countRoute);
-    raw.model = model;
-  }
-  // Fast-only: count_tokens never parsed an effort row, so it must not start. It returns a
-  // token estimate and sends no tier, so only the IDENTITY is corrected - without this the
-  // synthetic id reaches native passthrough as a model Anthropic has never heard of.
-  const countFastRow = parseFastOnlyRowId(
-    config, () => decodeClaudeFastSelector(model, config.claudeCode),
-  );
-  if (countFastRow) {
-    model = countFastRow.baseId;
-    raw.model = model;
-  }
-  captureClaudeInbound("count_tokens", raw, resolveInboundModel(model, config.claudeCode), req.headers.get("anthropic-beta") ?? undefined);
-  if (wantsNativePassthrough(req, config, requestPolicy, model)) {
-    return await anthropicNativePassthrough(req, config, { model, provider: "anthropic-native", surface: "claude" }, undefined, raw, "/v1/messages/count_tokens");
-  }
-  const inputTokens = estimateClaudeRequestTokens(raw, model);
-  return new Response(JSON.stringify({ input_tokens: inputTokens }), {
-    status: 200,
-    headers: { "Content-Type": "application/json" },
-  });
 }

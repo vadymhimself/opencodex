@@ -24,6 +24,7 @@ import {
   isKnownUsageSurface,
   isCodexUsageAccountLogLabel,
   isValidReasoningWireValue,
+  physicalUsageAttempts,
   readRecentUsageEntries,
   usageForFinalLog,
   usageStatusForFinalLog,
@@ -81,6 +82,8 @@ export interface RequestLogContext {
   shadowCallRewrittenFrom?: string;
   /** Internal structural combo identity; omitted from RequestLogEntry/JSONL. */
   comboId?: string;
+  /** True only when combo execution advanced to another configured target. */
+  comboTargetAdvanced?: true;
   requestedEffort?: string;
   effectiveEffort?: string;
   reasoningWireField?: string;
@@ -98,6 +101,8 @@ export interface RequestLogContext {
   /** Internal: client-facing response metadata must not replace the physical routed model. */
   preserveResolvedModelFromRoute?: boolean;
   usage?: OcxUsage;
+  /** Internal: root usage spans multiple physical attempts and must never be assigned to one attempt. */
+  usageIsRequestAggregate?: boolean;
   usageLogInputTokens?: number;
   attempts?: PersistedUsageAttempt[];
   /** Internal mutable final attempt; omitted from RequestLogEntry/JSONL. */
@@ -195,6 +200,8 @@ export interface RequestLogEntry {
   usage?: OcxUsage;
   totalTokens?: number;
   attempts?: PersistedUsageAttempt[];
+  /** True only when combo execution advanced to another configured target. */
+  comboTargetAdvanced?: true;
   /** Codex pool affinity decision for this request (diagnostics for #186). */
   affinity?: "reused" | "new_bind" | "rebound" | "cleared";
   /** Where the upstream terminal/failure was observed. */
@@ -266,11 +273,21 @@ function asCloseReason(value: string | undefined): RequestLogEntry["closeReason"
   }
 }
 
+/** Select the last real upstream attempt that reported a tier outcome. */
+function finalPhysicalTierOutcome(
+  attempts: readonly PersistedUsageAttempt[] | undefined,
+  fallback: AttemptTierOutcome | undefined,
+): AttemptTierOutcome | undefined {
+  return physicalUsageAttempts(attempts ?? []).findLast(attempt => attempt.tierOutcome)?.tierOutcome
+    ?? fallback;
+}
+
 /** Project a persisted usage.jsonl row back into the in-memory /api/logs shape. */
 export function requestLogEntryFromPersistedUsage(entry: PersistedUsageEntry): RequestLogEntry {
   const terminalStatus = asTerminalStatus(entry.terminalStatus);
   const closeReason = asCloseReason(entry.closeReason);
   const routeDecision = normalizeRouteDecisionTraceForLog(entry.routeDecision);
+  const tierOutcome = finalPhysicalTierOutcome(entry.attempts, entry.tierOutcome);
   return {
     requestId: entry.requestId,
     timestamp: entry.timestamp,
@@ -300,7 +317,7 @@ export function requestLogEntryFromPersistedUsage(entry: PersistedUsageEntry): R
       ? { modelSupportsServiceTier: entry.modelSupportsServiceTier }
       : {}),
     ...(entry.responseServiceTier ? { responseServiceTier: entry.responseServiceTier } : {}),
-    ...(entry.tierOutcome ? { tierOutcome: entry.tierOutcome } : {}),
+    ...(tierOutcome ? { tierOutcome } : {}),
     ...(entry.resolvedModel ? { resolvedModel: entry.resolvedModel } : {}),
     status: entry.status,
     durationMs: entry.durationMs,
@@ -312,6 +329,7 @@ export function requestLogEntryFromPersistedUsage(entry: PersistedUsageEntry): R
     ...(entry.usage ? { usage: entry.usage } : {}),
     ...(entry.totalTokens !== undefined ? { totalTokens: entry.totalTokens } : {}),
     ...(entry.attempts !== undefined ? { attempts: entry.attempts } : {}),
+    ...(entry.comboTargetAdvanced === true ? { comboTargetAdvanced: true } : {}),
     ...(routeDecision ? { routeDecision } : {}),
   };
 }
@@ -429,6 +447,7 @@ export function addRequestLog(entry: RequestLogEntry) {
       ...(entry.usage ? { usage: entry.usage } : {}),
       ...(entry.totalTokens !== undefined ? { totalTokens: entry.totalTokens } : {}),
       ...(entry.attempts !== undefined ? { attempts: entry.attempts } : {}),
+      ...(entry.comboTargetAdvanced === true ? { comboTargetAdvanced: true } : {}),
       ...failureDiagnostics,
       ...(entry.routeDecision ? { routeDecision: entry.routeDecision } : {}),
     });
@@ -488,6 +507,10 @@ export function recordAdapterReasoning(
     delete attempt.effectiveEffort;
     delete attempt.reasoningWireField;
     delete attempt.reasoningWireValue;
+    delete attempt.promptCacheTtlMs;
+    if (request.promptCacheTtlMs === 300_000 || request.promptCacheTtlMs === 3_600_000) {
+      attempt.promptCacheTtlMs = request.promptCacheTtlMs;
+    }
   }
   recordAttemptRequestedEffort(logCtx);
 
@@ -875,14 +898,15 @@ function captureTerminalHttpStatus(
     logCtx.terminalHttpStatus = 400;
     return;
   }
-  if (type !== "response.failed" || !responseError || typeof responseError !== "object") return;
-  const responseCode = responseError.code === null || typeof responseError.code === "string"
-    ? responseError.code
+  const terminalError = type === "error" ? json.error : responseError;
+  if (!terminalError || typeof terminalError !== "object") return;
+  const responseCode = terminalError.code === null || typeof terminalError.code === "string"
+    ? terminalError.code
     : undefined;
   logCtx.terminalHttpStatus = httpStatusFromTerminalError({
-    type: typeof responseError.type === "string" ? responseError.type : undefined,
+    type: typeof terminalError.type === "string" ? terminalError.type : undefined,
     code: responseCode,
-    message: typeof responseError.message === "string" ? responseError.message : undefined,
+    message: typeof terminalError.message === "string" ? terminalError.message : undefined,
   });
 }
 
@@ -950,16 +974,20 @@ export function addFinalRequestLog(
     ? "client_cancel"
     : meta?.closeReason;
   if (logCtx.activeAttempt) {
+    const attemptWasOpen = logCtx.activeAttempt.status === 0;
     finishRequestAttempt(
       logCtx.activeAttempt,
       effectiveStatus,
       Date.now() - (logCtx.activeAttemptStartedAt ?? start),
-      logCtx.usage,
+      logCtx.activeAttempt.usage
+        ?? (logCtx.usageIsRequestAggregate ? undefined : logCtx.usage),
     );
     // The final row and its active physical attempt describe the same terminal. Preserve the
     // semantic code on both so detailed attempt telemetry cannot regress to a generic status code.
-    if (errorCode) logCtx.activeAttempt.errorCode = errorCode;
-    else delete logCtx.activeAttempt.errorCode;
+    if (attemptWasOpen) {
+      if (errorCode) logCtx.activeAttempt.errorCode = errorCode;
+      else delete logCtx.activeAttempt.errorCode;
+    }
   }
   const existing = finalizedUsage(
     logCtx.providerAdapter ?? logCtx.provider,
@@ -975,16 +1003,19 @@ export function addFinalRequestLog(
     ...(attempt.tierOutcome ? { tierOutcome: { ...attempt.tierOutcome } } : {}),
   }));
   const isCombo = logCtx.comboId !== undefined && (attempts?.length ?? 0) > 0;
-  const aggregate = isCombo ? aggregateAttemptUsage(attempts ?? []) : null;
-  const loggedUsage = aggregate?.usage ?? existing.usage;
-  const usageStatus = aggregate?.status ?? existing.status;
-  const totalTokens = aggregate?.totalTokens ?? existing.totalTokens;
+  const finalized = attempts === undefined || logCtx.localTerminalReason !== undefined
+    ? existing
+    : aggregateAttemptUsage(attempts);
+  const loggedUsage = finalized.usage;
+  const usageStatus = finalized.status;
+  const totalTokens = finalized.totalTokens;
   // Sanitize at the logging layer, not only at the one call site that populates this today.
   // The value originates in an upstream-supplied model id, so an unsanitized newline would
   // let a single field forge a record boundary in any line-oriented log viewer. Doing it here
   // means a future caller cannot reintroduce the hole by forgetting to sanitize first, and
   // the in-memory /api/logs row matches what usage.jsonl already stores.
   const shadowCallRewrittenFrom = sanitizeLogMetadataString(logCtx.shadowCallRewrittenFrom);
+  const tierOutcome = finalPhysicalTierOutcome(attempts, logCtx.tierOutcome);
   addLog({
     requestId,
     timestamp: start,
@@ -1015,9 +1046,7 @@ export function addFinalRequestLog(
     ...(logCtx.configuredSpeedLabel ? { configuredSpeedLabel: logCtx.configuredSpeedLabel } : {}),
     ...(logCtx.modelSupportsServiceTier !== undefined ? { modelSupportsServiceTier: logCtx.modelSupportsServiceTier } : {}),
     ...(logCtx.responseServiceTier ? { responseServiceTier: logCtx.responseServiceTier } : {}),
-    ...((attempts?.at(-1)?.tierOutcome ?? logCtx.tierOutcome)
-      ? { tierOutcome: attempts?.at(-1)?.tierOutcome ?? { ...logCtx.tierOutcome! } }
-      : {}),
+    ...(tierOutcome ? { tierOutcome } : {}),
     ...(logCtx.resolvedModel ? { resolvedModel: logCtx.resolvedModel } : {}),
     status: effectiveStatus,
     durationMs: Date.now() - start,
@@ -1030,6 +1059,7 @@ export function addFinalRequestLog(
     ...(loggedUsage ? { usage: loggedUsage } : {}),
     ...(totalTokens !== undefined ? { totalTokens } : {}),
     ...(attempts !== undefined ? { attempts } : {}),
+    ...(logCtx.comboTargetAdvanced === true ? { comboTargetAdvanced: true } : {}),
     ...(logCtx.affinity ? { affinity: logCtx.affinity } : {}),
     ...(logCtx.transportPhase ? { transportPhase: logCtx.transportPhase } : {}),
     ...(logCtx.terminalSource ? { terminalSource: logCtx.terminalSource } : {}),
@@ -1210,18 +1240,93 @@ export function sealRequestAttemptIdentity(
   adapter: string,
   accountLogLabel?: string,
 ): void {
-  if (!attempt) return;
+  if (!attempt || attempt.sendCount > 0) return;
   attempt.provider = provider;
   attempt.adapter = adapter;
   if (isCodexUsageAccountLogLabel(accountLogLabel)) attempt.accountLogLabel = accountLogLabel;
+  else delete attempt.accountLogLabel;
+}
+
+/** Keep sent attempt identity immutable; open a new physical attempt when target identity changes. */
+export function transitionRequestAttempt(
+  logCtx: RequestLogContext,
+  identity: {
+    provider: string;
+    model: string;
+    adapter: string;
+    accountLogLabel?: string;
+    forceNew?: boolean;
+  },
+  previousStatus: number,
+  now = Date.now(),
+): PersistedUsageAttempt {
+  const accountLogLabel = isCodexUsageAccountLogLabel(identity.accountLogLabel)
+    ? identity.accountLogLabel
+    : undefined;
+  const current = logCtx.activeAttempt;
+  const applyIdentity = (attempt: PersistedUsageAttempt): void => {
+    attempt.provider = identity.provider;
+    attempt.model = identity.model;
+    attempt.adapter = identity.adapter;
+    if (accountLogLabel) attempt.accountLogLabel = accountLogLabel;
+    else delete attempt.accountLogLabel;
+  };
+  const activate = (): PersistedUsageAttempt => {
+    const ordinal = Math.max(0, ...(logCtx.attempts ?? []).map(attempt => attempt.ordinal)) + 1;
+    const attempt = beginRequestAttempt(
+      ordinal,
+      identity.provider,
+      identity.model,
+      identity.adapter,
+    );
+    applyIdentity(attempt);
+    (logCtx.attempts ??= []).push(attempt);
+    logCtx.activeAttempt = attempt;
+    logCtx.activeAttemptStartedAt = now;
+    return attempt;
+  };
+
+  if (!current) return activate();
+  if (current.sendCount === 0) {
+    applyIdentity(current);
+    return current;
+  }
+  if (
+    !identity.forceNew
+    && current.provider === identity.provider
+    && current.model === identity.model
+    && current.adapter === identity.adapter
+    && current.accountLogLabel === accountLogLabel
+  ) return current;
+
+  finishRequestAttempt(
+    current,
+    previousStatus,
+    now - (logCtx.activeAttemptStartedAt ?? now),
+    current.usage,
+  );
+  delete logCtx.activeTierMetadata;
+  delete logCtx.tierOutcome;
+  delete logCtx.usage;
+  delete logCtx.usageIsRequestAggregate;
+  delete logCtx.usageLogInputTokens;
+  delete logCtx.usageFromBridge;
+  return activate();
 }
 
 export function noteAttemptSend(
   attempt: PersistedUsageAttempt | undefined,
   inputTokenEstimate: number | undefined,
   recovery?: AttemptRecoveryKind,
+  now = performance.timeOrigin + performance.now(),
 ): void {
   if (!attempt) return;
+  if (attempt.status !== 0) {
+    attempt.status = 0;
+    attempt.durationMs = 0;
+    delete attempt.errorCode;
+  }
+  if (attempt.sendCount === 0 && Number.isFinite(now) && now >= 0) attempt.firstSendAt = now;
   attempt.sendCount += 1;
   if (typeof inputTokenEstimate === "number"
     && Number.isFinite(inputTokenEstimate)
@@ -1233,8 +1338,9 @@ export function noteAttemptSend(
       contextWindowForModel(attempt.adapter, attempt.model),
     );
   }
-  if (recovery && !attempt.recoveryKinds.includes(recovery)) {
-    attempt.recoveryKinds.push(recovery);
+  if (recovery) {
+    attempt.recoveryCount = (attempt.recoveryCount ?? 0) + 1;
+    if (!attempt.recoveryKinds.includes(recovery)) attempt.recoveryKinds.push(recovery);
   }
 }
 
@@ -1244,6 +1350,7 @@ export function finishRequestAttempt(
   durationMs: number,
   usage?: OcxUsage,
 ): PersistedUsageAttempt {
+  if (attempt.status !== 0) return attempt;
   const finalized = finalizedUsage(
     attempt.adapter,
     usage ?? attempt.usage,
@@ -1267,35 +1374,56 @@ export function finishRequestAttempt(
 export function aggregateAttemptUsage(
   attempts: readonly PersistedUsageAttempt[],
 ): FinalizedUsageResult {
-  const status: UsageStatus = attempts.length > 0
-    && attempts.every(attempt => attempt.usageStatus === "unsupported")
+  const physicalAttempts = physicalUsageAttempts(attempts);
+  const status: UsageStatus = physicalAttempts.length > 0
+    && physicalAttempts.every(attempt => attempt.usageStatus === "unsupported")
     ? "unsupported"
-    : attempts.some(attempt => (
+    : physicalAttempts.some(attempt => (
         attempt.usageStatus === "unreported" || attempt.usageStatus === "unsupported"
       ))
       ? "unreported"
-      : attempts.some(attempt => attempt.usageStatus === "estimated")
+      : physicalAttempts.some(attempt => attempt.usageStatus === "estimated")
         ? "estimated"
-        : attempts.length > 0
+        : physicalAttempts.length > 0
           ? "reported"
           : "unreported";
 
-  const usages = attempts.flatMap(attempt => attempt.usage ? [attempt.usage] : []);
+  const usages = physicalAttempts.flatMap(attempt => attempt.usage ? [attempt.usage] : []);
   if (usages.length === 0) return { status };
 
   const sumOptional = (
-    key: "cachedInputTokens" | "cacheReadInputTokens" | "cacheCreationInputTokens"
-      | "reasoningOutputTokens",
+    key: "cacheCreationInputTokens" | "reasoningOutputTokens",
   ): number | undefined => {
     const present = usages.flatMap(usage => (
       typeof usage[key] === "number" ? [usage[key] as number] : []
     ));
     return present.length > 0 ? present.reduce((sum, value) => sum + value, 0) : undefined;
   };
-  const cachedInputTokens = sumOptional("cachedInputTokens");
-  const cacheReadInputTokens = sumOptional("cacheReadInputTokens");
+  const cacheReads = usages.flatMap(usage => {
+    const read = usage.cacheReadInputTokens ?? usage.cachedInputTokens;
+    return typeof read === "number" ? [read] : [];
+  });
+  const cacheReadInputTokens = cacheReads.length > 0
+    ? cacheReads.reduce((sum, value) => sum + value, 0)
+    : undefined;
   const cacheCreationInputTokens = sumOptional("cacheCreationInputTokens");
   const reasoningOutputTokens = sumOptional("reasoningOutputTokens");
+  const contextTotals = usages.flatMap(usage => (
+    typeof usage.contextTotalTokens === "number"
+      && Number.isFinite(usage.contextTotalTokens)
+      && usage.contextTotalTokens >= 0
+      ? [usage.contextTotalTokens]
+      : []
+  ));
+  const contextTotalTokens = contextTotals.at(-1);
+  const anthropicServerToolUse: Record<string, number> = {};
+  for (const usage of usages) {
+    for (const [name, value] of Object.entries(usage.anthropicServerToolUse ?? {})) {
+      if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+        anthropicServerToolUse[name] = (anthropicServerToolUse[name] ?? 0) + value;
+      }
+    }
+  }
   const totalTokens = usages.reduce(
     (sum, usage) => sum + (usageTotalTokens(usage) ?? 0),
     0,
@@ -1304,10 +1432,13 @@ export function aggregateAttemptUsage(
     inputTokens: usages.reduce((sum, usage) => sum + usage.inputTokens, 0),
     outputTokens: usages.reduce((sum, usage) => sum + usage.outputTokens, 0),
     totalTokens,
-    ...(cachedInputTokens !== undefined ? { cachedInputTokens } : {}),
-    ...(cacheReadInputTokens !== undefined ? { cacheReadInputTokens } : {}),
+    ...(cacheReadInputTokens !== undefined
+      ? { cachedInputTokens: cacheReadInputTokens, cacheReadInputTokens }
+      : {}),
     ...(cacheCreationInputTokens !== undefined ? { cacheCreationInputTokens } : {}),
     ...(reasoningOutputTokens !== undefined ? { reasoningOutputTokens } : {}),
+    ...(contextTotalTokens !== undefined ? { contextTotalTokens } : {}),
+    ...(Object.keys(anthropicServerToolUse).length > 0 ? { anthropicServerToolUse } : {}),
     ...(status === "estimated" ? { estimated: true } : {}),
   };
   return { usage: aggregate, status, totalTokens };

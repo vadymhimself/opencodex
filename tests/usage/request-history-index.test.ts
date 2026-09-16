@@ -17,19 +17,21 @@ import {
   appendUsageEntry,
   resetUsageReadCacheForTests,
   usageLogPath,
+  type PersistedUsageAttempt,
   type PersistedUsageEntry,
 } from "../../src/usage/log";
 import {
   closeRequestHistoryIndex,
   queryRequestHistory,
   rebuildRequestHistoryIndex,
+  requestHistoryDb,
   requestHistoryRowById,
   REQUEST_HISTORY_MAX_RECORD_BYTES,
   REQUEST_HISTORY_MAX_PAGE_SIZE,
   REQUEST_HISTORY_READ_CHUNK_BYTES,
 } from "../../src/routing/history/indexer";
 import { InvalidCursorError } from "../../src/routing/history/cursor";
-import { HISTORY_DB_FILENAME } from "../../src/routing/history/schema";
+import { HISTORY_DB_FILENAME, HISTORY_SCHEMA_VERSION } from "../../src/routing/history/schema";
 import { getConfigDir } from "../../src/config";
 import type { OcxConfig } from "../../src/types";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
@@ -102,7 +104,7 @@ describe("request-history index (RI-02)", () => {
     expect(page.rows).toEqual([]);
     expect(page.hasMore).toBe(false);
     expect(page.meta.indexedRows).toBe(0);
-    expect(page.meta.schemaVersion).toBe(1);
+    expect(page.meta.schemaVersion).toBe(HISTORY_SCHEMA_VERSION);
     expect(existsSync(join(getConfigDir(), HISTORY_DB_FILENAME))).toBe(true);
   });
 
@@ -202,7 +204,7 @@ describe("request-history index (RI-02)", () => {
     db.close();
     const page = await queryRequestHistory({}, undefined, 10);
     expect(page.rows.length).toBe(4);
-    expect(page.meta.schemaVersion).toBe(1);
+    expect(page.meta.schemaVersion).toBe(HISTORY_SCHEMA_VERSION);
   });
 
   test("partial final JSONL line is skipped until it completes", async () => {
@@ -300,6 +302,57 @@ describe("request-history index (RI-02)", () => {
     expect(byRange.rows.map(row => row.requestId)).toEqual(["f2"]);
   });
 
+  test("fallback and attempt count use only distinct physical attempts", async () => {
+    const attempt = (ordinal: number, overrides: Partial<PersistedUsageAttempt> = {}): PersistedUsageAttempt => ({
+      ordinal,
+      provider: "a",
+      model: "m1",
+      adapter: "openai-chat",
+      status: 200,
+      durationMs: 5,
+      sendCount: 1,
+      recoveryKinds: [],
+      usageStatus: "reported",
+      ...overrides,
+    });
+    appendUsageEntry(entry("attempts-absent", 1000));
+    appendUsageEntry(entry("attempts-empty", 1001, "a", "m1", { attempts: [] }));
+    appendUsageEntry(entry("attempts-nonphysical", 1002, "a", "m1", {
+      attempts: [attempt(1, { sendCount: 0 }), attempt(2, { locallyAnswered: true })],
+    }));
+    appendUsageEntry(entry("attempts-duplicate", 1003, "a", "m1", {
+      attempts: [attempt(1), attempt(1, { provider: "duplicate" })],
+    }));
+    appendFileSync(usageLogPath(), `${JSON.stringify(entry("attempts-fallback", 1004, "a", "m1", {
+      attempts: [
+        attempt(1, { sendCount: 0 }),
+        attempt(1),
+        attempt(2),
+        attempt(2, { provider: "duplicate" }),
+      ],
+    }))}\n`, "utf-8");
+    appendFileSync(usageLogPath(), `${JSON.stringify(entry("attempts-invalid", 1005, "a", "m1", {
+      attempts: [
+        { ordinal: 1, provider: "a", model: "m1", status: 503, durationMs: 5 },
+        { ordinal: 2, provider: "b", model: "m2", status: 200, durationMs: 5 },
+      ] as PersistedUsageAttempt[],
+    }))}\n`, "utf-8");
+
+    const fallback = await queryRequestHistory({ fallback: true }, undefined, 10);
+    expect(fallback.rows.map(row => row.requestId)).toEqual(["attempts-fallback"]);
+    const counts = requestHistoryDb().query(
+      "SELECT request_id, attempt_count FROM requests ORDER BY request_id",
+    ).all() as Array<{ request_id: string; attempt_count: number }>;
+    expect(counts).toEqual([
+      { request_id: "attempts-absent", attempt_count: 1 },
+      { request_id: "attempts-duplicate", attempt_count: 1 },
+      { request_id: "attempts-empty", attempt_count: 0 },
+      { request_id: "attempts-fallback", attempt_count: 2 },
+      { request_id: "attempts-invalid", attempt_count: 0 },
+      { request_id: "attempts-nonphysical", attempt_count: 0 },
+    ]);
+  });
+
   test("row-by-id returns the canonical entry and unknown ids 404 through the API", async () => {
     appendUsageEntry(entry("target-id", 1234));
     const row = await requestHistoryRowById("target-id");
@@ -331,7 +384,7 @@ describe("request-history index (RI-02)", () => {
     expect(body.entries.length).toBe(2);
     expect(body.hasMore).toBe(true);
     expect(typeof body.nextCursor).toBe("string");
-    expect(body.index.schemaVersion).toBe(1);
+    expect(body.index.schemaVersion).toBe(HISTORY_SCHEMA_VERSION);
     expect(body.index.indexedRows).toBe(5);
   });
 

@@ -47,6 +47,7 @@ import {
   noteAttemptSend,
   recordFirstOutput,
   sealRequestAttemptIdentity,
+  transitionRequestAttempt,
   type RequestLogContext,
 } from "./request-log";
 import { jsonCompletionSse, nativeChatSse, structuredError, usageFromChat } from "./chat-native-sse";
@@ -214,6 +215,7 @@ export async function handleNativeChatCompletions(options: HandleNativeChatOptio
   const transientSendAvailable = (): boolean => remainingTransientSends() > 0;
 
   const send = async (request: AdapterRequest, recovery?: "rate-limit-429" | "key-429"): Promise<Response> => {
+    let credentialTransitionPending = recovery === "key-429";
     try {
       // #2643: opted-in key-auth openai-chat providers retry pre-stream transient statuses on
       // the native chat lane too; everyone else keeps reset-only semantics.
@@ -224,7 +226,6 @@ export async function handleNativeChatCompletions(options: HandleNativeChatOptio
       const fetchWithPolicy = requestTransientPolicy ? fetchWithTransientRetry : fetchWithResetRetry;
       return await fetchWithPolicy(
         (transportRecovery?: UpstreamSendRecovery) => {
-          noteAttemptSend(attempt, logCtx.usageLogInputTokens, transportRecovery ?? recovery);
           return fetchWithHeaderTimeout(
             request.url,
             applyUpstreamRecoveryInit({
@@ -238,6 +239,27 @@ export async function handleNativeChatCompletions(options: HandleNativeChatOptio
             providerFetch(activeProvider, undefined, {
               providerName: route.providerName,
               modelId: route.modelId,
+              onTransportDispatch: () => {
+                if (credentialTransitionPending) {
+                  transitionRequestAttempt(
+                    logCtx,
+                    {
+                      provider: route.providerName,
+                      model: route.modelId,
+                      adapter: "openai-chat",
+                      accountLogLabel: logCtx.accountLogLabel,
+                      forceNew: true,
+                    },
+                    429,
+                  );
+                  credentialTransitionPending = false;
+                }
+                noteAttemptSend(
+                  logCtx.activeAttempt,
+                  logCtx.usageLogInputTokens,
+                  transportRecovery ?? recovery,
+                );
+              },
             }),
           );
         },
@@ -385,7 +407,7 @@ export async function handleNativeChatCompletions(options: HandleNativeChatOptio
       onFirstOutput: logIds ? () => recordFirstOutput(logCtx, logIds.start) : undefined,
       onUsage: usage => {
         logCtx.usage = usage;
-        attempt.usage = usage;
+        if (logCtx.activeAttempt) logCtx.activeAttempt.usage = usage;
       },
       ...(requestedStream ? {
         onTerminal: (status: number, message?: string) => {
@@ -464,7 +486,7 @@ export async function handleNativeChatCompletions(options: HandleNativeChatOptio
   const usage = usageFromChat(completion.usage);
   if (usage) {
     logCtx.usage = usage;
-    attempt.usage = usage;
+    if (logCtx.activeAttempt) logCtx.activeAttempt.usage = usage;
   }
   if (logIds) recordFirstOutput(logCtx, logIds.start);
   finishLog(200);

@@ -2008,6 +2008,7 @@ export function createKiroAdapter(provider: OcxProviderConfig): ProviderAdapter 
   let requestSnapshot: OcxParsedRequest | undefined;
   let firstRequestBodyBytes = 0;
   let requestAbortSignal: AbortSignal | undefined;
+  let requestFetchContext: AdapterFetchContext | undefined;
 
   const build = async (
     parsed: OcxParsedRequest,
@@ -2150,7 +2151,9 @@ export function createKiroAdapter(provider: OcxProviderConfig): ProviderAdapter 
       retryBodyReservation.commitRetained();
       retryBodyRetained = true;
       budget.releaseRetained(retryBodyUpperBound - retryBodyBytes, { kind: "request_copies" });
+      requestFetchContext?.onRetry?.("adapter-retry");
       const response = await fetchKiroWithRetry(retry.request, {
+        ...requestFetchContext,
         abortSignal: requestAbortSignal,
         returnRawErrors: true,
         stream: true,
@@ -2223,6 +2226,7 @@ export function createKiroAdapter(provider: OcxProviderConfig): ProviderAdapter 
       // The normal Responses path supplies cancellation at fetch time rather than build time.
       // Keep it for the adapter-owned bounded continuation so cancelling the client turn aborts
       // both the first Kiro request and its one allowed completion retry.
+      requestFetchContext = ctx;
       if (ctx?.abortSignal) requestAbortSignal = ctx.abortSignal;
       return fetchKiroWithRetry(request, ctx);
     },

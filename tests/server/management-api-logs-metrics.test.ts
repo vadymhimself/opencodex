@@ -202,6 +202,26 @@ describe("GET /api/logs display metrics", () => {
     expect(dto!.displayMetrics.cost).toEqual({ kind: "unavailable", reason: "usage_missing" });
   });
 
+  test("unmeasured counters are unavailable for both metrics", async () => {
+    for (const usageStatus of ["unreported", "unsupported"] as const) {
+      addRequestLog(baseEntry({
+        requestId: usageStatus,
+        usageStatus,
+        usage: { inputTokens: 100, outputTokens: 10 },
+      }));
+    }
+    const logs = await readLogs();
+    const byStatus = new Map(logs.map(row => [row.usageStatus, row]));
+    expect(byStatus.get("unreported")!.displayMetrics).toEqual({
+      tokPerSecond: { kind: "unavailable", reason: "usage_missing" },
+      cost: { kind: "unavailable", reason: "usage_missing" },
+    });
+    expect(byStatus.get("unsupported")!.displayMetrics).toEqual({
+      tokPerSecond: { kind: "unavailable", reason: "usage_unsupported" },
+      cost: { kind: "unavailable", reason: "usage_unsupported" },
+    });
+  });
+
   test("zero output is output_missing, not 0 tok/s", async () => {
     addRequestLog(baseEntry({ usage: { inputTokens: 100, outputTokens: 0 } }));
     const [dto] = await readLogs();
@@ -246,6 +266,125 @@ describe("GET /api/logs display metrics", () => {
     expect(dto!.attempts[0].displayMetrics.cost.kind).toBe("value");
     expect(dto!.attempts[0].displayMetrics.tokPerSecond.kind).toBe("value");
     expect(dto!.attempts[1].displayMetrics.cost).toEqual({ kind: "unavailable", reason: "price_unmatched" });
+  });
+
+  test("partial combo keeps measured attempt metrics without pricing unreported counters", async () => {
+    addRequestLog(baseEntry({
+      provider: "combo",
+      model: "combo/my-combo",
+      usageStatus: "unreported",
+      usage: { inputTokens: 200, outputTokens: 20 },
+      attempts: [
+        {
+          ordinal: 1,
+          provider: "anthropic",
+          model: "claude-3-haiku-20240307",
+          adapter: "anthropic",
+          status: 429,
+          durationMs: 900,
+          sendCount: 1,
+          recoveryKinds: [],
+          usageStatus: "reported",
+          usage: { inputTokens: 100, outputTokens: 10 },
+        },
+        {
+          ordinal: 2,
+          provider: "anthropic",
+          model: "claude-3-haiku-20240307",
+          adapter: "anthropic",
+          status: 200,
+          durationMs: 1100,
+          sendCount: 1,
+          recoveryKinds: [],
+          usageStatus: "unreported",
+          usage: { inputTokens: 100, outputTokens: 10 },
+        },
+      ],
+    }));
+    const [dto] = await readLogs();
+    expect(dto!.displayMetrics.tokPerSecond).toEqual({ kind: "unavailable", reason: "usage_missing" });
+    expect(dto!.displayMetrics.cost).toEqual({ kind: "unavailable", reason: "combo_attempt_unavailable" });
+    expect(dto!.attempts[0].displayMetrics.cost.kind).toBe("value");
+    expect(dto!.attempts[0].displayMetrics.tokPerSecond.kind).toBe("value");
+    expect(dto!.attempts[1].displayMetrics.cost).toEqual({ kind: "unavailable", reason: "usage_missing" });
+    expect(dto!.attempts[1].displayMetrics.tokPerSecond).toEqual({ kind: "unavailable", reason: "usage_missing" });
+  });
+
+  test("aggregate cost excludes local, unsent, and duplicate attempts", async () => {
+    const physical = {
+      ordinal: 1,
+      provider: "anthropic",
+      model: "claude-3-haiku-20240307",
+      adapter: "anthropic" as const,
+      status: 200,
+      durationMs: 900,
+      sendCount: 1,
+      recoveryKinds: [],
+      usageStatus: "reported" as const,
+      usage: { inputTokens: 100, outputTokens: 10 },
+    };
+    addRequestLog(baseEntry({
+      provider: "combo",
+      model: "combo/my-combo",
+      usage: { inputTokens: 999, outputTokens: 999 },
+      attempts: [
+        physical,
+        { ...physical, ordinal: 2, provider: "local-only", locallyAnswered: true },
+        { ...physical, ordinal: 3, provider: "unsent", sendCount: 0 },
+        { ...physical, provider: "duplicate" },
+      ],
+    }));
+
+    const [dto] = await readLogs();
+    expect(dto!.attempts).toHaveLength(4);
+    expect(dto!.displayMetrics.cost.kind).toBe("value");
+    expect(dto!.displayMetrics.cost.estimate.cost.total)
+      .toBe(dto!.attempts[0].displayMetrics.cost.estimate.cost.total);
+  });
+
+  test("uses legacy root usage to price its final physical attempt", async () => {
+    addRequestLog(baseEntry({
+      provider: "combo",
+      model: "combo/my-combo",
+      usage: { inputTokens: 100, outputTokens: 10 },
+      attempts: [{
+        ordinal: 1,
+        provider: "anthropic",
+        model: "claude-3-haiku-20240307",
+        adapter: "anthropic",
+        status: 200,
+        durationMs: 900,
+        sendCount: 1,
+        recoveryKinds: [],
+        usageStatus: "unreported",
+      }],
+    }));
+
+    const [dto] = await readLogs();
+    expect(dto!.displayMetrics.cost.kind).toBe("value");
+    expect(dto!.displayMetrics.cost.estimate.attempts).toHaveLength(1);
+  });
+
+  test("explicit all-nonphysical attempts do not reuse stale root cost", async () => {
+    const nonphysical = {
+      ordinal: 1,
+      provider: "anthropic",
+      model: "claude-3-haiku-20240307",
+      adapter: "anthropic" as const,
+      status: 200,
+      durationMs: 900,
+      sendCount: 0,
+      recoveryKinds: [],
+      usageStatus: "reported" as const,
+      usage: { inputTokens: 100, outputTokens: 10 },
+    };
+    addRequestLog(baseEntry({
+      usage: { inputTokens: 10_000, outputTokens: 1_000 },
+      attempts: [nonphysical, { ...nonphysical, ordinal: 2, sendCount: 1, locallyAnswered: true }],
+    }));
+
+    const [dto] = await readLogs();
+    expect(dto!.displayMetrics.cost).toEqual({ kind: "unavailable", reason: "usage_missing" });
   });
 
   test("legacy recoverable cache row is priced, not invalid_cache_breakdown", async () => {

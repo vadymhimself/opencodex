@@ -79,6 +79,7 @@ export async function* decodeServerSentEvents(
   let lineBuffer = "";
   let lineRawBytes = 0;
   let lineRetainedBytes = 0;
+  let skipLfAfterCr = false;
   let event: string | undefined;
   let eventBytes = 0;
   let dataLines: string[] = [];
@@ -183,8 +184,8 @@ export async function* decodeServerSentEvents(
   };
 
   const acceptLine = (): { record: ServerSentEvent | SseRecord; bytes: number } | undefined => {
-    let line = lineBuffer;
-    let retainedLineBytes = lineRetainedBytes;
+    const line = lineBuffer;
+    const retainedLineBytes = lineRetainedBytes;
     let lineOwned = true;
     const releaseLine = (): void => {
       if (!lineOwned) return;
@@ -195,20 +196,6 @@ export async function* decodeServerSentEvents(
     lineRawBytes = 0;
     lineRetainedBytes = 0;
     try {
-      if (line.endsWith("\r")) {
-        const nextLineBytes = retainedLineBytes - 1;
-        const reservation = translatorBudget.reserveTransient(nextLineBytes, scope);
-        try {
-          const nextLine = line.slice(0, -1);
-          reservation.commitRetained();
-          translatorBudget.releaseRetained(retainedLineBytes, scope);
-          line = nextLine;
-          retainedLineBytes = nextLineBytes;
-        } catch (error) {
-          reservation.release();
-          throw error;
-        }
-      }
       if (line === "") {
         releaseLine();
         return dispatch();
@@ -296,13 +283,22 @@ export async function* decodeServerSentEvents(
     decoded: string,
   ): AsyncGenerator<ServerSentEvent | SseRecord> {
     let offset = 0;
+    if (skipLfAfterCr && decoded.length > 0) {
+      skipLfAfterCr = false;
+      if (decoded.charCodeAt(0) === 10) offset = 1;
+    }
     while (offset < decoded.length) {
-      const newline = decoded.indexOf("\n", offset);
-      if (newline < 0) {
+      let lineEnd = offset;
+      while (lineEnd < decoded.length) {
+        const code = decoded.charCodeAt(lineEnd);
+        if (code === 10 || code === 13) break;
+        lineEnd += 1;
+      }
+      if (lineEnd >= decoded.length) {
         appendLine(decoded, offset, decoded.length);
         return;
       }
-      appendLine(decoded, offset, newline);
+      appendLine(decoded, offset, lineEnd);
       const accepted = acceptLine();
       if (accepted) {
         try {
@@ -311,7 +307,12 @@ export async function* decodeServerSentEvents(
           translatorBudget.releaseRetained(accepted.bytes, scope);
         }
       }
-      offset = newline + 1;
+      if (decoded.charCodeAt(lineEnd) === 13) {
+        if (lineEnd + 1 >= decoded.length) skipLfAfterCr = true;
+        offset = lineEnd + (decoded.charCodeAt(lineEnd + 1) === 10 ? 2 : 1);
+      } else {
+        offset = lineEnd + 1;
+      }
     }
   };
 

@@ -14,11 +14,12 @@ interface ExchangeOptions {
   sseFallback: typeof globalThis.fetch;
   onQuota?: CodexWsQuotaObserver;
   beforeDispatch?: (headers: Headers) => void;
+  onTransportDispatch?: (headers: Headers) => void;
 }
 
 /** The sole SSE exchange state machine for both one-shot and retained sockets. */
 export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
-  const { session, url, init, prepared, sseFallback, onQuota, beforeDispatch } = options;
+  const { session, url, init, prepared, sseFallback, onQuota, beforeDispatch, onTransportDispatch } = options;
   const { frameText, headers } = prepared;
   const signal = init.signal ?? undefined;
   return new Promise<Response>((resolve, reject) => {
@@ -125,7 +126,6 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
         return;
       }
       if (terminal || settledPreOpen || signal?.aborted) return;
-      sent = true;
       try {
         ws.send(frameText);
       } catch {
@@ -139,10 +139,16 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
         // (instead of erroring a synthetic 200 body) keeps the pre-stream
         // HTTP error/refresh/failover machinery in charge.
         settledPreOpen = true;
-        sent = false;
         cleanup();
         session.dispose();
         resolve(sseFallback(url, init));
+        return;
+      }
+      sent = true;
+      try {
+        onTransportDispatch?.(new Headers(headers));
+      } catch (error) {
+        failStream(error);
         return;
       }
       if (!metadata) commitResponse();

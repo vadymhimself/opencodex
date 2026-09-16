@@ -22,6 +22,7 @@ import {
   recordFirstOutput,
   requestLogEntryFromPersistedUsage,
   sealRequestAttemptIdentity,
+  transitionRequestAttempt,
   type RequestLogContext,
 } from "../../src/server/request-log";
 import { handleResponses } from "../../src/server/responses";
@@ -164,6 +165,28 @@ describe("request log metadata", () => {
     expect(logCtx.reasoningWireValue).not.toContain("redaction-fixture");
     expect(attempt.effectiveEffort).not.toContain("redaction-fixture");
     expect(attempt.reasoningWireValue).not.toContain("redaction-fixture");
+  });
+
+  test("records only valid adapter prompt-cache TTL metadata on the active attempt", () => {
+    const attempt = beginRequestAttempt(1, "anthropic", "claude-opus-5", "anthropic");
+    const logCtx: RequestLogContext = {
+      model: "claude-opus-5",
+      provider: "anthropic",
+      activeAttempt: attempt,
+    };
+    const request = {
+      url: "https://api.anthropic.com/v1/messages",
+      method: "POST",
+      headers: {},
+      body: "{}",
+      promptCacheTtlMs: 3_600_000,
+    };
+
+    recordAdapterReasoning(logCtx, request as never);
+    expect((attempt as unknown as { promptCacheTtlMs?: number }).promptCacheTtlMs).toBe(3_600_000);
+
+    recordAdapterReasoning(logCtx, { ...request, promptCacheTtlMs: -1 } as never);
+    expect((attempt as unknown as { promptCacheTtlMs?: number }).promptCacheTtlMs).toBeUndefined();
   });
 
   test("malformed adapter reasoning metadata never interrupts request logging", () => {
@@ -356,46 +379,101 @@ describe("request log metadata", () => {
     }
   });
 
-  test("records ordered attempts with sealed identity, fresh estimates, and deduplicated recoveries", () => {
+  test("captures first physical send time once across retries", () => {
+    const attempt = beginRequestAttempt(1, "anthropic", "claude-opus-5", "anthropic");
+
+    noteAttemptSend(attempt, undefined, undefined, 123.25);
+    noteAttemptSend(attempt, undefined, "transient-5xx", 456.5);
+
+    expect(attempt.firstSendAt).toBe(123.25);
+    expect(attempt.sendCount).toBe(2);
+  });
+
+  test("keeps sent attempt identity immutable and splits physical account changes", () => {
     const a = beginRequestAttempt(1, "provisional-a", "model-a", "openai-chat");
+    sealRequestAttemptIdentity(a, "chatgpt-pabcdef", "openai-responses", "pabcdef");
+    expect(a).toMatchObject({
+      provider: "chatgpt-pabcdef",
+      accountLogLabel: "pabcdef",
+      adapter: "openai-responses",
+    });
     noteAttemptSend(a, 100);
     noteAttemptSend(a, 120, "transient-5xx");
     noteAttemptSend(a, 120, "transient-5xx");
-    sealRequestAttemptIdentity(a, "chatgpt-pabcdef", "openai-responses", "pabcdef");
-    finishRequestAttempt(a, 503, 12);
+    a.usage = { inputTokens: 7, outputTokens: 1 };
+    sealRequestAttemptIdentity(a, "chatgpt-p123456", "openai-chat", "p123456");
+    expect(a).toMatchObject({
+      provider: "chatgpt-pabcdef",
+      accountLogLabel: "pabcdef",
+      adapter: "openai-responses",
+    });
 
-    const b = beginRequestAttempt(2, "prov-b", "model-b", "openai-chat");
+    const logCtx: RequestLogContext = {
+      model: "model-a",
+      provider: "chatgpt-p123456",
+      accountLogLabel: "p123456",
+      attempts: [a],
+      activeAttempt: a,
+      activeAttemptStartedAt: 100,
+      usage: { inputTokens: 7, outputTokens: 1 },
+      usageFromBridge: true,
+    };
+    expect(transitionRequestAttempt(logCtx, {
+      provider: "chatgpt-pabcdef",
+      model: "model-a",
+      adapter: "openai-responses",
+      accountLogLabel: "pabcdef",
+    }, 429, 110)).toBe(a);
+
+    const b = transitionRequestAttempt(logCtx, {
+      provider: "chatgpt-p123456",
+      model: "model-a",
+      adapter: "openai-responses",
+      accountLogLabel: "p123456",
+    }, 429, 112);
+    expect(a).toMatchObject({
+      ordinal: 1,
+      status: 429,
+      durationMs: 12,
+      sendCount: 3,
+      inputTokenEstimate: 120,
+      recoveryKinds: ["transient-5xx"],
+      recoveryCount: 2,
+      usageStatus: "estimated",
+      usage: { inputTokens: 120, outputTokens: 1, estimated: true },
+      totalTokens: 121,
+      errorCode: "rate_limit_exceeded",
+    });
+    expect(b).toMatchObject({
+      ordinal: 2,
+      provider: "chatgpt-p123456",
+      model: "model-a",
+      adapter: "openai-responses",
+      accountLogLabel: "p123456",
+      sendCount: 0,
+    });
+    expect(logCtx).toMatchObject({
+      activeAttempt: b,
+      activeAttemptStartedAt: 112,
+      attempts: [a, b],
+    });
+    expect(logCtx.usage).toBeUndefined();
+    expect(logCtx.usageFromBridge).toBeUndefined();
+
     noteAttemptSend(b, undefined);
     finishRequestAttempt(b, 200, 8, {
       inputTokens: 10,
       outputTokens: 2,
-      cachedInputTokens: 4,
+      cachedInputTokens: 9,
       cacheReadInputTokens: 4,
     });
-
-    expect(a).toMatchObject({
-      ordinal: 1,
-      provider: "chatgpt-pabcdef",
-      accountLogLabel: "pabcdef",
-      adapter: "openai-responses",
-      status: 503,
-      sendCount: 3,
-      inputTokenEstimate: 120,
-      recoveryKinds: ["transient-5xx"],
-      usageStatus: "estimated",
-      usage: { inputTokens: 120, outputTokens: 0, estimated: true },
-      totalTokens: 120,
-      errorCode: "server_is_overloaded",
-    });
-    expect(b).toMatchObject({ status: 200, sendCount: 1, usageStatus: "reported", totalTokens: 12 });
-
     expect(aggregateAttemptUsage([a, b])).toEqual({
       status: "estimated",
-      totalTokens: 132,
+      totalTokens: 133,
       usage: {
         inputTokens: 130,
-        outputTokens: 2,
-        totalTokens: 132,
+        outputTokens: 3,
+        totalTokens: 133,
         cachedInputTokens: 4,
         cacheReadInputTokens: 4,
         estimated: true,
@@ -403,15 +481,279 @@ describe("request log metadata", () => {
     });
   });
 
+  test("updates provisional attempt identity and clears stale account label", () => {
+    const attempt = beginRequestAttempt(4, "old", "old-model", "openai-chat");
+    attempt.accountLogLabel = "pold";
+    const logCtx: RequestLogContext = {
+      model: "new-model",
+      provider: "new",
+      attempts: [attempt],
+      activeAttempt: attempt,
+      activeAttemptStartedAt: 1,
+    };
+
+    expect(transitionRequestAttempt(logCtx, {
+      provider: "new",
+      model: "new-model",
+      adapter: "anthropic",
+    }, 0, 2)).toBe(attempt);
+    expect(attempt).toMatchObject({
+      ordinal: 4,
+      provider: "new",
+      model: "new-model",
+      adapter: "anthropic",
+      sendCount: 0,
+    });
+    expect(attempt.accountLogLabel).toBeUndefined();
+    expect(logCtx.attempts).toEqual([attempt]);
+  });
+
+  test("keeps the latest context checkpoint while adding server tool counters", () => {
+    const first = beginRequestAttempt(1, "a", "m1", "anthropic");
+    noteAttemptSend(first, undefined);
+    finishRequestAttempt(
+      first,
+      429,
+      1,
+      {
+        inputTokens: 10,
+        outputTokens: 1,
+        contextTotalTokens: 90,
+        anthropicServerToolUse: { web_search_requests: 1 },
+      },
+    );
+    const second = beginRequestAttempt(2, "a", "m1", "anthropic");
+    noteAttemptSend(second, undefined);
+    finishRequestAttempt(
+      second,
+      200,
+      1,
+      {
+        inputTokens: 12,
+        outputTokens: 2,
+        contextTotalTokens: 80,
+        anthropicServerToolUse: { web_search_requests: 2, web_fetch_requests: 1 },
+      },
+    );
+
+    expect(aggregateAttemptUsage([first, second])).toMatchObject({
+      usage: {
+        inputTokens: 22,
+        outputTokens: 3,
+        contextTotalTokens: 80,
+        anthropicServerToolUse: { web_search_requests: 3, web_fetch_requests: 1 },
+      },
+    });
+  });
+
+  test("explicit attempts do not reuse stale root usage when no physical usage survives", () => {
+    const local = beginRequestAttempt(1, "local", "m1", "anthropic");
+    local.locallyAnswered = true;
+    finishRequestAttempt(local, 200, 1, { inputTokens: 30, outputTokens: 3 });
+    const unsent = finishRequestAttempt(
+      beginRequestAttempt(2, "unsent", "m2", "anthropic"),
+      502,
+      1,
+      { inputTokens: 40, outputTokens: 4 },
+    );
+
+    for (const [requestId, attempts] of [
+      ["explicit-empty", []],
+      ["explicit-nonphysical", [local, unsent]],
+    ] as const) {
+      const entries: RequestLogEntry[] = [];
+      addFinalRequestLog(requestId, Date.now(), {
+        model: "stale-model",
+        provider: "stale-provider",
+        usage: { inputTokens: 99, outputTokens: 9 },
+        attempts: [...attempts],
+      }, 200, undefined, entry => entries.push(entry));
+
+      expect(entries[0]?.usageStatus).toBe("unreported");
+      expect(entries[0]).not.toHaveProperty("usage");
+      expect(entries[0]).not.toHaveProperty("totalTokens");
+    }
+  });
+
+  test("final logging derives tier outcome from the last unique physical attempt", () => {
+    const first = beginRequestAttempt(1, "a", "m1", "anthropic");
+    noteAttemptSend(first, undefined);
+    first.tierOutcome = {
+      wireValue: "first",
+      fastOutcome: "applied",
+      confirmation: "confirmed",
+    };
+    finishRequestAttempt(first, 429, 1);
+    const final = beginRequestAttempt(2, "b", "m2", "anthropic");
+    noteAttemptSend(final, undefined);
+    final.tierOutcome = {
+      wireValue: "final",
+      fastOutcome: "applied",
+      confirmation: "confirmed",
+    };
+    finishRequestAttempt(final, 200, 1);
+    const duplicate = {
+      ...final,
+      tierOutcome: {
+        wireValue: "duplicate",
+        fastOutcome: "downgraded" as const,
+        confirmation: "downgraded" as const,
+      },
+    };
+    const local = beginRequestAttempt(3, "local", "m3", "anthropic");
+    local.locallyAnswered = true;
+    local.tierOutcome = {
+      wireValue: "local",
+      fastOutcome: "applied",
+      confirmation: "confirmed",
+    };
+    finishRequestAttempt(local, 200, 1);
+    const unsent = beginRequestAttempt(4, "unsent", "m4", "anthropic");
+    unsent.tierOutcome = {
+      wireValue: "unsent",
+      fastOutcome: "applied",
+      confirmation: "confirmed",
+    };
+    finishRequestAttempt(unsent, 502, 1);
+    const rootFallback = {
+      wireValue: "stale-root",
+      fastOutcome: "unknown" as const,
+      confirmation: "unknown" as const,
+    };
+    const entries: RequestLogEntry[] = [];
+
+    addFinalRequestLog("tier-physical", Date.now(), {
+      model: "m2",
+      provider: "b",
+      attempts: [first, final, duplicate, local, unsent],
+      tierOutcome: rootFallback,
+    }, 200, undefined, entry => entries.push(entry));
+
+    expect(entries[0]?.tierOutcome).toEqual(final.tierOutcome);
+
+    const fallbackEntries: RequestLogEntry[] = [];
+    const physicalWithoutTier = beginRequestAttempt(1, "a", "m1", "anthropic");
+    noteAttemptSend(physicalWithoutTier, undefined);
+    finishRequestAttempt(physicalWithoutTier, 200, 1);
+    addFinalRequestLog("tier-fallback", Date.now(), {
+      model: "m1",
+      provider: "a",
+      attempts: [physicalWithoutTier],
+      tierOutcome: rootFallback,
+    }, 200, undefined, entry => fallbackEntries.push(entry));
+    expect(fallbackEntries[0]?.tierOutcome).toEqual(rootFallback);
+  });
+
+  test("hydration derives tier outcome from the last unique physical attempt", () => {
+    const first = beginRequestAttempt(1, "a", "m1", "anthropic");
+    noteAttemptSend(first, undefined);
+    first.tierOutcome = {
+      wireValue: "first",
+      fastOutcome: "applied",
+      confirmation: "confirmed",
+    };
+    finishRequestAttempt(first, 429, 1);
+    const final = beginRequestAttempt(2, "b", "m2", "anthropic");
+    noteAttemptSend(final, undefined);
+    final.tierOutcome = {
+      wireValue: "final",
+      fastOutcome: "applied",
+      confirmation: "confirmed",
+    };
+    finishRequestAttempt(final, 200, 1);
+    const duplicate = {
+      ...final,
+      tierOutcome: {
+        wireValue: "duplicate",
+        fastOutcome: "downgraded" as const,
+        confirmation: "downgraded" as const,
+      },
+    };
+    const trailingLocal = beginRequestAttempt(3, "local", "m3", "anthropic");
+    trailingLocal.locallyAnswered = true;
+    trailingLocal.tierOutcome = {
+      wireValue: "local",
+      fastOutcome: "applied",
+      confirmation: "confirmed",
+    };
+    finishRequestAttempt(trailingLocal, 200, 1);
+
+    const projected = requestLogEntryFromPersistedUsage({
+      requestId: "hydrated-tier",
+      timestamp: 1,
+      model: "m2",
+      provider: "b",
+      status: 200,
+      durationMs: 1,
+      usageStatus: "unreported",
+      attempts: [first, final, duplicate, trailingLocal],
+      tierOutcome: {
+        wireValue: "stale-root",
+        fastOutcome: "unknown",
+        confirmation: "unknown",
+      },
+    });
+
+    expect(projected.tierOutcome).toEqual(final.tierOutcome);
+  });
+
+  test("aggregates only unique sent physical attempts", () => {
+    const physical = beginRequestAttempt(1, "a", "m1", "anthropic");
+    noteAttemptSend(physical, undefined);
+    finishRequestAttempt(physical, 200, 1, { inputTokens: 10, outputTokens: 2 });
+    const duplicate = { ...physical };
+    const local = beginRequestAttempt(2, "local", "m2", "anthropic");
+    local.locallyAnswered = true;
+    finishRequestAttempt(local, 200, 1, { inputTokens: 1_000, outputTokens: 100 });
+    const unsent = finishRequestAttempt(
+      beginRequestAttempt(3, "unsent", "m3", "anthropic"),
+      502,
+      1,
+      { inputTokens: 2_000, outputTokens: 200 },
+    );
+
+    expect(aggregateAttemptUsage([physical, duplicate, local, unsent])).toMatchObject({
+      totalTokens: 12,
+      usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12 },
+    });
+  });
+
+  test("finalized attempts reopen only when another send starts", () => {
+    const attempt = beginRequestAttempt(1, "a", "m1", "anthropic");
+    noteAttemptSend(attempt, undefined);
+    finishRequestAttempt(attempt, 200, 10, { inputTokens: 10, outputTokens: 2 });
+
+    finishRequestAttempt(attempt, 502, 20, { inputTokens: 99, outputTokens: 9 });
+    expect(attempt).toMatchObject({
+      status: 200,
+      durationMs: 10,
+      usage: { inputTokens: 10, outputTokens: 2 },
+    });
+
+    noteAttemptSend(attempt, undefined);
+    expect(attempt.status).toBe(0);
+    finishRequestAttempt(attempt, 502, 30, { inputTokens: 12, outputTokens: 3 });
+    expect(attempt).toMatchObject({
+      status: 502,
+      durationMs: 30,
+      sendCount: 2,
+      usage: { inputTokens: 12, outputTokens: 3 },
+    });
+  });
+
   test("folds partial and unsupported attempt measurement honestly", () => {
-    const reported = finishRequestAttempt(
-      beginRequestAttempt(1, "a", "m1", "openai-chat"),
+    const reported = beginRequestAttempt(1, "a", "m1", "openai-chat");
+    noteAttemptSend(reported, undefined);
+    finishRequestAttempt(
+      reported,
       200,
       1,
       { inputTokens: 4, outputTokens: 1 },
     );
-    const unreported = finishRequestAttempt(
-      beginRequestAttempt(2, "b", "m2", "openai-chat"),
+    const unreported = beginRequestAttempt(2, "b", "m2", "openai-chat");
+    noteAttemptSend(unreported, undefined);
+    finishRequestAttempt(
+      unreported,
       503,
       1,
     );
@@ -444,6 +786,7 @@ describe("request log metadata", () => {
         wireValue: 0,
       },
     });
+    noteAttemptSend(a, undefined);
     finishRequestAttempt(
       a,
       503,
@@ -506,6 +849,72 @@ describe("request log metadata", () => {
           reasoningWireField: "reasoning_effort",
           reasoningWireValue: "high",
         },
+      ],
+    });
+  });
+
+  test("request aggregate is not assigned to a later attempt that reported no usage", () => {
+    const entries: RequestLogEntry[] = [];
+    const first = beginRequestAttempt(1, "a", "model-a", "anthropic");
+    noteAttemptSend(first, undefined);
+    finishRequestAttempt(first, 429, 3, { inputTokens: 10, outputTokens: 4 });
+    const final = beginRequestAttempt(2, "b", "model-b", "anthropic");
+    noteAttemptSend(final, "oauth-account-429");
+    const start = Date.now();
+    const logCtx = {
+      model: "combo/free",
+      provider: "combo",
+      usage: { inputTokens: 10, outputTokens: 4 },
+      usageIsRequestAggregate: true,
+      attempts: [first, final],
+      activeAttempt: final,
+      activeAttemptStartedAt: start,
+    } as RequestLogContext & { usageIsRequestAggregate: boolean };
+
+    addFinalRequestLog("aggregate-after-rotation", start, logCtx, 502, undefined, entry => entries.push(entry));
+
+    expect(entries[0]?.usage).toEqual({ inputTokens: 10, outputTokens: 4, totalTokens: 14 });
+    expect(entries[0]?.attempts?.[1]?.usage).toBeUndefined();
+  });
+
+  test("final non-combo logging aggregates every explicit physical attempt", () => {
+    const entries: RequestLogEntry[] = [];
+    const first = beginRequestAttempt(1, "a", "model-a", "openai-chat");
+    noteAttemptSend(first, undefined);
+    finishRequestAttempt(
+      first,
+      503,
+      3,
+      { inputTokens: 4, outputTokens: 1, cacheReadInputTokens: 2 },
+    );
+    const final = beginRequestAttempt(2, "b", "model-b", "openai-chat");
+    noteAttemptSend(final, undefined);
+    const start = Date.now();
+    addFinalRequestLog("policy-parent", start, {
+      model: "policy/fast",
+      provider: "policy",
+      requestedModel: "policy/fast",
+      providerAdapter: "openai-chat",
+      usage: { inputTokens: 10, outputTokens: 2, cachedInputTokens: 7 },
+      attempts: [first, final],
+      activeAttempt: final,
+      activeAttemptStartedAt: start,
+    }, 200, undefined, entry => entries.push(entry));
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      provider: "policy",
+      model: "policy/fast",
+      usageStatus: "reported",
+      usage: {
+        inputTokens: 14,
+        outputTokens: 3,
+        cachedInputTokens: 9,
+        cacheReadInputTokens: 9,
+      },
+      attempts: [
+        { provider: "a", usage: { inputTokens: 4, cacheReadInputTokens: 2 } },
+        { provider: "b", usage: { inputTokens: 10, cachedInputTokens: 7 } },
       ],
     });
   });

@@ -16,8 +16,15 @@ import {
   resolveAnthropicAccountForSession,
   resetAnthropicRoutingForManualSelection,
   rotateAnthropicAccountOn429,
+  rotateAnthropicAccountOnCredentialDenial,
 } from "../../../src/oauth/anthropic-routing";
-import { getAccountSet, saveCredential, setActiveAccount } from "../../../src/oauth/store";
+import {
+  credentialGeneration,
+  getAccountCredential,
+  getAccountSet,
+  saveCredential,
+  setActiveAccount,
+} from "../../../src/oauth/store";
 import { clearAccountQuotaCache, setCachedProviderAccountQuotaForTests } from "../../../src/providers/quota";
 import type { OcxAccountPoolQuotaWindow, OcxAccountPoolRotationStrategy, OcxConfig } from "../../../src/types";
 import { removeTreeWithRetry } from "../../helpers/remove-tree";
@@ -152,6 +159,28 @@ describe("anthropic account pool", () => {
     expect(getEligibleAnthropicAccounts()).toEqual([bId]);
     const after = resolveAnthropicAccountForSession("sess-fail", cfg(true));
     expect(after.accountId).toBe(bId);
+  });
+
+  test("stale credential denial preserves and retries the replacement generation", async () => {
+    const { aId } = await seedTwoAccounts();
+    const rejectedGeneration = credentialGeneration(getAccountCredential("anthropic", aId)!);
+    await saveCredential("anthropic", {
+      access: "access-a-refreshed",
+      refresh: "refresh-a-refreshed",
+      expires: Date.now() + 7_200_000,
+      accountId: "uuid-aaaa",
+      email: "a@example.test",
+    });
+
+    const next = await rotateAnthropicAccountOnCredentialDenial(
+      cfg(true),
+      { accountId: aId, generation: rejectedGeneration },
+      "sess-refreshed",
+    );
+
+    expect(next).toBe(aId);
+    expect(getAccountCredential("anthropic", aId)?.access).toBe("access-a-refreshed");
+    expect(getAccountSet("anthropic")!.accounts.find(account => account.id === aId)?.needsReauth).toBeUndefined();
   });
 
   test("all cooled returns all-cooled rather than none", async () => {

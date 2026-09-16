@@ -165,6 +165,44 @@ describe("route explainability (RI-09)", () => {
     expect(body.summary).toMatchObject({ finalProvider: "b", finalModel: "m2" });
   });
 
+  test("final target ignores trailing local, unsent, and duplicate attempts", async () => {
+    appendUsageEntry({
+      requestId: "physical-final",
+      timestamp: 1_700_000_000_001,
+      provider: "root",
+      model: "root-model",
+      status: 200,
+      durationMs: 900,
+      usageStatus: "reported",
+      attempts: [
+        { ordinal: 1, provider: "a", model: "m1", adapter: "openai-chat", status: 503, durationMs: 100, sendCount: 1, recoveryKinds: [], usageStatus: "unreported" },
+        { ordinal: 2, provider: "b", model: "m2", adapter: "openai-chat", status: 200, durationMs: 700, sendCount: 1, recoveryKinds: [], usageStatus: "reported" },
+        { ordinal: 3, provider: "local", model: "local-model", adapter: "openai-chat", status: 200, durationMs: 1, sendCount: 1, locallyAnswered: true, recoveryKinds: [], usageStatus: "reported" },
+        { ordinal: 4, provider: "unsent", model: "unsent-model", adapter: "openai-chat", status: 503, durationMs: 1, sendCount: 0, recoveryKinds: [], usageStatus: "unreported" },
+        { ordinal: 2, provider: "duplicate", model: "duplicate-model", adapter: "openai-chat", status: 200, durationMs: 1, sendCount: 1, recoveryKinds: [], usageStatus: "reported" },
+      ],
+    });
+    appendUsageEntry({
+      requestId: "no-physical-target",
+      timestamp: 1_700_000_000_002,
+      provider: "root",
+      model: "root-model",
+      status: 200,
+      durationMs: 1,
+      usageStatus: "reported",
+      attempts: [
+        { ordinal: 1, provider: "local", model: "local-model", adapter: "openai-chat", status: 200, durationMs: 1, sendCount: 1, locallyAnswered: true, recoveryKinds: [], usageStatus: "reported" },
+      ],
+    });
+
+    const physical = await apiGet("/api/request-history/physical-final/route-decision", config());
+    const physicalBody = await physical.json() as { summary?: { finalProvider?: string; finalModel?: string } };
+    expect(physicalBody.summary).toMatchObject({ finalProvider: "b", finalModel: "m2" });
+    const root = await apiGet("/api/request-history/no-physical-target/route-decision", config());
+    const rootBody = await root.json() as { summary?: { finalProvider?: string; finalModel?: string } };
+    expect(rootBody.summary).toMatchObject({ finalProvider: "root", finalModel: "root-model" });
+  });
+
   test("dry-run without candidate evidence assembles canonical evidence", async () => {
     const cfg = config();
     const req = new ManagementRequest("http://localhost/api/routing-profiles/dry-run", {

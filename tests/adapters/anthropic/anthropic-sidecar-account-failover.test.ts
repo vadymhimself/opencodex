@@ -13,13 +13,14 @@ import { clearAnthropicAccountPoolState } from "../../../src/oauth/anthropic-rou
 import { clearGenericFailoverHealth } from "../../../src/oauth/generic-account-failover";
 import { getAccountSet, saveCredential, setActiveAccount } from "../../../src/oauth/store";
 import type { OcxConfig, OcxParsedRequest, OcxProviderConfig } from "../../../src/types";
+import type { AttemptRecoveryKind } from "../../../src/usage/log";
 import { removeTreeWithRetry } from "../../helpers/remove-tree";
 
 const previousHome = process.env.OPENCODEX_HOME;
 let testHome = "";
 let handleResponses: typeof import("../../../src/server/responses")["handleResponses"];
 let observedKeys: string[] = [];
-let sidecarMode = false;
+let sidecarMode: false | "403" | "429" = false;
 
 function fixtureAdapter(provider: OcxProviderConfig): ProviderAdapter {
   return {
@@ -66,13 +67,28 @@ beforeAll(async () => {
     runWithWebSearch: async (args: {
       parsed: OcxParsedRequest;
       adapter: ProviderAdapter;
-      on429?: (retryAfter: string | null) => Promise<ProviderAdapter | null>;
+      onCredentialError?: (response: Response, signal: AbortSignal) => Promise<{
+        adapter: ProviderAdapter;
+        recoveryKind: AttemptRecoveryKind;
+      } | null>;
+      on429?: (retryAfter: string | null) => Promise<{
+        adapter: ProviderAdapter;
+        recoveryKind: AttemptRecoveryKind;
+      } | null>;
     }) => {
       const first = await args.adapter.buildRequest(args.parsed);
       observedKeys.push(new Headers(first.headers).get("authorization") ?? "");
-      const rotated = await args.on429?.("30");
-      if (!rotated) throw new Error("Anthropic sidecar did not rotate after 429");
-      const second = await rotated.buildRequest(args.parsed);
+      const rotated = sidecarMode === "403"
+        ? await args.onCredentialError?.(Response.json({
+            type: "error",
+            error: {
+              type: "oauth_org_not_allowed",
+              message: "Your organization has disabled Claude subscription access for Claude Code. Use an Anthropic API key instead, or ask your admin to enable access.",
+            },
+          }, { status: 403 }), new AbortController().signal)
+        : await args.on429?.("30");
+      if (!rotated) throw new Error(`Anthropic sidecar did not rotate after ${sidecarMode}`);
+      const second = await rotated.adapter.buildRequest(args.parsed);
       observedKeys.push(new Headers(second.headers).get("authorization") ?? "");
       return new Response("sidecar-ok", { status: 200 });
     },
@@ -91,6 +107,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  sidecarMode = false;
   clearAnthropicAccountPoolState();
   clearGenericFailoverHealth();
   removeTreeWithRetry(testHome);
@@ -102,8 +119,55 @@ afterAll(() => {
   mock.restore();
 });
 
+test("Anthropic web-search sidecar rotates on 403 credential denial", async () => {
+  sidecarMode = "403";
+  for (let index = 0; index < 2; index += 1) {
+    await saveCredential("anthropic", {
+      access: `anthropic-access-${index}`,
+      refresh: `anthropic-refresh-${index}`,
+      expires: Date.now() + 3_600_000,
+      accountId: `anthropic-account-${index}`,
+    } as never, { addAccount: true });
+  }
+  const ids = getAccountSet("anthropic")!.accounts.map(account => account.id);
+  await setActiveAccount("anthropic", ids[0]!);
+
+  const config = {
+    port: 0,
+    defaultProvider: "anthropic",
+    anthropicAccountPool: { enabled: false, strategy: "round-robin" },
+    providers: {
+      anthropic: {
+        adapter: "test-anthropic-sidecar",
+        baseUrl: "https://anthropic-sidecar.test/v1",
+        authMode: "oauth",
+        models: ["model"],
+      },
+    },
+  } as unknown as OcxConfig;
+
+  const response = await handleResponses(new Request("http://localhost/v1/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "anthropic/model",
+      input: "search",
+      stream: true,
+      tools: [{ type: "web_search" }],
+    }),
+  }), config, { model: "", provider: "" });
+
+  expect(response.status).toBe(200);
+  expect(await response.text()).toBe("sidecar-ok");
+  expect(observedKeys).toEqual([
+    "Bearer anthropic-access-0",
+    "Bearer anthropic-access-1",
+  ]);
+  expect(getAccountSet("anthropic")!.accounts.find(account => account.id === ids[0])?.needsReauth).toBe(true);
+});
+
 test("Anthropic web-search sidecar rotates on 429 when proactive pooling is disabled", async () => {
-  sidecarMode = true;
+  sidecarMode = "429";
   for (let index = 0; index < 2; index += 1) {
     await saveCredential("anthropic", {
       access: `anthropic-access-${index}`,

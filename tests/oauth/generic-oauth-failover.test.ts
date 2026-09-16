@@ -1,7 +1,8 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync} from "node:fs";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { IncomingMeta, ProviderAdapter } from "../../src/adapters/base";
 import {
   clearGenericFailoverHealth,
   eligibleFailoverAccounts,
@@ -12,13 +13,83 @@ import {
   preferredInitialAccount,
   rotateGenericOAuthAccountOn429,
 } from "../../src/oauth/generic-account-failover";
+import { resolveCopilotApiBaseUrl } from "../../src/oauth/github-copilot";
 import { getAccountSet, markAccountNeedsReauth, saveCredential, setActiveAccount } from "../../src/oauth/store";
 import { clearAccountQuotaCache, setCachedProviderAccountQuotaForTests } from "../../src/providers/quota";
-import { resolveCopilotApiBaseUrl } from "../../src/oauth/github-copilot";
 import { resolveProviderTransport } from "../../src/providers/xai-transport";
-import type { OcxConfig, OcxProviderConfig } from "../../src/types";
+import {
+  addFinalRequestLog,
+  type RequestLogContext,
+  type RequestLogEntry,
+} from "../../src/server/request-log";
+import type { OcxConfig, OcxParsedRequest, OcxProviderConfig } from "../../src/types";
+import type { AttemptRecoveryKind } from "../../src/usage/log";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 import { repoPath } from "../helpers/repo-root";
+
+let sidecarObservedTokens: string[] = [];
+let sidecarReportsFinalUsage = true;
+let sidecarRejectBeforeRotatedSend = false;
+let handleResponses: typeof import("../../src/server/responses")["handleResponses"];
+
+beforeAll(async () => {
+  mock.module("../../src/images/fulfill", () => ({
+    fulfillImageCall: async () => ({
+      ok: true,
+      model: "image-model",
+      prompt: "test image",
+      path: "/tmp/test.png",
+      files: ["/tmp/test.png"],
+      count: 1,
+      markdown: "![image](file:///tmp/test.png)",
+    }),
+    imageFulfillmentTailSnapshot: () => ({ currentBytes: 0, highWaterBytes: 0, active: 0 }),
+  }));
+
+  mock.module("../../src/web-search/index", () => ({
+    buildWebSearchTool: () => ({ name: "web_search", parameters: { type: "object", properties: {} } }),
+    planWebSearch: (_config: OcxConfig, parsed: OcxParsedRequest) => parsed._webSearch ? { backend: "openai" } : undefined,
+    shouldResolveOpenAiWebSearchSidecar: () => false,
+    runWithWebSearch: async (args: {
+      adapter: ProviderAdapter;
+      parsed: OcxParsedRequest;
+      incomingMeta: IncomingMeta;
+      onAttemptSend?: (recovery?: AttemptRecoveryKind) => void;
+      onIterationUsage?: (usage: { inputTokens: number; outputTokens: number } | undefined) => void;
+      onUsage?: (usage: { inputTokens: number; outputTokens: number } | undefined) => void;
+      on429?: (retryAfter: string | null) =>
+        | { adapter: ProviderAdapter; recoveryKind: AttemptRecoveryKind }
+        | null
+        | Promise<{ adapter: ProviderAdapter; recoveryKind: AttemptRecoveryKind } | null>;
+    }) => {
+      const tokenFor = async (adapter: ProviderAdapter): Promise<string> => {
+        const request = await adapter.buildRequest(args.parsed, args.incomingMeta);
+        return new Headers(request.headers).get("authorization")?.replace(/^Bearer /, "") ?? "";
+      };
+      sidecarObservedTokens.push(await tokenFor(args.adapter));
+      args.onAttemptSend?.();
+      args.onIterationUsage?.({ inputTokens: 10, outputTokens: 4 });
+      sidecarObservedTokens.push(await tokenFor(args.adapter));
+      args.onAttemptSend?.();
+      const rotated = await args.on429?.("30");
+      if (!rotated) throw new Error("expected sidecar account rotation");
+      if (sidecarRejectBeforeRotatedSend) throw new Error("rotated pacing rejected");
+      sidecarObservedTokens.push(await tokenFor(rotated.adapter));
+      args.onAttemptSend?.(rotated.recoveryKind);
+      if (sidecarReportsFinalUsage) {
+        args.onIterationUsage?.({ inputTokens: 3, outputTokens: 2 });
+      }
+      args.onUsage?.(sidecarReportsFinalUsage
+        ? { inputTokens: 13, outputTokens: 6 }
+        : { inputTokens: 10, outputTokens: 4 });
+      return new Response("data: {\"type\":\"done\"}\n\n", {
+        headers: { "content-type": "text/event-stream" },
+      });
+    },
+  }));
+
+  ({ handleResponses } = await import("../../src/server/responses"));
+});
 
 const originalHome = process.env.OPENCODEX_HOME;
 let home: string;
@@ -27,6 +98,9 @@ beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "ocx-generic-failover-"));
   process.env.OPENCODEX_HOME = home;
   clearGenericFailoverHealth();
+  sidecarObservedTokens = [];
+  sidecarReportsFinalUsage = true;
+  sidecarRejectBeforeRotatedSend = false;
 });
 
 afterEach(() => {
@@ -35,6 +109,10 @@ afterEach(() => {
   if (originalHome === undefined) delete process.env.OPENCODEX_HOME;
   else process.env.OPENCODEX_HOME = originalHome;
   removeTreeWithRetry(home);
+});
+
+afterAll(() => {
+  mock.restore();
 });
 
 const OAUTH_PROVIDER = {
@@ -58,16 +136,16 @@ function config(enabled?: boolean, perProvider?: boolean): OcxConfig {
   } as unknown as OcxConfig;
 }
 
-async function seed(count: number, offset = 0): Promise<string[]> {
+async function seed(count: number, offset = 0, providerName = "xai"): Promise<string[]> {
   for (let i = offset; i < offset + count; i++) {
-    await saveCredential("xai", {
+    await saveCredential(providerName, {
       access: `access-${i}`,
       refresh: `refresh-${i}`,
       expires: Date.now() + 3_600_000,
       accountId: `uuid-${i}`,
     } as never, { addAccount: true });
   }
-  return getAccountSet("xai")?.accounts.map(a => a.id) ?? [];
+  return getAccountSet(providerName)?.accounts.map(a => a.id) ?? [];
 }
 
 describe("#2568 generic OAuth account failover", () => {
@@ -220,6 +298,221 @@ describe("#2568 generic OAuth account failover", () => {
     expect(isGenericOAuthFailoverEnabled(config(), "openai")).toBe(false);
     expect(isGenericOAuthFailoverEnabled(config(true), "openai")).toBe(false);
   });
+
+  test("image sidecar keeps hidden-round usage on the OAuth account that produced it", async () => {
+    await seed(2, 0, "kimi");
+    const runtimeConfig = {
+      defaultProvider: "kimi",
+      providers: {
+        kimi: {
+          adapter: "openai-chat",
+          baseUrl: "https://chat.example/v1",
+          authMode: "oauth",
+          models: ["grok"],
+        },
+        xai: {
+          adapter: "openai-chat",
+          baseUrl: "https://api.x.ai/v1",
+          apiKey: "image-key",
+          models: ["image-model"],
+        },
+      },
+      images: { bridgeEnabled: true },
+    } as unknown as OcxConfig;
+    const auth: string[] = [];
+    let send = 0;
+    const sse = (...events: unknown[]) => new Response(
+      events.map(event => `data: ${JSON.stringify(event)}\n\n`).join("") + "data: [DONE]\n\n",
+      { headers: { "content-type": "text/event-stream" } },
+    );
+    const transport = Object.assign(async (
+      input: Parameters<typeof fetch>[0],
+      init?: RequestInit,
+    ): Promise<Response> => {
+        const request = new Request(input, init);
+        auth.push(request.headers.get("authorization") ?? "");
+        send += 1;
+        if (send === 1) {
+          return sse(
+            {
+              id: "chatcmpl-image",
+              choices: [{
+                index: 0,
+                delta: {
+                  role: "assistant",
+                  tool_calls: [{
+                    index: 0,
+                    id: "call_image",
+                    type: "function",
+                    function: { name: "image_gen", arguments: '{"prompt":"test image"}' },
+                  }],
+                },
+                finish_reason: null,
+              }],
+            },
+            {
+              id: "chatcmpl-image",
+              choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+              usage: { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14 },
+            },
+          );
+        }
+        if (send === 2) {
+          return Response.json(
+            { error: { message: "quota" } },
+            { status: 429, headers: { "retry-after": "30" } },
+          );
+        }
+        return sse(
+          {
+            id: "chatcmpl-final",
+            choices: [{
+              index: 0,
+              delta: { role: "assistant", content: "done" },
+              finish_reason: null,
+            }],
+          },
+          {
+            id: "chatcmpl-final",
+            choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+            usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+          },
+        );
+      }, { preconnect() {} }) as typeof globalThis.fetch;
+    (runtimeConfig.providers.kimi as OcxProviderConfig & { fetch: typeof globalThis.fetch }).fetch = transport;
+
+    const logCtx: RequestLogContext = { model: "", provider: "" };
+    const response = await handleResponses(new Request("http://localhost/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "kimi/grok",
+        input: "make an image",
+        stream: true,
+        tools: [{ type: "image_generation" }],
+      }),
+    }), runtimeConfig, logCtx);
+    expect(response.status).toBe(200);
+    await response.text();
+
+    expect(auth).toEqual(["Bearer access-1", "Bearer access-1", "Bearer access-0"]);
+    expect(logCtx.usage).toMatchObject({ inputTokens: 13, outputTokens: 6 });
+    expect(logCtx.attempts).toHaveLength(2);
+    expect(logCtx.attempts?.[0]).toMatchObject({
+      status: 429,
+      sendCount: 2,
+      usage: { inputTokens: 10, outputTokens: 4 },
+    });
+    expect(logCtx.attempts?.[1]).toMatchObject({
+      sendCount: 1,
+      recoveryKinds: ["oauth-account-429"],
+      usage: { inputTokens: 3, outputTokens: 2 },
+    });
+    expect(logCtx.attempts?.[1]?.accountLogLabel)
+      .not.toBe(logCtx.attempts?.[0]?.accountLogLabel);
+  });
+
+  test("web-search sidecar keeps hidden-round usage on the OAuth account that produced it", async () => {
+    await seed(2);
+    const runtimeConfig = config();
+    runtimeConfig.defaultProvider = "xai";
+    runtimeConfig.providers.xai = { ...OAUTH_PROVIDER, models: ["grok"] };
+
+    const logCtx: RequestLogContext = { model: "", provider: "" };
+    const response = await handleResponses(new Request("http://localhost/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "xai/grok",
+        input: "search",
+        stream: true,
+        tools: [{ type: "web_search" }],
+      }),
+    }), runtimeConfig, logCtx);
+    await response.text();
+
+    expect(sidecarObservedTokens).toEqual(["access-1", "access-1", "access-0"]);
+    expect(logCtx.usage).toMatchObject({ inputTokens: 13, outputTokens: 6 });
+    expect(logCtx.attempts).toMatchObject([
+      { status: 429, sendCount: 2, usage: { inputTokens: 10, outputTokens: 4 } },
+      {
+        sendCount: 1,
+        recoveryKinds: ["oauth-account-429"],
+        usage: { inputTokens: 3, outputTokens: 2 },
+      },
+    ]);
+    expect(logCtx.attempts).toHaveLength(2);
+    expect(logCtx.attempts?.[1]?.accountLogLabel)
+      .not.toBe(logCtx.attempts?.[0]?.accountLogLabel);
+  });
+
+  test("web-search rotation rejected before dispatch creates no phantom attempt", async () => {
+    sidecarRejectBeforeRotatedSend = true;
+    await seed(2);
+    const runtimeConfig = config();
+    runtimeConfig.defaultProvider = "xai";
+    runtimeConfig.providers.xai = { ...OAUTH_PROVIDER, models: ["grok"] };
+    const logCtx: RequestLogContext = { model: "", provider: "" };
+
+    await expect(handleResponses(new Request("http://localhost/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "xai/grok",
+        input: "search",
+        stream: true,
+        tools: [{ type: "web_search" }],
+      }),
+    }), runtimeConfig, logCtx)).rejects.toThrow("rotated pacing rejected");
+
+    expect(sidecarObservedTokens).toEqual(["access-1", "access-1"]);
+    expect(logCtx.attempts).toHaveLength(1);
+    expect(logCtx.attempts?.[0]).toMatchObject({ sendCount: 2 });
+  });
+
+  test("web-search request aggregate is not assigned to a rotated attempt with no usage", async () => {
+    sidecarReportsFinalUsage = false;
+    await seed(2);
+    const runtimeConfig = config();
+    runtimeConfig.defaultProvider = "xai";
+    runtimeConfig.providers.xai = { ...OAUTH_PROVIDER, models: ["grok"] };
+
+    const start = Date.now();
+    const logCtx: RequestLogContext = { model: "", provider: "" };
+    const response = await handleResponses(new Request("http://localhost/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "xai/grok",
+        input: "search",
+        stream: true,
+        tools: [{ type: "web_search" }],
+      }),
+    }), runtimeConfig, logCtx);
+    await response.text();
+
+    const entries: RequestLogEntry[] = [];
+    addFinalRequestLog(
+      "web-search-rotation-no-final-usage",
+      start,
+      logCtx,
+      200,
+      undefined,
+      entry => entries.push(entry),
+    );
+
+    expect(sidecarObservedTokens).toEqual(["access-1", "access-1", "access-0"]);
+    expect(entries[0]?.usage).toEqual({
+      inputTokens: 10,
+      outputTokens: 4,
+      totalTokens: 14,
+    });
+    expect(entries[0]?.attempts).toMatchObject([
+      { status: 429, sendCount: 2, usage: { inputTokens: 10, outputTokens: 4 } },
+      { status: 200, sendCount: 1, recoveryKinds: ["oauth-account-429"] },
+    ]);
+    expect(entries[0]?.attempts?.[1]?.usage).toBeUndefined();
+  });
 });
 
 /**
@@ -303,15 +596,19 @@ describe("sidecar on429 wiring", () => {
     // Kiro's routing metadata) live in exactly one place. A fourth rotation site that swaps the
     // bearer by hand would reintroduce the mixed-identity bug this helper exists to prevent.
     const snapshotUses = coreSource.match(/failoverAccountSnapshot\(/g) ?? [];
-    const helperUses = coreSource.match(/applyFailoverSnapshot\(snapshot(?:, nextParsed)?\)/g) ?? [];
-    // Five includes native Responses passthrough, which returns before the Chat bridge loop.
-    // The explicit count keeps a newly added rotation site from skipping identity pairing.
+    const anthropicSnapshotUses = coreSource.match(/getAnthropicPoolAccessSnapshot\(/g) ?? [];
+    const helperUses = coreSource.match(
+      /applyFailoverSnapshot\(snapshot(?:, (?:nextParsed|retryParsed))?\)/g,
+    ) ?? [];
+    // Five generic sites plus four Anthropic recovery sites. Anthropic's fifth snapshot is initial
+    // authentication, not rotation, so it is applied before this shared failover helper exists.
     expect(snapshotUses.length).toBe(5);
-    expect(helperUses.length).toBe(snapshotUses.length);
-    // The bearer is written in exactly one place — inside the helper. Any other occurrence is a
-    // rotation site that skipped the pairing rules.
+    expect(anthropicSnapshotUses.length).toBe(5);
+    expect(helperUses.length).toBe(snapshotUses.length + anthropicSnapshotUses.length - 1);
+    // Bearer writes live only in shared recovery helper and Anthropic's initial pool resolution.
+    // Any third occurrence is a rotation site that skipped pairing rules.
     const bearerWrites = coreSource.match(/apiKey: snapshot\.accessToken/g) ?? [];
-    expect(bearerWrites.length).toBe(1);
+    expect(bearerWrites.length).toBe(2);
     const helperStart = coreSource.indexOf("const applyFailoverSnapshot =");
     expect(coreSource.indexOf("apiKey: snapshot.accessToken")).toBeGreaterThan(helperStart);
   });
@@ -342,16 +639,16 @@ describe("sidecar on429 wiring", () => {
     //                key-auth defaults and Anthropic's own wire/pool remain unchanged.
     //   anthropic = 3: the same, MINUS runTurn -- that path is Cursor-only (cursor.ts is the
     //                  sole adapter implementing runTurn), so Anthropic cannot reach it.
-    //   key       = 3: hasKeyPoolFailover guards the two 429 response loops plus the
-    //                  pre-stream 401 recovery site (a rejected key rotates instead of
-    //                  failing the request); the sidecar reaches the key pool through
-    //                  rotateProviderTransportOn429 instead.
+    //   key       = 4: hasKeyPoolFailover guards all three 429 response loops, including native
+    //                  Responses passthrough, plus the pre-stream 401 recovery site (a rejected
+    //                  key rotates instead of failing the request); the sidecar reaches the key
+    //                  pool through rotateProviderTransportOn429 instead.
     //
-    // Adding a fifth recovery site means deciding, deliberately, which rotators it needs and
+    // Adding another recovery site means deciding, deliberately, which rotators it needs and
     // updating the matching number. That decision is the thing this test exists to force.
     expect(counts.generic).toBe(5);
     expect(counts.anthropic).toBe(3);
-    expect(counts.key).toBe(3);
+    expect(counts.key).toBe(4);
   });
 
   test("the helper fails closed rather than pairing a new bearer with an old identity", () => {

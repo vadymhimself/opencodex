@@ -2,10 +2,33 @@ import { isCyberPolicyCode, isCyberPolicyMessage } from "../lib/errors";
 
 export const MAX_CLIENT_SSE_FRAME_BYTES = 4 * 1024 * 1024;
 
-const LF_LF = Uint8Array.of(10, 10);
-const LF_CR_LF = Uint8Array.of(10, 13, 10);
-const CR_LF_LF = Uint8Array.of(13, 10, 10);
-const CR_LF_CR_LF = Uint8Array.of(13, 10, 13, 10);
+/**
+ * Classify the bytes at `index` as an SSE block delimiter.
+ *
+ * Returns the delimiter length in bytes, `0` when `index` does not start a
+ * delimiter, and `undefined` when more bytes are required to decide.
+ */
+export function sseDelimiterLengthAt(
+  index: number,
+  length: number,
+  byteAt: (index: number) => number,
+  endOfStream = false,
+): number | undefined {
+  const first = byteAt(index);
+  if (first !== 10 && first !== 13) return 0;
+  const firstLength = first === 13
+    && index + 1 < length
+    && byteAt(index + 1) === 10
+    ? 2
+    : 1;
+  const secondIndex = index + firstLength;
+  if (secondIndex >= length) return undefined;
+  const second = byteAt(secondIndex);
+  if (second === 10) return firstLength + 1;
+  if (second !== 13) return 0;
+  if (secondIndex + 1 >= length) return endOfStream ? firstLength + 1 : undefined;
+  return firstLength + (byteAt(secondIndex + 1) === 10 ? 2 : 1);
+}
 
 export class SseFrameTooLargeError extends Error {
   readonly maxBytes: number;
@@ -32,46 +55,10 @@ export type BoundedSseFrame = {
   delimiter: Uint8Array;
 };
 
-/**
- * Classify the bytes at `index` as an SSE block delimiter.
- *
- * Returns the delimiter length in bytes, `0` when `index` does not start a
- * delimiter, and `undefined` when more bytes are required to decide.
- */
-function delimiterLengthAt(
-  index: number,
-  length: number,
-  byteAt: (index: number) => number,
-): number | undefined {
-  const first = byteAt(index);
-  if (first === 10) {
-    if (index + 1 >= length) return undefined;
-    const second = byteAt(index + 1);
-    if (second === 10) return 2;
-    if (second !== 13) return 0;
-    if (index + 2 >= length) return undefined;
-    return byteAt(index + 2) === 10 ? 3 : 0;
-  }
-  if (first !== 13) return 0;
-  if (index + 1 >= length) return undefined;
-  if (byteAt(index + 1) !== 10) return 0;
-  if (index + 2 >= length) return undefined;
-  const third = byteAt(index + 2);
-  if (third === 10) return 3;
-  if (third !== 13) return 0;
-  if (index + 3 >= length) return undefined;
-  return byteAt(index + 3) === 10 ? 4 : 0;
-}
-
-function delimiterBytesAt(
-  index: number,
-  delimiterLength: number,
-  byteAt: (index: number) => number,
-): Uint8Array {
-  if (delimiterLength === 2) return LF_LF;
-  if (delimiterLength === 4) return CR_LF_CR_LF;
-  return byteAt(index) === 10 ? LF_CR_LF : CR_LF_LF;
-}
+export type BoundedSseFinish = {
+  frames: BoundedSseFrame[];
+  tail: Uint8Array;
+};
 
 function copyRange(
   start: number,
@@ -99,7 +86,7 @@ function copyRange(
  */
 function isResponsesTerminalFrame(block: Uint8Array): boolean {
   const data: string[] = [];
-  for (const line of new TextDecoder().decode(block).split(/\r?\n/)) {
+  for (const line of new TextDecoder().decode(block).split(/\r\n|\r|\n/)) {
     if (!line.startsWith("data:")) continue;
     const value = line.slice(5);
     data.push(value.startsWith(" ") ? value.slice(1) : value);
@@ -245,7 +232,7 @@ export class BoundedSseFrameBuffer {
       let index = 0;
       let retainedThrough = 0;
       while (index < totalLength) {
-        const delimiterLength = delimiterLengthAt(index, totalLength, byteAt);
+        const delimiterLength = sseDelimiterLengthAt(index, totalLength, byteAt);
         if (delimiterLength === undefined) break;
         if (delimiterLength > 0) {
           if (frames.length >= this.maxFramesPerFeed) {
@@ -255,7 +242,13 @@ export class BoundedSseFrameBuffer {
           }
           retainRange(retainedThrough, index);
           const block = this.takeCandidate();
-          const delimiter = delimiterBytesAt(index, delimiterLength, byteAt);
+          const delimiter = copyRange(
+            index,
+            index + delimiterLength,
+            tailLength,
+            previousTail,
+            chunk,
+          );
           frames.push({ block, delimiter });
           index += delimiterLength;
           retainedThrough = index;
@@ -284,17 +277,36 @@ export class BoundedSseFrameBuffer {
     }
   }
 
-  /** Return the final unterminated block bytes and release all retained state. */
-  finish(): Uint8Array {
-    if (this.disposed) return new Uint8Array(0);
+  /** Resolve any final delimiter and release all retained state. */
+  finishFrames(): BoundedSseFinish {
+    if (this.disposed) return { frames: [], tail: new Uint8Array(0) };
     try {
-      this.retain(this.delimiterTail);
+      const delimiter = this.delimiterTail;
       this.delimiterTail = new Uint8Array(0);
-      return this.takeCandidate();
+      const delimiterLength = delimiter.byteLength > 0
+        ? sseDelimiterLengthAt(0, delimiter.byteLength, index => delimiter[index]!, true)
+        : 0;
+      if (delimiter.byteLength > 0 && delimiterLength === delimiter.byteLength) {
+        return {
+          frames: [{ block: this.takeCandidate(), delimiter }],
+          tail: new Uint8Array(0),
+        };
+      }
+      this.retain(delimiter);
+      return { frames: [], tail: this.takeCandidate() };
     } finally {
       this.clear();
       this.disposed = true;
     }
+  }
+
+  /** Return final bytes in wire order and release all retained state. */
+  finish(): Uint8Array {
+    const { frames, tail } = this.finishFrames();
+    return joinSseFrameBytes([
+      ...frames.flatMap(frame => [frame.block, frame.delimiter]),
+      tail,
+    ]);
   }
 
   dispose(): void {

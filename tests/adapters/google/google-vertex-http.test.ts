@@ -100,10 +100,16 @@ describe("vertex retry fetch", () => {
   });
 
   test("retries a thrown network error then succeeds", async () => {
-    const mock = mockFetch([new Error("ECONNRESET"), new Response("ok", { status: 200 })]);
-    const res = await fetchVertexWithRetry(request, { timeoutMs: 5_000 });
+    const recoveries: string[] = [];
+    const error = Object.assign(new Error("network failure: ECONNRESET"), { code: "ECONNRESET" });
+    const mock = mockFetch([error, new Response("ok", { status: 200 })]);
+    const res = await fetchVertexWithRetry(request, {
+      timeoutMs: 5_000,
+      onRetry: recovery => recoveries.push(recovery),
+    });
     expect(res.status).toBe(200);
     expect(mock.calls).toHaveLength(2);
+    expect(recoveries).toEqual(["connection-reset"]);
   });
 
   test("does NOT retry a quota-exhausted 429 (single attempt), but DOES retry a plain rate-limit 429", async () => {
@@ -151,10 +157,15 @@ describe("vertex retry fetch", () => {
       new Response("ok", { status: 200 }),
     ]);
 
-    const res = await fetchAntigravityWithRetry(repairableRequest, { timeoutMs: 5_000 });
+    const recoveries: string[] = [];
+    const res = await fetchAntigravityWithRetry(repairableRequest, {
+      timeoutMs: 5_000,
+      onRetry: recovery => recoveries.push(recovery),
+    });
 
     expect(res.status).toBe(200);
     expect(mock.calls).toHaveLength(2);
+    expect(recoveries).toEqual(["adapter-retry"]);
     const replay = JSON.parse(mock.calls[1].body as string);
     expect(replay.request.tools[0].functionDeclarations[0].parameters).toEqual({
       type: "object",
@@ -276,17 +287,28 @@ describe("vertex retry fetch", () => {
     expect(await res.text()).toBe(raw);
   });
 
-  test("fetchGoogleWithRetry routes physical attempts through ctx.executor when provided", async () => {
-    const executorCalls: RequestInit[] = [];
-    const customExecutor: typeof fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
-      executorCalls.push(init ?? {});
-      return new Response("executor-ok", { status: 200 });
+  test("routes retries through ctx.executor with labels on the next dispatch", async () => {
+    const executorCalls: Array<string | undefined> = [];
+    let nextRecovery: string | undefined;
+    const responses = [
+      new Response(vertexError(503, "UNAVAILABLE", "overloaded"), { status: 503, headers: { "Retry-After": "0" } }),
+      new Response(vertexError(429, "RESOURCE_EXHAUSTED", "rate limit, try again"), { status: 429, headers: { "Retry-After": "0" } }),
+      new Response("executor-ok", { status: 200 }),
+    ];
+    const customExecutor: typeof fetch = (async () => {
+      executorCalls.push(nextRecovery);
+      nextRecovery = undefined;
+      return responses.shift()!;
     }) as typeof fetch;
 
-    const res = await fetchVertexWithRetry(request, { timeoutMs: 5_000, executor: customExecutor });
+    const res = await fetchVertexWithRetry(request, {
+      timeoutMs: 5_000,
+      executor: customExecutor,
+      onRetry: recovery => { nextRecovery = recovery; },
+    });
     expect(res.status).toBe(200);
     expect(await res.text()).toBe("executor-ok");
-    expect(executorCalls).toHaveLength(1);
+    expect(executorCalls).toEqual([undefined, "transient-5xx", "rate-limit-429"]);
   });
 });
 

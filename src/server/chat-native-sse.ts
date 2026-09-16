@@ -117,6 +117,7 @@ export function nativeChatSse(
   const scope = { kind: "live_transient" as const };
   let buffer = "";
   let bufferBytes = 0;
+  let bufferSearchFrom = 0;
   let queuedBytes = 0;
   let sawFinish = false;
   let sawDone = false;
@@ -137,6 +138,7 @@ export function nativeChatSse(
     options.translatorBudget.releaseRetained(bufferBytes, scope);
     buffer = next;
     bufferBytes = nextBytes;
+    bufferSearchFrom = 0;
   };
   const appendBuffer = (fragment: string) => {
     if (!fragment) return;
@@ -167,6 +169,7 @@ export function nativeChatSse(
     options.translatorBudget.releaseRetained(bufferBytes, scope);
     buffer = "";
     bufferBytes = 0;
+    bufferSearchFrom = 0;
   };
   const settle = (status: number, message?: string) => {
     if (settled) return;
@@ -274,12 +277,13 @@ export function nativeChatSse(
       releaseQueued();
       try {
         for (;;) {
-          const next = nextSseBlock(buffer);
+          const next = nextSseBlock(buffer, bufferSearchFrom);
           if (next) {
             replaceBuffer(next.rest);
             processBlock(controller, next.block, next.delimiter);
             return;
           }
+          bufferSearchFrom = Math.max(0, buffer.length - 3);
           const { done, value } = await reader.read();
           if (cancelled) return;
           if (cancelledBySignal) {

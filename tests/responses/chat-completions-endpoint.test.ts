@@ -1,4 +1,3 @@
-import { waitForNativeMainStartupGate } from "../../src/codex/native-profile-startup";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -16,7 +15,9 @@ import { createTestTranslatorBudget } from "../helpers/translator-budget";
 import type { TranslatorBudget } from "../../src/lib/translator-budget";
 import {
   resetProviderRequestPacingForTest,
+  setProviderRequestPacingLimitsForTest,
   setProviderRequestPacingRuntimeForTest,
+  waitForProviderRequestSlot,
 } from "../../src/providers/request-pacing";
 import {
   acquireNativeMainProfileDrain,
@@ -984,6 +985,56 @@ test("chat-native consumes pacing before the response-header timeout starts", as
   expect(starts).toBe(2);
 });
 
+test("chat-native does not count pacing rejection as a physical send", async () => {
+  const { clearRequestLogsForTests, getRequestLogEntries } = await import("../../src/server/request-log");
+  clearRequestLogsForTests();
+  let now = 0;
+  setProviderRequestPacingRuntimeForTest({
+    now: () => now,
+    setTimer: callback => callback,
+    clearTimer: () => {},
+    enqueueMicrotask: callback => callback(),
+  });
+
+  let starts = 0;
+  const providerExecutor = Object.assign(async () => {
+    starts += 1;
+    return Response.json({
+      id: "chatcmpl_unexpected",
+      object: "chat.completion",
+      choices: [{ index: 0, message: { role: "assistant", content: "unexpected" }, finish_reason: "stop" }],
+    });
+  }, { preconnect() {} }) as typeof globalThis.fetch;
+  const config = mockConfig("https://provider.example/v1", {
+    requestPacing: { enabled: true, minIntervalMs: 100 },
+    fetch: providerExecutor,
+  } as Partial<OcxProviderConfig> & { fetch: typeof globalThis.fetch });
+  await waitForProviderRequestSlot("mock", config.providers.mock!, "test-model");
+  setProviderRequestPacingLimitsForTest({ maxQueueDepth: 0 });
+  saveConfig(config);
+  const server = startServer(0);
+
+  try {
+    const response = await originalFetch(new URL("/v1/chat/completions", server.url), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "mock/test-model",
+        stream: false,
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    });
+    expect(response.status).toBe(502);
+    expect(starts).toBe(0);
+    expect(getRequestLogEntries().findLast(entry => entry.inboundProtocol === "chat")?.attempts)
+      .toMatchObject([{ sendCount: 0 }]);
+  } finally {
+    now = 100;
+    await server.stop(true);
+    clearRequestLogsForTests();
+  }
+});
+
 test("chat-native stays outside the Responses empty-completion retry guard", async () => {
   const { handleChatCompletions } = await import("../../src/server/chat-completions");
   let upstreamCalls = 0;
@@ -1645,7 +1696,10 @@ test("chat-native preserves same-key retry, key rotation, usage, and request log
     const entry = getRequestLogEntries().at(-1);
     expect(entry?.status).toBe(200);
     expect(entry?.usage).toMatchObject({ inputTokens: 4, outputTokens: 2 });
-    expect(entry?.attempts?.[0]?.recoveryKinds).toEqual(["rate-limit-429", "key-429"]);
+    expect(entry?.attempts).toMatchObject([
+      { status: 429, sendCount: 2, recoveryKinds: ["rate-limit-429"] },
+      { sendCount: 1, recoveryKinds: ["key-429"] },
+    ]);
   } finally {
     await server.stop(true);
     upstream.stop(true);

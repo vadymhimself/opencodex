@@ -204,6 +204,32 @@ describe("active registry admission", () => {
     expect(after.releaseMisses).toBe(before.releaseMisses);
   });
 
+  test("forced shutdown cancels the source reader owned by a streamed turn", async () => {
+    const before = activeRegistryMetrics().activeTurns.active;
+    let cancels = 0;
+    let reading!: () => void;
+    const readStarted = new Promise<void>(resolve => { reading = resolve; });
+    const source = new ReadableStream<Uint8Array>({
+      pull() {
+        reading();
+        return new Promise<void>(() => {});
+      },
+      cancel() { cancels += 1; },
+    });
+    const lease = tryAdmitTurn()!;
+    const controller = new AbortController();
+    const reader = trackStreamLifetime(source, controller, undefined, lease).getReader();
+    const pendingRead = reader.read();
+    await readStarted;
+    expect(activeRegistryMetrics().activeTurns.active).toBe(before + 1);
+
+    const reason = new Error("server shutdown");
+    abortAndReleaseAllTurns(reason);
+    await expect(pendingRead).rejects.toBe(reason);
+    expect(cancels).toBe(1);
+    expect(activeRegistryMetrics().activeTurns.active).toBe(before);
+  });
+
   test("storage worker reservation 17 rejects before enqueue and the first 16 spawn serially and drain", async () => {
     let releaseFirst!: () => void;
     const blocked = new Promise<void>(resolve => { releaseFirst = resolve; });

@@ -2,8 +2,6 @@ import type { ProviderAdapter } from "../adapters/base";
 import type { AdapterEvent } from "../types";
 import {
   isTranslatorBudgetExceededError,
-  TRANSLATOR_MAX_TURN_BYTES,
-  TranslatorBudgetExceededError,
   type TranslatorBudget,
 } from "../lib/translator-budget";
 
@@ -248,7 +246,7 @@ export async function* parseStreamWithProgress(
   resetInactivity();
 
   const parserPump = (async (): Promise<void> => {
-    let heldTerminal: Extract<AdapterEvent, { type: "done" | "incomplete" }> | undefined;
+    let heldTerminal: Extract<AdapterEvent, { type: "done" | "incomplete" | "error" }> | undefined;
     try {
       iterator = parseStream(tappedResponse, options.translatorBudget);
       if (settled) {
@@ -290,18 +288,12 @@ export async function* parseStreamWithProgress(
         const event = result.value;
         if (heldTerminal) {
           throw new WebSearchStreamProtocolError(
-            event.type === "done" || event.type === "incomplete"
+            event.type === "done" || event.type === "incomplete" || event.type === "error"
               ? "adapter yielded more than one terminal event"
               : "adapter yielded an event after its terminal event",
           );
         }
-        if (event.type === "error") {
-          fail(event.code === "translation_buffer_limit"
-            ? new TranslatorBudgetExceededError("live_transient", TRANSLATOR_MAX_TURN_BYTES)
-            : new Error(event.message));
-          return;
-        }
-        if (event.type === "done" || event.type === "incomplete") {
+        if (event.type === "done" || event.type === "incomplete" || event.type === "error") {
           heldTerminal = event;
           continue;
         }

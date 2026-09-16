@@ -137,6 +137,15 @@ describe("WS endpoint re-framer (120/132)", () => {
     expect(JSON.parse(sent[1]).type).toBe("response.completed");
   });
 
+  test("supports lone-CR framing when final delimiter resolves at EOF", async () => {
+    const { ws, sent } = mockWs();
+    await pumpResponsesSseToWebSocket(ws, sseStream([
+      'event: response.completed\rdata: {"type":"response.completed","response":{"id":"r1"}}\r',
+      "\r",
+    ]));
+    expect(sent.map(frame => JSON.parse(frame).type)).toEqual(["response.completed"]);
+  });
+
   test("emits standalone transport error when EOF arrives before a terminal event", async () => {
     const { ws, sent } = mockWs();
     await pumpResponsesSseToWebSocket(ws, sseStream([

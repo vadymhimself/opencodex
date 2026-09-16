@@ -10,6 +10,7 @@ import {
   ANALYTICS_MAX_ROWS,
   computeRoutingAnalytics,
 } from "../../routing/analytics";
+import { parseRange, parseUsageSurface, rangeWindow } from "../../usage/summary";
 import { jsonResponse } from "../auth-cors";
 import type { ManagementContext } from "./context";
 
@@ -25,6 +26,13 @@ export async function handleRoutingAnalyticsRoutes(ctx: ManagementContext): Prom
   const { url, req, config } = ctx;
   if (url.pathname !== "/api/routing-analytics" || req.method !== "GET") return null;
 
+  const rangeRaw = url.searchParams.get("range");
+  if (rangeRaw !== null && !["today", "1d", "7d", "30d", "all"].includes(rangeRaw)) {
+    return jsonResponse({ error: { code: "invalid_range", message: "range must be today, 1d, 7d, 30d, or all" } }, 400, req, config);
+  }
+  const rangeFrom = rangeRaw === null
+    ? undefined
+    : rangeWindow(parseRange(rangeRaw), Date.now()).since ?? undefined;
   const fromParsed = parseQueryInt(url.searchParams.get("from"));
   if (fromParsed === "invalid") {
     return jsonResponse({ error: { code: "invalid_from", message: "from must be an integer timestamp" } }, 400, req, config);
@@ -33,7 +41,7 @@ export async function handleRoutingAnalyticsRoutes(ctx: ManagementContext): Prom
   if (toParsed === "invalid") {
     return jsonResponse({ error: { code: "invalid_to", message: "to must be an integer timestamp" } }, 400, req, config);
   }
-  const from = fromParsed;
+  const from = fromParsed ?? rangeFrom;
   const to = toParsed;
   if (from !== undefined && to !== undefined && from > to) {
     return jsonResponse({ error: { code: "invalid_range", message: "from must not be after to" } }, 400, req, config);
@@ -66,7 +74,7 @@ export async function handleRoutingAnalyticsRoutes(ctx: ManagementContext): Prom
     provider: url.searchParams.get("provider")?.trim() || undefined,
     model: url.searchParams.get("model")?.trim() || undefined,
     profileId: url.searchParams.get("profileId")?.trim() || undefined,
-    surface: url.searchParams.get("surface")?.trim() || undefined,
+    surface: parseUsageSurface(url.searchParams.get("surface")),
     from,
     to,
   }, { maxRows });

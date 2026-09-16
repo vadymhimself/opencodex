@@ -5,6 +5,7 @@ import type {
   OcxParsedRequest,
   OcxUsage,
 } from "../../types";
+import { mergeUsage } from "./empty-completion-guard";
 
 const ACTIONABLE_REQUEST_RE = /(?:\b(?:add|change|check|continue|create|debug|delete|deploy|edit|execute|fix|implement|inspect|keep going|modify|patch|proceed|refactor|remove|review|run|test|update|write)\b|继续|接着|往下|升级|修改|改(?:一下|下)?|修复|实现|添加|新增|删除|重构|更新|运行|执行|检查|查看|排查|调试|创建|写入|提交|推送|部署|看下|改成|修一下)/iu;
 const PLAN_ONLY_REQUEST_RE = /(?:暂时不要(?:调用|使用)工具|不要调用工具|不用执行|只回复(?:计划|方案)|(?:只|先|给|说|写|出|来)(?:我)?(?:一个|个|一下|份)?[^。！？\n]{0,8}?(?:计划|方案|草案|提案|思路)|(?:计划|方案|草案|提案|思路)(?:就(?:行|好|可以)|即可)|\b(?:just give|provide)\s+(?:me\s+)?(?:a\s+)?plan\b|\b(?:do not|don't)\s+(?:use|call)\s+tools?\b|\b(?:write|draft|outline|propose|give|provide|create|make|share|suggest|sketch)\s+(?:me\s+)?(?:a\s+|an\s+|the\s+|your\s+)?(?:(?:brief|concise|short|detailed|high[-\s]?level|rough|quick|step[-\s]?by[-\s]?step|implementation|migration|refactor(?:ing)?|design|technical)\s+)*(?:plan|proposal|draft|outline|approach|strategy|design\s+doc)\b)/iu;
@@ -165,34 +166,6 @@ export interface GuardedEventStreamOptions {
  */
 export function isTerminalGuardPassthroughOnly(event: AdapterEvent): boolean {
   return event.type === "heartbeat" || event.type === "tool_call_delta";
-}
-
-function mergeUsage(first: OcxUsage | undefined, second: OcxUsage | undefined): OcxUsage | undefined {
-  if (!first) return second;
-  if (!second) return first;
-  const sumOptional = (key: keyof OcxUsage): number | undefined => {
-    const left = first[key];
-    const right = second[key];
-    return typeof left === "number" || typeof right === "number"
-      ? (typeof left === "number" ? left : 0) + (typeof right === "number" ? right : 0)
-      : undefined;
-  };
-  const cachedInputTokens = sumOptional("cachedInputTokens");
-  const cacheReadInputTokens = sumOptional("cacheReadInputTokens");
-  const cacheCreationInputTokens = sumOptional("cacheCreationInputTokens");
-  const reasoningOutputTokens = sumOptional("reasoningOutputTokens");
-  const inputTokens = first.inputTokens + second.inputTokens;
-  const outputTokens = first.outputTokens + second.outputTokens;
-  return {
-    inputTokens,
-    outputTokens,
-    totalTokens: inputTokens + outputTokens,
-    ...(cachedInputTokens !== undefined ? { cachedInputTokens } : {}),
-    ...(cacheReadInputTokens !== undefined ? { cacheReadInputTokens } : {}),
-    ...(cacheCreationInputTokens !== undefined ? { cacheCreationInputTokens } : {}),
-    ...(reasoningOutputTokens !== undefined ? { reasoningOutputTokens } : {}),
-    ...(first.estimated || second.estimated ? { estimated: true } : {}),
-  };
 }
 
 /** Preserve normal terminals, but withhold one suspicious no-tool terminal for a bounded re-ask. */

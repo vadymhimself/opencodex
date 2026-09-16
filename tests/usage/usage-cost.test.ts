@@ -472,6 +472,18 @@ describe("combo", () => {
       { ordinal: 1, provider: "pa", model: "ma", usageStatus: "unreported" },
     ], overlays)).toBeNull();
   });
+
+  test("15. unmeasured attempt counters are never priced", () => {
+    for (const usageStatus of ["unreported", "unsupported"] as const) {
+      expect(estimateAttemptCost({
+        ordinal: 1,
+        provider: "pa",
+        model: "ma",
+        usageStatus,
+        usage: { inputTokens: 100, outputTokens: 10 },
+      }, overlays)).toBeNull();
+    }
+  });
 });
 
 describe("estimateRequestCost", () => {
@@ -482,6 +494,20 @@ describe("estimateRequestCost", () => {
     const est = estimateRequestCost({ provider: "p", model: "m", usageStatus: "estimated", usage: { inputTokens: 10, outputTokens: 5, estimated: true } }, overlays);
     expect(est?.estimated).toBe(true);
     expect(estimateRequestCost({ provider: "p", model: "m", usageStatus: "unreported" }, overlays)).toBeNull();
+  });
+
+  test("unmeasured request counters are never priced", () => {
+    const overlays: ExpectedPriceOverlay[] = [
+      { provider: "p", modelId: "m", cost4: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, source: "s", verifiedAt: "2026-07-20", status: "verified" },
+    ];
+    for (const usageStatus of ["unreported", "unsupported"] as const) {
+      expect(estimateRequestCost({
+        provider: "p",
+        model: "m",
+        usageStatus,
+        usage: { inputTokens: 100, outputTokens: 10 },
+      }, overlays)).toBeNull();
+    }
   });
 });
 

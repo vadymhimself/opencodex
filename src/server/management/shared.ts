@@ -37,7 +37,7 @@ import { DEFAULT_PROVIDER_CONTEXT_CAP, globalContextCapValue, providerContextCap
 import { resolveCodexHomeDir } from "../../codex/home";
 import { readUsageEntries } from "../../usage/log";
 import { getUsageDebugLogEntries } from "../../usage/debug";
-import { parseRange, parseUsageSurface, summarizeUsage } from "../../usage/summary";
+import { normalizePhysicalEntry, parseRange, parseUsageSurface, summarizeUsage } from "../../usage/summary";
 import { stripCodexRuntimeProviderFields } from "../../codex/auth-context";
 import { getProviderRegistryEntry, providerMatchesRegistryTransport } from "../../providers/registry";
 import { getDebugLogEntries } from "../../lib/debug-log-buffer";
@@ -101,7 +101,7 @@ export type MetricSource = Pick<RequestLogEntry, "provider" | "model" | "duratio
 };
 
 export function tokPerSecondResult(entry: Pick<MetricSource, "durationMs" | "usageStatus" | "usage">): TokPerSecondResult {
-  if (!entry.usage) return { kind: "unavailable", reason: "usage_missing" };
+  if (!entry.usage || entry.usageStatus === "unreported") return { kind: "unavailable", reason: "usage_missing" };
   if (entry.usageStatus === "unsupported") return { kind: "unavailable", reason: "usage_unsupported" };
   const value = tokensPerSecond(entry.usage.outputTokens, entry.durationMs);
   if (value === null) {
@@ -117,10 +117,11 @@ export function unavailableCostReason(entry: MetricSource): MetricUnavailableRea
   // Normalizer-first classification: the landed normalizer recovers legacy
   // cachedInputTokens=read+write rows via retry, so a raw read+write>input
   // pre-check would misclassify recoverable rows (020 audit blocker #2).
-  if (!entry.usage && !entry.attempts?.length) return "usage_missing";
+  if (entry.attempts !== undefined) {
+    return entry.attempts.length > 0 ? "combo_attempt_unavailable" : "usage_missing";
+  }
+  if (!entry.usage || entry.usageStatus === "unreported") return "usage_missing";
   if (entry.usageStatus === "unsupported") return "usage_unsupported";
-  if (entry.attempts?.length) return "combo_attempt_unavailable";
-  if (!entry.usage) return "usage_missing";
   if (!normalizeCostTokens(entry.usage)) {
     const effectiveRead = entry.usage.cacheReadInputTokens ?? entry.usage.cachedInputTokens ?? 0;
     const effectiveWrite = entry.usage.cacheCreationInputTokens ?? 0;
@@ -134,7 +135,7 @@ export function unavailableCostReason(entry: MetricSource): MetricUnavailableRea
 /** Display-time cost estimate for one log entry (or its attempt list), including the reasons that qualify the estimate. */
 export function costResult(entry: MetricSource): CostResult {
   const tier = serviceTierContext(entry);
-  const estimate = entry.attempts?.length
+  const estimate = entry.attempts !== undefined
     ? estimateComboCost(entry.attempts.map(attempt => ({ ...attempt, ...usageModelPriceOptions(entry, attempt) })), undefined, tier)
     : estimateRequestCost({ provider: entry.provider, model: entry.model, usage: entry.usage, usageStatus: entry.usageStatus, serviceTier: tier, ...usageModelPriceOptions(entry, entry) });
   if (!estimate) return { kind: "unavailable", reason: unavailableCostReason(entry) };
@@ -153,11 +154,12 @@ export function costResult(entry: MetricSource): CostResult {
 }
 
 export function requestLogDto(entry: RequestLogEntry): Record<string, unknown> {
+  const metricEntry = normalizePhysicalEntry({ ...entry, accountLogLabel: undefined });
   return {
     ...entry,
     displayMetrics: {
-      tokPerSecond: tokPerSecondResult(entry),
-      cost: costResult(entry),
+      tokPerSecond: tokPerSecondResult(metricEntry),
+      cost: costResult(metricEntry),
     },
     ...(entry.attempts?.length
       ? {

@@ -23,16 +23,19 @@ import {
   BoundedSseFrameBuffer,
   joinSseFrameBytes,
   MAX_CLIENT_SSE_FRAME_BYTES,
+  sseDelimiterLengthAt,
 } from "./sse-frame-buffer";
 import { replaceSseDataPayload } from "./sse-payload-rewrite";
 
 const nativePassthroughSseResponses = new WeakSet<Response>();
+const anthropicSourceReplayResponses = new WeakSet<Response>();
 const eagerRelaySseResponses = new WeakSet<Response>();
 
 export const MAX_INSPECTION_SSE_FRAME_BYTES = MAX_CLIENT_SSE_FRAME_BYTES;
 export const MAX_COMPLETED_OUTPUT_ITEMS = 256;
 export const MAX_COMPLETED_OUTPUT_ITEM_SOURCE_BYTES = 8 * 1024 * 1024;
 export const MAX_TAIL_ERROR_MESSAGE_CHARS = 512;
+const MAX_INSPECTION_SSE_FRAMES_PER_FEED = 4_096;
 const ADAPTER_EOF_INCOMPLETE_PAYLOAD = JSON.stringify({
   type: "response.incomplete",
   response: {
@@ -227,15 +230,18 @@ export function createSseTerminalOutputBoundary(): SseTerminalOutputBoundary {
     },
     finish() {
       if (disposed || terminal) return new Uint8Array(0);
-      const tail = framer.finish();
-      if (tail.byteLength === 0) return new Uint8Array(0);
+      const { frames, tail } = framer.finishFrames();
+      const completed = processFrames(frames);
+      if (tail.byteLength === 0) return completed;
       // EOF may cut off the final SSE block before its blank-line delimiter.
       // Feed it through the exact same parser/rewrite/terminal path as a
       // complete frame, using a synthetic delimiter so the client receives a
       // dispatchable event rather than an unterminated tail.
       const tailText = decoder.decode(tail);
-      const delimiter = encoder.encode(tailText.includes("\r\n") ? "\r\n\r\n" : "\n\n");
-      return processFrames([{ block: tail, delimiter }]);
+      const delimiter = encoder.encode(
+        tailText.includes("\r\n") ? "\r\n\r\n" : tailText.includes("\r") ? "\r\r" : "\n\n",
+      );
+      return joinSseFrameBytes([completed, processFrames([{ block: tail, delimiter }])]);
     },
     terminalSeen: () => terminal,
     doneSeen: () => done,
@@ -352,19 +358,9 @@ export function relaySseWithFailedTail(
   });
 }
 
-export function nextSseBlock(buffer: string): { block: string; delimiter: string; rest: string } | null {
-  const match = buffer.match(/\r?\n\r?\n/);
-  if (!match || match.index === undefined) return null;
-  return {
-    block: buffer.slice(0, match.index),
-    delimiter: match[0],
-    rest: buffer.slice(match.index + match[0].length),
-  };
-}
-
 export function sseDataPayload(block: string): string | null {
   const data: string[] = [];
-  for (const line of block.split(/\r?\n/)) {
+  for (const line of block.split(/\r\n|\r|\n/)) {
     if (!line.startsWith("data:")) continue;
     const value = line.slice(5);
     data.push(value.startsWith(" ") ? value.slice(1) : value);
@@ -439,9 +435,9 @@ function isPolicyRewriteType(parsed: unknown): boolean {
 }
 
 function rewritePolicyTerminalBlock(block: string, payload: string): string {
-  const newline = block.includes("\r\n") ? "\r\n" : "\n";
+  const newline = block.includes("\r\n") ? "\r\n" : block.includes("\r") ? "\r" : "\n";
   const rewritten = replaceSseDataPayload(block, payload);
-  const lines = rewritten.split(/\r?\n/);
+  const lines = rewritten.split(/\r\n|\r|\n/);
   let eventRewritten = false;
   const withEvent = lines.map(line => {
     if (!eventRewritten && line.startsWith("event:")) {
@@ -650,7 +646,10 @@ export function responseWithDeferredRequestLog(
   if (isUsageDebugEnabled() && !logCtx.usageDebugContentType && contentType) {
     logCtx.usageDebugContentType = contentType;
   }
-  if (isNativePassthroughSseResponse(response)) {
+  if (
+    isNativePassthroughSseResponse(response)
+    || isAnthropicSourceReplayResponse(response)
+  ) {
     return response;
   }
   if (!response.body || !contentType.includes("text/event-stream")) {
@@ -722,6 +721,15 @@ export function markNativePassthroughSseResponse(response: Response): Response {
 
 export function isNativePassthroughSseResponse(response: Response): boolean {
   return nativePassthroughSseResponses.has(response);
+}
+
+export function markAnthropicSourceReplayResponse(response: Response): Response {
+  anthropicSourceReplayResponses.add(response);
+  return response;
+}
+
+export function isAnthropicSourceReplayResponse(response: Response): boolean {
+  return anthropicSourceReplayResponses.has(response);
 }
 
 export function markEagerRelaySseResponse(response: Response): Response {
@@ -809,8 +817,8 @@ export function relaySseWithHeartbeat(
  * Does not produce output; safe to ignore errors (the client-facing stream is separate).
  */
 export type SseInspector = {
-  /** Feed one upstream chunk through the SSE scanning state machine. */
-  feed(chunk: Uint8Array): void;
+  /** Feed one upstream chunk; returns bytes through first configured terminal. */
+  feed(chunk: Uint8Array): number | undefined;
   /** Flush the decoder + trailing unterminated buffer (upstream cleanly done). */
   finish(): void;
   /** Drop every retained frame/item reference without parsing. Idempotent. */
@@ -825,6 +833,18 @@ export type SseInspectorHandlers = {
   onTerminal?: (status: ResponsesTerminalStatus, httpStatusOverride?: number) => void;
   logCtx?: RequestLogContext;
   onCompletedResponse?: (response: { id?: unknown; output?: unknown; status?: unknown }) => void;
+  /** Override the standard Responses terminal classifier for this protocol. */
+  classifyTerminal?: (payload: unknown) => ResponsesTerminalStatus | null;
+  /** Stop parsing at first terminal and return its byte boundary from feed(). */
+  stopAtTerminal?: boolean;
+  /** Require every SSE data payload to be a valid JSON object record. */
+  strictJsonRecords?: boolean;
+  /** Receive each complete frame only after strict validation; return false to stop at its boundary. */
+  onValidatedFrame?: (frame: Uint8Array) => boolean | void;
+  /** Notify replay owners when best-effort inspection stops at its per-feed work limit. */
+  onInspectionLimit?: () => void;
+  /** Receive the first strict protocol failure. */
+  onProtocolError?: (message: string) => void;
   /**
    * Every parsed SSE payload, delivered BEFORE any onCompletedResponse derived from that same
    * payload. A caller that must decide on the whole turn -- not just its terminal snapshot --
@@ -843,31 +863,6 @@ export type SseInspectorHandlers = {
 
 type CompletedOutputItem = { item: unknown; sourceBytes: number };
 
-function delimiterLengthAt(
-  index: number,
-  length: number,
-  byteAt: (index: number) => number,
-): number | 0 | undefined {
-  const first = byteAt(index);
-  if (first === 10) {
-    if (index + 1 >= length) return undefined;
-    const second = byteAt(index + 1);
-    if (second === 10) return 2;
-    if (second !== 13) return 0;
-    if (index + 2 >= length) return undefined;
-    return byteAt(index + 2) === 10 ? 3 : 0;
-  }
-  if (first !== 13) return 0;
-  if (index + 1 >= length) return undefined;
-  if (byteAt(index + 1) !== 10) return 0;
-  if (index + 2 >= length) return undefined;
-  const third = byteAt(index + 2);
-  if (third === 10) return 3;
-  if (third !== 13) return 0;
-  if (index + 3 >= length) return undefined;
-  return byteAt(index + 3) === 10 ? 4 : 0;
-}
-
 /**
  * Per-chunk SSE inspection state machine shared by consumeForInspection,
  * consumeForResponseLogMetadata, and the eager bounded relay (relay-eager.ts).
@@ -884,14 +879,18 @@ function delimiterLengthAt(
  *   the caller owns `cancelled` state and reads `reported()` to decide.
  */
 export function createSseInspector(handlers: SseInspectorHandlers): SseInspector {
-  let decoder: TextDecoder | null = new TextDecoder();
+  let decoder: TextDecoder | null = new TextDecoder("utf-8", {
+    fatal: handlers.strictJsonRecords === true,
+  });
   let reported = false;
   let sawTerminal = false;
   let disposed = false;
+  let protocolFailed = false;
   let delimiterTail: Uint8Array = new Uint8Array(0);
   let candidate: Uint8Array = new Uint8Array(0);
   let candidateBytes = 0;
   let discardingOversizedFrame = false;
+  let stopRequested = false;
   const reportFirstOutput = createFirstOutputReporter(handlers.onFirstOutput);
   // Allocate reconstruction state only for persistence-capable inspectors.
   const completedItemsByOutputIndex = handlers.onCompletedResponse
@@ -921,6 +920,17 @@ export function createSseInspector(handlers: SseInspectorHandlers): SseInspector
     clearFrameState();
     clearCompletedItems();
     firstResponseId = undefined;
+  };
+
+  const reportProtocolError = (message: string): void => {
+    if (protocolFailed) return;
+    protocolFailed = true;
+    reconstructionTainted = true;
+    try {
+      handlers.onProtocolError?.(message);
+    } catch {
+      /* protocol failure remains authoritative */
+    }
   };
 
   const ensureCandidateCapacity = (requiredBytes: number): void => {
@@ -963,6 +973,11 @@ export function createSseInspector(handlers: SseInspectorHandlers): SseInspector
       // any later empty-output terminal must not synthesize a partial replay
       // from the surviving map entries (same taint rule as item eviction).
       reconstructionTainted = true;
+      if (handlers.strictJsonRecords) {
+        reportProtocolError(
+          `upstream SSE frame exceeded ${MAX_INSPECTION_SSE_FRAME_BYTES} bytes`,
+        );
+      }
       return;
     }
     ensureCandidateCapacity(nextBytes);
@@ -1002,8 +1017,8 @@ export function createSseInspector(handlers: SseInspectorHandlers): SseInspector
     );
   };
 
-  const scanPayload = (payload: string | null, sourceBytes: number): void => {
-    if (!payload) return;
+  const scanPayload = (payload: string | null, sourceBytes: number): ResponsesTerminalStatus | null => {
+    if (!payload) return null;
     let parsed: unknown | undefined;
     if (payload !== "[DONE]") {
       try {
@@ -1021,7 +1036,9 @@ export function createSseInspector(handlers: SseInspectorHandlers): SseInspector
       try { handlers.onParsedPayload(parsed); } catch { /* inspection must never throw into the pump */ }
     }
     reportFirstOutput.parsed(parsed);
-    const status = terminalStatusFromParsed(parsed);
+    const status = handlers.classifyTerminal
+      ? handlers.classifyTerminal(parsed)
+      : terminalStatusFromParsed(parsed);
     const policyTerminal = status === "failed"
       && isPolicyRewriteType(parsed)
       && cyberPolicyTerminalError(parsed) !== undefined;
@@ -1083,7 +1100,7 @@ export function createSseInspector(handlers: SseInspectorHandlers): SseInspector
           && response.output.length > 0;
         if (!hasAuthoritativeOutput && reconstructionTainted) {
           clearCompletedItems();
-          return;
+          return status;
         }
         if (!hasAuthoritativeOutput && completedItemsByOutputIndex!.size > 0) {
           response = {
@@ -1102,21 +1119,57 @@ export function createSseInspector(handlers: SseInspectorHandlers): SseInspector
         clearCompletedItems();
       }
     }
+    return status;
   };
 
-  const completeCandidate = (): void => {
+  const completeCandidate = (delimiter: Uint8Array = new Uint8Array(0)): boolean => {
     if (discardingOversizedFrame) {
       discardingOversizedFrame = false;
-      return;
+      return false;
     }
     const sourceBytes = candidateBytes;
     const frame = takeCandidate();
-    if (reported && !handlers.onCompletedResponse) return;
-    const decoded = decoder!.decode(frame);
-    scanPayload(sseDataPayload(decoded), sourceBytes);
+    if (reported && !handlers.onCompletedResponse) return false;
+    let decoded: string;
+    try {
+      decoded = decoder!.decode(frame);
+    } catch {
+      reportProtocolError("upstream SSE frame contained invalid UTF-8");
+      return false;
+    }
+    const payload = sseDataPayload(decoded);
+    if (handlers.strictJsonRecords) {
+      const hasData = decoded.split(/\r\n|\r|\n/).some(
+        line => line === "data" || line.startsWith("data:"),
+      );
+      if (hasData) {
+        if (!payload) {
+          reportProtocolError("upstream SSE data payload was empty");
+          return false;
+        }
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(payload);
+        } catch {
+          reportProtocolError("upstream SSE data payload was not valid JSON");
+          return false;
+        }
+        if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+          reportProtocolError("upstream SSE data payload was not a JSON object");
+          return false;
+        }
+      }
+    }
+    const terminal = scanPayload(payload, sourceBytes) !== null;
+    if (handlers.strictJsonRecords) {
+      stopRequested = handlers.onValidatedFrame?.(
+        joinSseFrameBytes([frame, delimiter]),
+      ) === false;
+    }
+    return terminal;
   };
 
-  const scanChunk = (chunk: Uint8Array): void => {
+  const scanChunk = (chunk: Uint8Array): number | undefined => {
     const previousTail = delimiterTail;
     delimiterTail = new Uint8Array(0);
     const tailLength = previousTail.byteLength;
@@ -1135,40 +1188,80 @@ export function createSseInspector(handlers: SseInspectorHandlers): SseInspector
     };
     let index = 0;
     let retainedThrough = 0;
+    let completedFrames = 0;
     while (index < totalLength) {
-      const delimiterLength = delimiterLengthAt(index, totalLength, byteAt);
+      const delimiterLength = sseDelimiterLengthAt(index, totalLength, byteAt);
       if (delimiterLength === undefined) break;
       if (delimiterLength > 0) {
+        completedFrames += 1;
+        if (completedFrames > MAX_INSPECTION_SSE_FRAMES_PER_FEED) {
+          reconstructionTainted = true;
+          if (handlers.strictJsonRecords) {
+            reportProtocolError("upstream SSE chunk exceeded 4,096 complete frames");
+          } else {
+            try { handlers.onInspectionLimit?.(); } catch { /* inspection must not throw */ }
+            protocolFailed = true;
+          }
+          clearFrameState();
+          return undefined;
+        }
         retainRange(retainedThrough, index);
-        completeCandidate();
+        if (protocolFailed) {
+          clearFrameState();
+          return undefined;
+        }
+        const delimiter = new Uint8Array(delimiterLength);
+        for (let offset = 0; offset < delimiterLength; offset += 1) {
+          delimiter[offset] = byteAt(index + offset);
+        }
+        const terminal = completeCandidate(delimiter);
         index += delimiterLength;
         retainedThrough = index;
+        if (protocolFailed) {
+          clearFrameState();
+          return undefined;
+        }
+        if ((terminal && handlers.stopAtTerminal) || stopRequested) {
+          clearFrameState();
+          return Math.min(chunk.byteLength, Math.max(0, index - tailLength));
+        }
         continue;
       }
       index += 1;
     }
     retainRange(retainedThrough, index);
+    if (protocolFailed) {
+      clearFrameState();
+      return undefined;
+    }
     if (index < totalLength) {
       delimiterTail = new Uint8Array(totalLength - index);
       for (let offset = 0; offset < delimiterTail.byteLength; offset += 1) {
         delimiterTail[offset] = byteAt(index + offset);
       }
     }
+    return undefined;
   };
 
   return {
     feed(chunk) {
-      if (!disposed) scanChunk(chunk);
+      return disposed || protocolFailed ? undefined : scanChunk(chunk);
     },
     finish() {
       if (disposed) return;
       try {
-        retainCandidateSlice(delimiterTail);
+        const delimiter = delimiterTail;
         delimiterTail = new Uint8Array(0);
-        if (!discardingOversizedFrame && candidateBytes > 0 && !reported) {
-          const sourceBytes = candidateBytes;
-          const decoded = decoder!.decode(takeCandidate());
-          scanPayload(decoded.trim() ? sseDataPayload(decoded) : null, sourceBytes);
+        const delimiterLength = delimiter.byteLength > 0
+          ? sseDelimiterLengthAt(0, delimiter.byteLength, index => delimiter[index]!, true)
+          : 0;
+        if (!discardingOversizedFrame && !reported && !protocolFailed) {
+          if (delimiter.byteLength > 0 && delimiterLength === delimiter.byteLength) {
+            completeCandidate(delimiter);
+          } else {
+            retainCandidateSlice(delimiter);
+            if (candidateBytes > 0) completeCandidate();
+          }
         }
       } finally {
         clearFrameState();

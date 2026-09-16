@@ -328,14 +328,31 @@ export type AdapterEvent =
   // "Searching the web" spinner, then `end` once it resolves. The bridge maps begin → an
   // output_item.added(in_progress) and end → the matching output_item.done(completed|failed) under
   // the SAME output index, so the activity animates instead of flashing completed instantly.
-  | { type: "web_search_call_begin"; id: string }
-  | { type: "web_search_call_end"; id: string; queries: string[]; status?: "completed" | "failed"; sources?: OcxUrlCitation[] }
+  | {
+      type: "web_search_call_begin";
+      id: string;
+      anthropicServerTool?: Record<string, unknown>;
+    }
+  | {
+      type: "web_search_call_end";
+      id: string;
+      queries: string[];
+      status?: "completed" | "failed";
+      sources?: OcxUrlCitation[];
+      anthropicServerToolResult?: Record<string, unknown>;
+    }
+  /** Opaque native Anthropic blocks retained only for immediate Messages round-trip. */
+  | { type: "anthropic_server_block"; block: Record<string, unknown> }
+  | { type: "anthropic_citation_delta"; delta: Record<string, unknown> }
   | {
       type: "done";
       usage?: OcxUsage;
       /** Native opaque compaction ciphertext returned by a Responses backend. */
       compactionEncryptedContent?: string;
       stopReason?: string;
+      /** Exact Anthropic terminal fields, present only for canonical source replay. */
+      anthropicStopReason?: string;
+      anthropicStopSequence?: string | null;
       endTurn?: boolean;
       providerState?: OcxProviderContinuationState;
     }
@@ -395,6 +412,8 @@ export interface OcxUsage {
   cacheReadInputTokens?: number;
   cacheCreationInputTokens?: number;
   reasoningOutputTokens?: number;
+  /** Native Anthropic server-tool usage counts retained for immediate Messages round-trip. */
+  anthropicServerToolUse?: Record<string, number>;
   estimated?: boolean;
   /**
    * The raw upstream usage object for Responses-shaped upstreams (openai/codex#41980 parity):

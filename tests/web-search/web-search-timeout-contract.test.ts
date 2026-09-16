@@ -393,7 +393,7 @@ describe("web-search timeout runtime contracts", () => {
       connectTimeoutMs,
       on429: () => {
         rotations++;
-        return rotatedAdapter;
+        return { adapter: rotatedAdapter, recoveryKind: "key-429" };
       },
     }));
 

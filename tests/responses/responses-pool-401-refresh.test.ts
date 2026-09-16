@@ -205,16 +205,21 @@ afterEach(() => {
 describe("ordinary pool 401 refresh and replay (#2887)", () => {
   test("Responses refreshes a time-valid stored credential once and replays the same account", async () => {
     const harness = installHarness();
+    const logCtx = { model: "", provider: "" } as RequestLogContext;
     const response = await handleResponses(
       request("/v1/responses"),
       config(),
-      { model: "", provider: "" } as RequestLogContext,
+      logCtx,
     );
 
     // The defect surfaced as a 401 reaching the client with no refresh attempted.
     expect(response.status).toBe(200);
     expect(harness.refreshes).toEqual(["refresh-grant"]);
     expect(harness.sends).toEqual(["Bearer rejected-access", "Bearer refreshed-access"]);
+    expect(logCtx.attempts).toMatchObject([
+      { status: 401, sendCount: 1 },
+      { sendCount: 1, recoveryKinds: ["oauth-401"] },
+    ]);
     // Quarantine is the other half of the report: the account must stay usable.
     expect(isAccountNeedsReauth(ACCOUNT_ID)).toBe(false);
     expect(readStoredGeneration()).toBe(4);
@@ -821,12 +826,13 @@ describe("ordinary pool 401 refresh and replay (#2887)", () => {
     });
 
     let dispatchSignals = 0;
+    const logCtx = { model: "", provider: "" } as RequestLogContext;
     let response: Response;
     try {
       response = await handleResponses(
         request("/v1/responses"),
         cfg,
-        { model: "", provider: "" } as RequestLogContext,
+        logCtx,
         { onStoredPool401ReplayDispatched: () => { dispatchSignals += 1; } },
       );
     } finally {
@@ -840,6 +846,8 @@ describe("ordinary pool 401 refresh and replay (#2887)", () => {
     // downstream fallback is unreachable here for a reason that has nothing to do with this fix.
     expect(dispatchSignals).toBe(0);
     expect(harness.sends.filter(send => send === "Bearer refreshed-access")).toEqual([]);
+    expect(logCtx.attempts).toHaveLength(1);
+    expect(logCtx.attempts?.[0]).toMatchObject({ sendCount: 1 });
     // The refresh did happen — this is the post-refresh replay being rejected, not an earlier stop.
     expect(harness.refreshes).toEqual(["refresh-grant"]);
     expect(response.status).toBe(429);

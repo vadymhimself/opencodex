@@ -13,9 +13,15 @@ export function systemToInstructions(system: unknown): string | undefined {
   return undefined;
 }
 
-export function toolsToResponses(tools: unknown): Rec[] | undefined {
-  if (!Array.isArray(tools) || tools.length === 0) return undefined;
+export function toolsToResponses(tools: unknown): {
+  tools?: Rec[];
+  requiresExactAnthropicReplay: boolean;
+} {
+  if (!Array.isArray(tools) || tools.length === 0) {
+    return { requiresExactAnthropicReplay: false };
+  }
   const out: Rec[] = [];
+  let requiresExactAnthropicReplay = false;
   for (const raw of tools) {
     if (!isRec(raw)) continue;
     const type = typeof raw.type === "string" ? raw.type : "";
@@ -23,7 +29,12 @@ export function toolsToResponses(tools: unknown): Rec[] | undefined {
       out.push({ type: "web_search" }); // hosted sidecar path
       continue;
     }
-    if (typeof raw.name === "string" && raw.name.length > 0 && isRec(raw.input_schema)) {
+    if (
+      (type === "" || type === "custom")
+      && typeof raw.name === "string"
+      && raw.name.length > 0
+      && isRec(raw.input_schema)
+    ) {
       out.push({
         type: "function",
         name: raw.name,
@@ -32,9 +43,13 @@ export function toolsToResponses(tools: unknown): Rec[] | undefined {
       });
       continue;
     }
-    // Other server tools (bash_*, text_editor_*, ...) have no routed equivalent: drop.
+    // Anthropic-native and future server tools have no faithful Responses equivalent.
+    requiresExactAnthropicReplay = true;
   }
-  return out.length > 0 ? out : undefined;
+  return {
+    ...(out.length > 0 ? { tools: out } : {}),
+    requiresExactAnthropicReplay,
+  };
 }
 
 export function toolChoiceToResponses(choice: unknown, body: Rec): void {

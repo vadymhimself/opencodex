@@ -427,22 +427,46 @@ export function trackStreamLifetime(
   onDone?: () => void,
   lease?: AdmissionLease,
 ): ReadableStream<Uint8Array> {
-  registerTurn(ac, lease);
   const reader = body.getReader();
   let closed = false;
+  const tracksAdmission = lease !== undefined;
+  let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
+  let detachAbort = () => {};
   const finish = () => {
     if (closed) return;
     closed = true;
-    unregisterTurn(ac);
+    detachAbort();
+    if (tracksAdmission) unregisterTurn(ac);
     onDone?.();
   };
+  const onAbort = () => {
+    if (closed) return;
+    finish();
+    reader.cancel(ac.signal.reason).catch(() => {});
+    try { streamController?.error(ac.signal.reason); } catch { /* already closed */ }
+  };
+  registerTurn(ac, lease);
+  if (ac.signal.aborted) queueMicrotask(onAbort);
+  else {
+    ac.signal.addEventListener("abort", onAbort, { once: true });
+    detachAbort = () => ac.signal.removeEventListener("abort", onAbort);
+  }
   return new ReadableStream<Uint8Array>({
+    start(controller) {
+      streamController = controller;
+      if (closed) {
+        try { controller.error(ac.signal.reason); } catch { /* already closed */ }
+      }
+    },
     async pull(controller) {
+      if (closed) return;
       try {
         const { done, value } = await reader.read();
+        if (closed) return;
         if (done) { finish(); controller.close(); return; }
         controller.enqueue(value);
       } catch (err) {
+        if (closed) return;
         finish();
         try { controller.error(err); } catch { /* already closed */ }
       }
