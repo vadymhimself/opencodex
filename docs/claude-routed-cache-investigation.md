@@ -402,3 +402,33 @@ A gateway arm run against a cold prefix cohort scores 0.8522 on identical work, 
 ### Eval
 
 `scripts/claude-session-parity-live.ts` runs both arms as real Claude Code sessions against a throwaway gateway on an ephemeral port, seeded from a copied config/auth pair, with `OPENCODEX_HOME`, `CODEX_HOME`, and both Claude config dirs redirected so no live session is repointed. It measures from each arm's own transcript, deduplicating on `message.id`, and treats turn 2 onward as steady state so a new prefix cohort cannot score as a regression. The native arm clears `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_API_KEY` as well as `ANTHROPIC_BASE_URL`: a developer shell commonly carries gateway credentials, and clearing only the base URL either 401s or silently measures gateway-versus-gateway. Latest run: cache checks pass (gateway 0.9861 versus native 0.9663, raw 16 both), and the single failing check is `gateway_first_turn_not_inflated` at 2.47x, which is finding 3 above.
+
+## Tool search: the actual fix for the MCP inflation, 2026-09-16
+
+Finding 3 above (Claude Code inlining every MCP tool schema for a custom base URL) is documented client behaviour with a documented override, not an unavoidable cost. Claude Code defers MCP tools and discovers them on demand by default, but auto-disables tool search when `ANTHROPIC_BASE_URL` is a non-first-party host, because most proxies do not forward `tool_reference` blocks. `ENABLE_TOOL_SEARCH=true` overrides that.
+
+The strict canonical replay lane is exactly what the feature needs: it forwards the caller's Anthropic body verbatim and relays Anthropic's response bytes verbatim, so `tool_reference` survives untouched. Measured on this machine, same prompt, same 217 MCP tools, turn-0 inclusive input:
+
+| Arm | Turn-0 inclusive |
+|---|---|
+| Gateway, tool search off (previous behaviour) | 103,158 |
+| True native | 43,236 |
+| Gateway, tool search on (isolated build) | 35,619 |
+| Gateway, tool search on (live laptop gateway) | 33,984 |
+
+A 65% reduction that also puts the gateway below native, with every MCP server still attached. End-to-end proof rather than a token count: a session asked for a search, the transcript shows `ToolSearch` firing and then `mcp__perplexity__perplexity_search` executing and returning the right answer — a tool that was never in the initial prompt. Verified on both `claude-opus-5` and `combo/waterfall`.
+
+The Astra leg was not live-tested: an isolated `CODEX_HOME` has no native profile, so the request is fenced by the native-main startup gate with HTTP 503. Static reading says it degrades safely rather than failing — `src/adapters/openai-responses.ts` strips `defer_loading` and promotes deferred tools, and `src/responses/tool-search-compat.ts` rewrites a `tool_search` tool into a plain `function` — so Astra falls back to inlining: no saving, no error.
+
+## Deployment and live verification, 2026-09-16
+
+Commit `f47552136` on `upgrade/astra-v2.43.0`, pushed to `origin`. Gates before commit: 16,597 tests across 865 files with 0 failures, and `tsc --noEmit` clean. Package `bitkyc08-opencodex-2.43.0.tgz`, archive SHA-256 `40455474521af092367461aa7af487c733bcdaacda8518d41b19a29e3ff0765a`, verified byte-identical on both hosts before install. Laptop and Mini both restarted and healthy on port 10100.
+
+Two deployment notes worth keeping. A hand-started gateway is not owned by the service manager, so `ocx stop` left it running and the replacement bound a random port (50563) because 10100 was still busy; the stale process had to be killed by PID before a restart took the intended port. And `ocx restart` refused with `package_tree_changed` after the install, which is correct behaviour, not a failure — the running process cannot adopt a changed package tree.
+
+The fix was then proved on live traffic rather than fixtures, against genuinely exhausted quota (Codex at 100% weekly, two of three Claude accounts at 100%). The upstream body confirms the shape this whole change is about: HTTP 502 carrying `{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"pro","resets_in_seconds":343428}`.
+
+- First combo request: 4 attempts, walking all three Anthropic accounts and then Astra, every one exhausted; `comboTargetAdvanced: true`.
+- Second identical request, immediately after: `0` attempts, `8 ms`, HTTP 503 `No available targets for combo: waterfall`.
+
+Zero wasted upstream sends where the old behaviour re-sent to every exhausted account each minute for the life of the window.
