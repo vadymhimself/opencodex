@@ -443,3 +443,17 @@ Two things found along the way are separate from that verdict and remain in effe
 - `ENABLE_TOOL_SEARCH=true` is persisted in the agent recipes on both hosts and cuts turn-0 input from 103,158 to 33,984 with every MCP intact. It is configuration, not a fix for any gateway fault.
 
 Open levers were deliberately not taken: combo `waitForCooldownMs` stays at its default of 0 (no waiting before a hop to Astra), no upstream PR was opened, and the quota watcher keeps its current thresholds.
+
+## Inlined MCP tools and cache rewrites, 2026-09-19
+
+Finding 3 above measured inlined MCP schemas as a per-turn size cost. A live Mini session on 2026-09-18/19 showed the second cost: a gateway session started without `ENABLE_TOOL_SEARCH` (its launch path predated the recipe change, so the variable was absent from its environment) accumulated 1,006 `falling-cache-read` alerts and 120M cache-write tokens on `claude-opus-5`, at roughly 500–760k inclusive tokens per request with near-zero output.
+
+After the same session was restarted with `ENABLE_TOOL_SEARCH=true`, the first 8 minutes recorded 168 requests, 0.96 cache-read share, and one rewrite event (~100k excess write), with per-request context at 51–125k.
+
+Mechanism (inferred, not isolated): tool definitions lead the cached prefix, so any change to an inlined MCP tool array — a server reconnecting, a tool appearing or disappearing — invalidates the entire cache behind it. With tool search the MCP tools are deferred and the prefix stays stable. The before/after comparison is confounded by the restart also dropping the accumulated context, so treat it as strong correlation rather than proof.
+
+Operational consequences now in place:
+
+- `ENABLE_TOOL_SEARCH=true` is set in `~/.claude/settings.json` `env` on both hosts, so it applies to every launcher, not only the `agent` recipe.
+- The life-wiki orchestrator sets `ENABLE_TOOL_SEARCH=true` and routes its `claude -p` spawns through the gateway.
+- Mixing models on one large context compounds the cost: the cache is per model, so every Opus⇄Fable switch or combo failover rewrites the whole prefix cold (observed: 558,865 written, 0 read, on a Fable leg).
