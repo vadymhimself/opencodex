@@ -329,10 +329,10 @@ describe("getCodexAccountHealthSnapshot", () => {
   test("exposes active cooldown source without changing write policy", () => {
     const config = { providers: {} } as OcxConfig;
     const now = Date.parse("2026-07-23T14:00:00.000Z");
-    recordCodexUpstreamOutcome(config, "pool-acct", 429, { retryAfter: "120", now });
+    recordCodexUpstreamOutcome(config, "pool-acct", 429, { retryAfter: "45", now });
 
     expect(getCodexAccountHealthSnapshot("pool-acct", now)).toEqual({
-      cooldownUntil: now + 120_000,
+      cooldownUntil: now + 45_000,
       cooldownSource: "retry-after",
     });
     expect(getCodexAccountHealthSnapshot("missing", now)).toBeNull();

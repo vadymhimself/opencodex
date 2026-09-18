@@ -287,8 +287,8 @@ describe("#2568 generic OAuth account failover", () => {
 
   test("Retry-After drives the cooldown length", async () => {
     const ids = await seed(2);
-    rotateGenericOAuthAccountOn429(config(), "xai", ids[0]!, "600");
-    expect(genericFailoverRetryAfterSeconds("xai")).toBeGreaterThan(500);
+    rotateGenericOAuthAccountOn429(config(), "xai", ids[0]!, "30");
+    expect(genericFailoverRetryAfterSeconds("xai")).toBeGreaterThan(20);
   });
 
   test("an excluded provider is never enabled, however many accounts it has", async () => {

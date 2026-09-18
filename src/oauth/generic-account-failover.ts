@@ -25,7 +25,7 @@ import type { OcxConfig, OcxProviderConfig } from "../types";
 export const GENERIC_OAUTH_MAX_FAILOVERS_PER_REQUEST = 3;
 
 const DEFAULT_COOLDOWN_MS = 60_000;
-const MAX_COOLDOWN_MS = 15 * 60_000;
+const MAX_COOLDOWN_MS = 60_000;
 
 /**
  * How long a presence answer may be reused before the store is consulted again.

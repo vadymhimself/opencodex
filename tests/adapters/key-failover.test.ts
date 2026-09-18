@@ -85,15 +85,15 @@ describe("rotateKeyOn429", () => {
   test("respects Retry-After seconds for the cooldown window", () => {
     const config = makeConfig({ apiKey: "key-alpha-000111222333", apiKeyPool: pool3() });
     const now = 1_000_000;
-    rotateKeyOn429(config, "p", "120", now);
-    expect(getKeyCooldownUntil("p", "k1", now)).toBe(now + 120_000);
+    rotateKeyOn429(config, "p", "45", now);
+    expect(getKeyCooldownUntil("p", "k1", now)).toBe(now + 45_000);
   });
 
   test("caps absurd Retry-After at the max cooldown", () => {
     const config = makeConfig({ apiKey: "key-alpha-000111222333", apiKeyPool: pool3() });
     const now = 1_000_000;
     rotateKeyOn429(config, "p", "86400", now);
-    expect(getKeyCooldownUntil("p", "k1", now)).toBe(now + 10 * 60_000);
+    expect(getKeyCooldownUntil("p", "k1", now)).toBe(now + 60_000);
   });
 
   test("skips keys already in cooldown and wraps around the pool", () => {

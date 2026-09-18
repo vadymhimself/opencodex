@@ -377,11 +377,11 @@ describe("combo target cooldowns", () => {
   test("parses numeric and date Retry-After values with exact bounds", () => {
     const now = Date.parse("2026-07-18T00:00:00.000Z");
     expect(parseRetryAfterMs("0.001", now)).toBe(1);
-    expect(parseRetryAfterMs("120", now)).toBe(120_000);
-    expect(parseRetryAfterMs("999999", now)).toBe(600_000);
-    expect(parseRetryAfterMs(new Date(now + 90_000).toUTCString(), now)).toBe(90_000);
-    expect(parseRetryAfterMs(new Date(now + 90_000).toUTCString().toLowerCase(), now)).toBe(90_000);
-    expect(parseRetryAfterMs(new Date(now + 900_000).toUTCString(), now)).toBe(600_000);
+    expect(parseRetryAfterMs("120", now)).toBe(60_000);
+    expect(parseRetryAfterMs("999999", now)).toBe(60_000);
+    expect(parseRetryAfterMs(new Date(now + 90_000).toUTCString(), now)).toBe(60_000);
+    expect(parseRetryAfterMs(new Date(now + 90_000).toUTCString().toLowerCase(), now)).toBe(60_000);
+    expect(parseRetryAfterMs(new Date(now + 900_000).toUTCString(), now)).toBe(60_000);
   });
 
   test("rejects missing malformed zero and expired Retry-After values", () => {
@@ -399,16 +399,16 @@ describe("combo target cooldowns", () => {
     expect(parseRetryAfterMs("0", now, options)).toBe(1);
     expect(parseRetryAfterMs(new Date(now - 1_000).toUTCString(), now, options)).toBe(1);
     expect(parseRetryAfterMs("Sunday, 06-Nov-94 08:49:37 GMT", now, options)).toBe(1);
-    expect(parseRetryAfterMs("Sunday, 06-Nov-50 08:49:37 GMT", now, options)).toBe(600_000);
+    expect(parseRetryAfterMs("Sunday, 06-Nov-50 08:49:37 GMT", now, options)).toBe(60_000);
     expect(parseRetryAfterMs("Sun Nov  6 08:49:37 1994", now, options)).toBe(1);
     expect(parseRetryAfterMs("not-a-date", now, options)).toBeUndefined();
     expect(parseRetryAfterMs("-1", now, options)).toBeUndefined();
     expect(parseRetryAfterMs("March 1, 2020", now, options)).toBeUndefined();
     expect(parseRetryAfterMs("Sun Sep 99 99:99:99 2026", now, options)).toBeUndefined();
     const centuryBoundary = Date.parse("2099-12-31T23:59:00.000Z");
-    expect(parseRetryAfterMs("Friday, 01-Jan-00 00:01:00 GMT", centuryBoundary, options)).toBe(120_000);
+    expect(parseRetryAfterMs("Friday, 01-Jan-00 00:01:00 GMT", centuryBoundary, options)).toBe(60_000);
     const fullTimestampBoundary = Date.parse("2026-01-01T00:00:00.000Z");
-    expect(parseRetryAfterMs("Wednesday, 01-Jan-76 00:00:00 GMT", fullTimestampBoundary, options)).toBe(600_000);
+    expect(parseRetryAfterMs("Wednesday, 01-Jan-76 00:00:00 GMT", fullTimestampBoundary, options)).toBe(60_000);
     expect(parseRetryAfterMs("Friday, 31-Dec-76 00:00:00 GMT", fullTimestampBoundary, options)).toBe(1);
   });
 
@@ -502,8 +502,8 @@ describe("combo target cooldowns", () => {
       code: "1308",
       message: "Usage limit reached for 5 hour",
     });
-    expect(isComboTargetInCooldown("free", target, 1_000 + 10 * 60_000 - 1)).toBe(true);
-    expect(isComboTargetInCooldown("free", target, 1_000 + 10 * 60_000)).toBe(false);
+    expect(isComboTargetInCooldown("free", target, 1_000 + 60_000 - 1)).toBe(true);
+    expect(isComboTargetInCooldown("free", target, 1_000 + 60_000)).toBe(false);
   });
 
   test("honors explicit Retry-After over the request-rate default", () => {
@@ -881,6 +881,32 @@ describe("combo failure policy and advancement", () => {
       updatedAt: now,
     });
     expect(pickComboTarget(config, "free", { now })?.target.provider).toBe("b");
+  });
+
+  test("an exhausted model-family window only skips that family, not the whole provider", () => {
+    const now = 50_000;
+    const quota = {
+      fiveHourPercent: 10,
+      fiveHourResetAt: now + 60 * 60_000,
+      weeklyPercent: 89,
+      weeklyResetAt: now + 48 * 60 * 60_000,
+      customWindows: [{ label: "Fable", percent: 100, resetAt: now + 48 * 60 * 60_000 }],
+      updatedAt: now,
+    };
+    const comboFor = (model: string) => baseConfig({
+      combos: { free: { strategy: "failover" as const, targets: [{ provider: "a", model }, { provider: "b", model: "m2" }] } },
+    });
+
+    setCachedProviderQuotaForTests("a", quota);
+    expect(pickComboTarget(comboFor("claude-opus-5"), "free", { now })?.target.provider).toBe("a");
+    expect(pickComboTarget(comboFor("claude-fable-5-1"), "free", { now })?.target.provider).toBe("b");
+
+    // Non-family labels are provider-wide counters and must still gate every model.
+    setCachedProviderQuotaForTests("a", {
+      ...quota,
+      customWindows: [{ label: "Prepaid credits", percent: 100, resetAt: now + 48 * 60 * 60_000 }],
+    });
+    expect(pickComboTarget(comboFor("claude-opus-5"), "free", { now })?.target.provider).toBe("b");
   });
 
   test("provider-scoped cooldown skips sibling models but leaves other providers eligible", () => {

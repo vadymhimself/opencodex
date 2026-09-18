@@ -331,8 +331,8 @@ describe("pre-dispatch account preference", () => {
         providers: { kiro: OAUTH_PROVIDER },
       } as unknown as OcxConfig;
 
-      expect(rotateGenericOAuthAccountOn429(kiroConfig, "kiro", ids[0]!, "120", now)).toBe(ids[1]);
-      expect(genericFailoverRetryAfterSeconds("kiro", now)).toBe(120);
+      expect(rotateGenericOAuthAccountOn429(kiroConfig, "kiro", ids[0]!, "45", now)).toBe(ids[1]);
+      expect(genericFailoverRetryAfterSeconds("kiro", now)).toBe(45);
     } finally {
       clearGenericFailoverHealth();
       clearAccountQuotaCache();

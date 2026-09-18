@@ -13,7 +13,7 @@ interface TargetCooldown {
 }
 
 const DEFAULT_COOLDOWN_MS = 60_000;
-const MAX_COOLDOWN_MS = 10 * 60_000;
+const MAX_COOLDOWN_MS = 60_000;
 /**
  * A proven-empty account window is worth the full ceiling rather than the generic 60s default:
  * the window rolls in hours, so a minute-long cooldown re-sent to it constantly. The ceiling

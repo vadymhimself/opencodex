@@ -1695,7 +1695,7 @@ describe("server combo failover 030 activation matrix", () => {
     expect(await response.text()).toContain("larger context backup");
   });
 
-  test("429 Retry-After 120 keeps A cooling at 60 seconds and restores it at 120", async () => {
+  test("429 Retry-After 45 keeps A cooling at 30 seconds and restores it at 45", async () => {
     const t0 = Date.parse("2026-07-18T00:00:00.000Z");
     let now = t0;
     Date.now = () => now;
@@ -1706,7 +1706,7 @@ describe("server combo failover 030 activation matrix", () => {
       if (aHits === 1) {
         return Response.json({ error: { message: "rate limited" } }, {
           status: 429,
-          headers: { "retry-after": "120" },
+          headers: { "retry-after": "45" },
         });
       }
       return chatSuccess("a recovered", "m1");
@@ -1720,10 +1720,10 @@ describe("server combo failover 030 activation matrix", () => {
       b: provider("openai-chat", baseUrl(b), "key-b"),
     });
     expect((await post(config)).status).toBe(200);
-    now = t0 + 60_000;
+    now = t0 + 30_000;
     expect((await post(config)).status).toBe(200);
     expect(aHits).toBe(1);
-    now = t0 + 120_000;
+    now = t0 + 45_000;
     expect((await post(config)).status).toBe(200);
     expect(aHits).toBe(2);
     expect(bHits).toBe(2);
@@ -1869,10 +1869,10 @@ describe("server combo failover 030 activation matrix", () => {
 
     const target = { provider: "a", model: "m1" };
     // The configured 200ms cooldown would have expired here; the advertised window has not.
-    expect(isComboTargetInCooldown("free", target, t0 + 60_000)).toBe(true);
-    expect(isComboTargetInCooldown("free", target, t0 + 9 * 60_000)).toBe(true);
-    // Reset metadata cannot extend the existing ten-minute combo cooldown ceiling.
-    expect(isComboTargetInCooldown("free", target, t0 + 10 * 60_000)).toBe(false);
+    expect(isComboTargetInCooldown("free", target, t0 + 59_999)).toBe(true);
+    expect(isComboTargetInCooldown("free", target, t0 + 30_000)).toBe(true);
+    // Reset metadata cannot extend the existing 60-second combo cooldown ceiling.
+    expect(isComboTargetInCooldown("free", target, t0 + 60_000)).toBe(false);
   });
 
   test("disabled image input rejects the request before any combo target is called", async () => {

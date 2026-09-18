@@ -22,7 +22,9 @@ interface KeyCooldown {
 }
 
 const DEFAULT_COOLDOWN_MS = 60_000;
-const MAX_COOLDOWN_MS = 10 * 60_000; // cap at 10 min for api-key rotation
+const MAX_COOLDOWN_MS = 60_000; // cap at 60s for api-key rotation
+// A 401 is not a rate limit: a revoked key stays rejected until replaced.
+const AUTH_REJECT_HOLD_MS = 10 * 60_000;
 
 /**
  * Default same-target 429 retry policy used when a provider opts in via a bare
@@ -240,7 +242,7 @@ function rotateKeyAfterFailure(
     // until an operator replaces it, and upstreams send no Retry-After for it. Hold it for the
     // full cap instead of the 429 default so a dead key is not re-tried once a minute.
     const cooldownMs = failureStatus === 401
-      ? MAX_COOLDOWN_MS
+      ? AUTH_REJECT_HOLD_MS
       : parseRetryAfterMs(retryAfterHeader, now) ?? DEFAULT_COOLDOWN_MS;
     keyCooldowns.set(cooldownKey(providerName, outcome.value.failedId), { cooldownUntil: now + cooldownMs });
     sweepExpiredOnWrite(now);

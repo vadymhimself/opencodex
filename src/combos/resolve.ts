@@ -71,15 +71,28 @@ function quotaWindowExhausted(percent: number | undefined, resetAt: number | und
   return typeof resetAt !== "number" || !Number.isFinite(resetAt) || resetAt > now;
 }
 
+// customWindows is a generic carrier: most labels are provider-wide counters ("Prepaid credits",
+// "Free trial", "burst", "Spark") and must gate every model. Anthropic also rides it for per-model
+// family counters, where Fable at 100% says nothing about Opus. Only those skip a non-matching model.
+const MODEL_FAMILY_WINDOW_LABELS = new Set(["fable", "opus", "sonnet", "haiku"]);
+
+function customWindowAppliesToModel(label: string, model: string | undefined): boolean {
+  const family = label.trim().toLowerCase();
+  if (!MODEL_FAMILY_WINDOW_LABELS.has(family)) return true;
+  return model === undefined || model.toLowerCase().includes(family);
+}
+
 export function cachedProviderQuotaIsExhausted(
   quota: ProviderQuota | null,
   now = Date.now(),
+  model?: string,
 ): boolean {
   if (!quota) return false;
   if (quotaWindowExhausted(quota.fiveHourPercent, quota.fiveHourResetAt, now)) return true;
   if (quotaWindowExhausted(quota.weeklyPercent, quota.weeklyResetAt, now)) return true;
   if (quotaWindowExhausted(quota.monthlyPercent, quota.monthlyResetAt, now)) return true;
-  if (quota.customWindows?.some(window => quotaWindowExhausted(window.percent, window.resetAt, now))) return true;
+  if (quota.customWindows?.some(window => customWindowAppliesToModel(window.label, model)
+    && quotaWindowExhausted(window.percent, window.resetAt, now))) return true;
   if (quota.creditsUsd?.unlimited !== true
       && typeof quota.creditsUsd?.percent === "number"
       && Number.isFinite(quota.creditsUsd.percent)
@@ -171,7 +184,7 @@ export function pickComboTarget(
   const now = options.now ?? Date.now();
   const eligible = (target: Required<OcxComboTarget>): boolean =>
     targetProviderIsUsable(config, target)
-    && !cachedProviderQuotaIsExhausted(getCachedProviderQuota(target.provider, now), now)
+    && !cachedProviderQuotaIsExhausted(getCachedProviderQuota(target.provider, now), now, target.model)
     && !isComboTargetInCooldown(comboId, target, now)
     && !excluded.has(targetKey(target))
     && (options.eligible?.(target) ?? true);
@@ -360,7 +373,7 @@ export async function pickComboTargetWithWait(
   if (!combo) throw new UnknownComboError(comboId);
   const waitingTargets = combo.targets.filter(target =>
     targetProviderIsUsable(config, target)
-    && !cachedProviderQuotaIsExhausted(getCachedProviderQuota(target.provider, now), now)
+    && !cachedProviderQuotaIsExhausted(getCachedProviderQuota(target.provider, now), now, target.model)
     && !excluded.has(targetKey(target))
     && isComboTargetInCooldown(comboId, target, now)
     && (customEligible?.(target) ?? true),
