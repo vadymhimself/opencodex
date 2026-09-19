@@ -114,6 +114,27 @@ correct direction for a cost and quota report.
    instead of upstream's private duplicate: it carries `contextTotalTokens` and
    `anthropicServerToolUse`.
 
+## Port-interaction defects
+
+Defects that exist in neither side alone, only in the combination. They belong in none of the
+lists above: nothing was deviated from and no fork behaviour was dropped — two correct designs
+met and left a hole. Expect more of these than of either plain regression.
+
+1. **Non-streaming canonical Anthropic replay logged no usage under key auth.**
+   Upstream added `keyUsageOwners` (`src/server/request-log.ts`): a key-auth attempt owns its own
+   wire usage snapshot, so settle deliberately refuses to attribute request-level `logCtx.usage`
+   to it. The fork's replay tap never needed to take that snapshot, because the fork's settle
+   guard was only `usageIsRequestAggregate` — writing `logCtx.usage` was sufficient there. Ported
+   together, a key-auth non-streaming replay finished a fully populated attempt with no usage, and
+   since the persisted row totals from its attempts (`aggregateAttemptUsage`), the whole row
+   reported zero. Real traffic on that lane spent quota while logging none, which is a blind spot
+   for any burn guard reading these rows — not just a red test.
+   Isolated by driving the live endpoint three ways with the same replayed body: combo + key
+   (no usage), direct + key (no usage — so the variable is auth mode, not combo), combo + forward
+   (usage present). Streaming replay was never affected: its inspector attributes frame by frame
+   as it parses. Fixed at the non-streaming tap in `src/server/claude-messages.ts` by routing
+   through `recordKeyWireAttemptUsage` with a direct attempt write as the non-key fallback.
+
 ## Inherited upstream failures (baseline, 2026-09-19)
 
 Gate 3 cannot mean "everything green": upstream 2.59.0 does not pass its own suite on this
@@ -153,6 +174,15 @@ absent symbol is `transitionRequestAttempt`, and it is superseded rather than lo
   through `noteProviderAttemptSend`.
 - The one remaining direct `noteAttemptSend` (`request-send-budget.ts:114`) is upstream's
   adapter-inner-retry accounting, which is same-account by construction and must not split.
+
+- `claude-messages-endpoint`: `custom forward openai-responses route never receives the main
+  ChatGPT credential` is a **deviation #6 baseline entry, not a defect**. Probed rather than
+  inferred: the captured upstream body arrives as `["model","input","store","stream","temperature",
+  "top_p","stop","user","prompt_cache_key"]`, so upstream's canonical-only sampling gate works
+  correctly on a non-canonical forward route. The single failing expectation is
+  `max_output_tokens: 16`, stripped by `stripUnsupportedForwardParams` for any `forward` provider
+  under the Codex REST allowlist -- deviation #6 verbatim. The credential assertion the test is
+  named for passes. Do not restore fork behaviour to make this green.
 
 **Gate 3 therefore reads: no failure outside this inherited set.** A new failure is port damage;
 one of these is upstream's own. Re-measure the baseline if upstream is bumped again.
