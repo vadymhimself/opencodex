@@ -1725,6 +1725,10 @@ export function noteProviderAttemptSend(
   // -> `transitionRequestAttempt` with `forceNew`); this is that rule expressed on the split
   // that already lives here.
   const recoveryStatus = credentialRecoveryStatus(recovery);
+  // The three axes are not redundant, and none is dead code. The recovery axis catches rotations
+  // that carry a kind; the label and provider axes catch rotations that arrive without one, which
+  // is how the Anthropic 403 path reaches this split at all. Dropping either side reads as a
+  // simplification and silently narrows the set of rotations that open their own row.
   if (attempt && attempt.sendCount > 0
     && (recoveryStatus !== undefined || accountLabelChanged || accountProviderChanged)) {
     // An input estimate is not evidence that a failed send used that many tokens.
@@ -1747,12 +1751,18 @@ export function noteProviderAttemptSend(
     }
     for (const key of Object.keys(attempt)) delete (attempt as unknown as Record<string, unknown>)[key];
     Object.assign(attempt, fresh);
-    // The finished row owns what it spent. Leaving the previous leg's usage, its aggregate
-    // marker or its bridge flag in place would attribute the replay's tokens to the account
-    // that just failed.
+    // The finished row owns what it spent. Leaving ANY of the previous leg's per-attempt context
+    // in place attributes the replay's numbers to the account that just failed -- and a stale
+    // `usageIsRequestAggregate` is worse than a stale total, because settle refuses to attribute
+    // usage to an attempt carrying it, so the new row would report nothing at all. The tier
+    // fields are in the same trap: they describe the finished send, and the fresh attempt above
+    // already inherited its own copy. This is the fork's full transition clear list.
     delete logCtx.usage;
     delete logCtx.usageIsRequestAggregate;
     delete logCtx.usageFromBridge;
+    delete logCtx.usageLogInputTokens;
+    delete logCtx.activeTierMetadata;
+    delete logCtx.tierOutcome;
     logCtx.activeAttemptStartedAt = Date.now();
   }
   if (attempt) {
