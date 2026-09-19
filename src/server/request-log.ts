@@ -1758,17 +1758,25 @@ export function noteProviderAttemptSend(
     }
     for (const key of Object.keys(attempt)) delete (attempt as unknown as Record<string, unknown>)[key];
     Object.assign(attempt, fresh);
-    // The finished row owns what it spent. Leaving ANY of the previous leg's per-attempt context
-    // in place attributes the replay's numbers to the account that just failed -- and a stale
-    // `usageIsRequestAggregate` is worse than a stale total, because settle refuses to attribute
-    // usage to an attempt carrying it, so the new row would report nothing at all. The tier
-    // fields are in the same trap: they describe the finished send, and the fresh attempt above
-    // already inherited its own copy. This is the fork's full transition clear list.
+    // The finished row owns what it spent: leaving its totals here attributes them to the
+    // account that just failed, and a stale `usageIsRequestAggregate` is worse than a stale
+    // total, because settle refuses to attribute usage to an attempt carrying it -- the new row
+    // would then report nothing at all. `tierOutcome` is a plain value the fresh attempt above
+    // already copied, so it goes with them.
+    //
+    // Deliberately NOT the fork's full transition list. The fork also cleared
+    // `usageLogInputTokens` and `activeTierMetadata`, which it could because its transition ran
+    // at the dispatch moment; here the split runs INSIDE the send and both are read back after
+    // it. Measured on a two-rotation turn: clearing them leaves the second rotation's row with
+    // `inputTokenEstimate: undefined` and the final log with `usage: undefined` -- an
+    // estimated-usage adapter (kiro, cursor) reporting no input tokens at all -- and hands the
+    // response parse an undefined tier observer, so `confirmation` can only stay "unknown".
+    // `usageLogInputTokens` is request-level state that chat-native.ts:353,
+    // run-turn-execution.ts:149 and both sidecar sites pass into every later send;
+    // `activeTierMetadata` is a live observer armed once per build and never re-armed here.
     delete logCtx.usage;
     delete logCtx.usageIsRequestAggregate;
     delete logCtx.usageFromBridge;
-    delete logCtx.usageLogInputTokens;
-    delete logCtx.activeTierMetadata;
     delete logCtx.tierOutcome;
     logCtx.activeAttemptStartedAt = Date.now();
   }
