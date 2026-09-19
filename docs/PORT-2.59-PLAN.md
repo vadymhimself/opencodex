@@ -259,5 +259,19 @@ per-account attribution for pool turns is wrong in exactly the way the quota wor
   under the Codex REST allowlist -- deviation #6 verbatim. The credential assertion the test is
   named for passes. Do not restore fork behaviour to make this green.
 
+## Known nits, recorded and deliberately NOT fixed in this port
+
+- **A mixed row drops `estimated: true`.** `aggregateAttemptUsage` attaches the marker only when
+  the aggregate's own status is `estimated` (`request-log.ts:1967`). Two failed legs plus one
+  estimated leg make the row `unreported`, so the marker is suppressed even though the only
+  usage in the total came from an estimate. The line is identical on both sides (fork
+  `request-log.ts:1442`, upstream `:1800`), so it is pre-existing, not a port regression.
+  Blast radius is presentation only: `usage/summary.ts:537` rebuilds the row from attempts and
+  ORs the marker across them, and quota capacity (`codex/quota-capacity.ts:28`) reads per-attempt
+  usage, which always carries it. The single exposure is `/api/logs` via
+  `management/shared.ts:114`, where the GUI shows estimated tokens without the qualifier.
+  Fix is one line aligning `aggregateAttemptUsage` with the rule `summary.ts` already uses --
+  deliberately deferred so this port does not carry opportunistic changes.
+
 **Gate 3 therefore reads: no failure outside this inherited set.** A new failure is port damage;
 one of these is upstream's own. Re-measure the baseline if upstream is bumped again.

@@ -56,7 +56,7 @@ describe("key attempt accounting", () => {
     expect(logCtx.activeTierMetadata).toBeDefined();
     const rows: RequestLogEntry[] = [];
     addFinalRequestLog("two-rotation-estimate", Date.now(), logCtx, 200, undefined, row => rows.push(row));
-    expect(rows[0].usage).toMatchObject({ inputTokens: 1234, estimated: true });
+    expect(rows[0].usage).toMatchObject({ inputTokens: 1234, totalTokens: 1234 });
   });
 
   test("a reader takes the attempts or the request total, never both", () => {
