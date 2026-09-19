@@ -16,6 +16,7 @@ import type {
 } from "../types";
 import { isAllowedToolChoice, namespacedToolName, resolveToolChoiceWireName, toolChoiceToolPredicate } from "../types";
 import { ANTHROPIC_OAUTH_BETA, CLAUDE_CODE_SYSTEM_INSTRUCTION, applyClaudeToolPrefix, stripClaudeToolPrefix } from "../oauth/anthropic";
+import { parseComboModelId } from "../combos/identifiers";
 import { parseDataUrl } from "./image";
 import { enforceAnthropicImageLimits } from "./anthropic-image-guard";
 import { normalizeAnthropicImages } from "./anthropic-image-normalize";
@@ -666,9 +667,16 @@ export function canReplayAnthropicSource(
 
   // Dated Anthropic-native tool types are model-specific. Without a complete vendor
   // compatibility matrix, changing models must fail closed before dispatch.
-  if (Array.isArray(body.tools) && body.tools.some(tool =>
-    tool !== null && typeof tool === "object" && !Array.isArray(tool)
-    && Object.hasOwn(tool, "type"))) {
+  //
+  // A combo alias names no source model, so there is nothing to change away FROM: the
+  // caller delegated model choice to the gateway. Comparing `combo/<id>` against a
+  // concrete target never matches, which rejected every typed-tool request routed
+  // through a combo -- every WebFetch and web_search turn on combo/waterfall -- and
+  // surfaced as "No available targets" once the sibling leg was quota-capped.
+  if (parseComboModelId(typeof body.model === "string" ? body.model : "") === null
+    && Array.isArray(body.tools) && body.tools.some(tool =>
+      tool !== null && typeof tool === "object" && !Array.isArray(tool)
+      && Object.hasOwn(tool, "type"))) {
     return false;
   }
 
