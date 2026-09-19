@@ -76,7 +76,7 @@ import {
 } from "../oauth/anthropic-routing";
 import type { OcxConfig } from "../types";
 import { readJsonRequestBody, resolveInboundBodyLimitBytes } from "./request-decompress";
-import { addFinalRequestLog, httpStatusForRequestLogTerminal, httpStatusFromTerminalError, recordFirstOutput, type RequestLogContext, type RequestLogEntry } from "./request-log";
+import { addFinalRequestLog, httpStatusForRequestLogTerminal, httpStatusFromTerminalError, recordFirstOutput, recordKeyWireAttemptUsage, type RequestLogContext, type RequestLogEntry } from "./request-log";
 import {
   conversationIdFromClaudeMetadata,
   getOrAllocateRequestSessionLane,
@@ -1161,7 +1161,17 @@ async function handleClaudeMessagesWithBudget(
       finalizeSource(502, { terminalStatus: "failed", closeReason: "terminal" });
       return anthropicErrorResponse(502, "canonical Anthropic returned an invalid JSON response", "api_error");
     }
-    logCtx.usage = usageFromAnthropic(isRec(payload.usage) ? payload.usage : undefined);
+    // Non-streaming replay only. A key-auth attempt owns its own wire usage snapshot
+    // (`keyUsageOwners`), and settle refuses to attribute request-level usage to such an
+    // attempt -- so writing `logCtx.usage` alone leaves the attempt, and the row totalled from
+    // it, reporting nothing for a turn that really spent tokens. The SSE lane needs none of
+    // this: its inspector attributes frame by frame as it parses, and repeating this there
+    // would count the same tokens twice.
+    const replayUsage = usageFromAnthropic(isRec(payload.usage) ? payload.usage : undefined);
+    if (!recordKeyWireAttemptUsage(logCtx, replayUsage)) {
+      logCtx.usage = replayUsage;
+      if (logCtx.activeAttempt) logCtx.activeAttempt.usage = replayUsage;
+    }
     finalizeSource(response.status, { closeReason: "terminal" });
     return new Response(new Uint8Array(bytes), {
       status: response.status,
