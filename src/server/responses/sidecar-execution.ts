@@ -69,6 +69,7 @@ export async function executeResponsesSidecars(
     | "oauthDispatch"
     | "noteRoutedAttemptSend"
     | "bindKeyUsageFromBridge"
+    | "exactAnthropicSourceReplay"
   >,
   sidecarState: Pick<ResponsesSidecarAuth, "routedCompaction" | "openAiSidecar">,
   responseEffects: Pick<
@@ -146,13 +147,19 @@ export async function executeResponsesSidecars(
   //   - non-runTurn: web-search wins over image when both eligible (documented priority)
   //   - runTurn: image bridge may run (it supports runTurn); web-search is skipped so runTurn
   //     can proceed for web-search-only turns
-  const wsPlan = !routedCompaction
+  // A turn that will be replayed to canonical Anthropic byte-for-byte plans no sidecar at all.
+  // Every one of these rewrites the request — web search injects its tool and system contract,
+  // the media bridges inject `image_gen`/`video_gen` — and Anthropic serves its own server tools
+  // on the source wire, so planning one both breaks the exactness and duplicates a capability
+  // the target already has.
+  const canPlanSidecars = !routedCompaction && !transportState.exactAnthropicSourceReplay;
+  const wsPlan = canPlanSidecars
     ? planWebSearch(config, parsed, false, route.provider, route.modelId, openAiSidecar, {
       admission: options.admission, codexAuthPolicy: options.codexAuthPolicy, providerName: route.providerName,
     })
     : undefined;
-  const imgPlan = !routedCompaction ? await planImageBridge(config, parsed, route.provider) : undefined;
-  const vidPlan = !routedCompaction ? await planVideoBridge(config, parsed, route.provider) : undefined;
+  const imgPlan = canPlanSidecars ? await planImageBridge(config, parsed, route.provider) : undefined;
+  const vidPlan = canPlanSidecars ? await planVideoBridge(config, parsed, route.provider) : undefined;
   const canRunWebSearch = !!wsPlan && !transportState.adapter.runTurn;
   const rotateSidecarProviderOn429 = async (
     retryAfter: string | null,
