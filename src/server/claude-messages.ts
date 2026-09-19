@@ -1255,7 +1255,7 @@ async function handleClaudeMessagesWithBudget(
     }
     const isError = (message as Rec).type === "error";
     const translatedError = isError && typeof (message as Rec).error === "object"
-      ? (message as { error: { code?: unknown; message?: unknown } }).error
+      ? (message as { error: { type?: unknown; code?: unknown; message?: unknown } }).error
       : undefined;
     if (translatedError?.code === "translation_buffer_limit") {
       return anthropicErrorResponse(
@@ -1267,8 +1267,17 @@ async function handleClaudeMessagesWithBudget(
         "translation_buffer_limit",
       );
     }
+    // The collected error already carries the upstream's classification; answering a flat 502
+    // would relabel an explicit client refusal as a retryable proxy failure. `api_error` maps
+    // back to 502, so an unclassified upstream error keeps today's status.
     return new Response(JSON.stringify(message), {
-      status: isError ? 502 : 200,
+      status: isError
+        ? httpStatusFromTerminalError({
+          type: typeof translatedError?.type === "string" ? translatedError.type : undefined,
+          code: typeof translatedError?.code === "string" ? translatedError.code : undefined,
+          message: typeof translatedError?.message === "string" ? translatedError.message : undefined,
+        })
+        : 200,
       headers: { "Content-Type": "application/json" },
     });
   }

@@ -153,11 +153,22 @@ export function failedTailFrame(encoder: TextEncoder, err: unknown): Uint8Array 
   return encoder.encode(`\n\nevent: response.failed\ndata: ${payload}\n\n${DONE_SSE_FRAME_TEXT}`);
 }
 
-export function upstreamErrorTailFrame(encoder: TextEncoder, message: string): Uint8Array {
+/** A bare upstream `error` frame, kept with the classification it declared. */
+export type BareUpstreamError = { message: string; type?: string; code?: string };
+
+export function upstreamErrorTailFrame(
+  encoder: TextEncoder,
+  upstream: string | BareUpstreamError,
+): Uint8Array {
+  const bare = typeof upstream === "string" ? { message: upstream } : upstream;
+  // Keep the upstream's own classification when it declared one. Stamping every bare error as
+  // `upstream_server_error` told every later status mapping this was a 5xx, so an explicit
+  // client refusal reached the caller as a retryable 502 with its message intact but its type
+  // and status replaced.
   const error = {
-    type: "upstream_error",
-    code: "upstream_server_error",
-    message: redactSecretString(message).slice(0, MAX_TAIL_ERROR_MESSAGE_CHARS),
+    type: bare.type ?? "upstream_error",
+    code: bare.code ?? (bare.type ? undefined : "upstream_server_error"),
+    message: redactSecretString(bare.message).slice(0, MAX_TAIL_ERROR_MESSAGE_CHARS),
   };
   return encoder.encode(`event: response.failed\ndata: ${JSON.stringify({
     type: "response.failed",
@@ -165,11 +176,21 @@ export function upstreamErrorTailFrame(encoder: TextEncoder, message: string): U
   })}\n\n`);
 }
 
-function boundedBareUpstreamErrorMessage(payload: unknown): string | undefined {
+function boundedBareUpstreamError(payload: unknown): BareUpstreamError | undefined {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)
     || (payload as { type?: unknown }).type !== "error") return undefined;
   const message = upstreamErrorMessageFromPayload(payload);
-  return message ? redactSecretString(message).slice(0, MAX_TAIL_ERROR_MESSAGE_CHARS) : undefined;
+  if (!message) return undefined;
+  const nested = (payload as { error?: unknown }).error;
+  const declared = nested && typeof nested === "object" && !Array.isArray(nested)
+    ? nested as { type?: unknown; code?: unknown }
+    : {};
+  return {
+    message: redactSecretString(message).slice(0, MAX_TAIL_ERROR_MESSAGE_CHARS),
+    // `type: "error"` is the frame's own envelope tag, not a classification.
+    ...(typeof declared.type === "string" && declared.type !== "error" ? { type: declared.type } : {}),
+    ...(typeof declared.code === "string" ? { code: declared.code } : {}),
+  };
 }
 
 export type SseTerminalOutputBoundary = {
@@ -177,7 +198,7 @@ export type SseTerminalOutputBoundary = {
   finish(): Uint8Array;
   terminalSeen(): boolean;
   doneSeen(): boolean;
-  upstreamError(): string | undefined;
+  upstreamError(): BareUpstreamError | undefined;
   dispose(): void;
 };
 
@@ -199,7 +220,7 @@ export function createSseTerminalOutputBoundary(
   let done = false;
   let pendingDone: { block: Uint8Array; delimiter: Uint8Array } | null = null;
   let disposed = false;
-  let upstreamError: string | undefined;
+  let upstreamError: BareUpstreamError | undefined;
 
   const processFrames = (
     frames: ReturnType<BoundedSseFrameBuffer["feed"]>,
@@ -213,8 +234,8 @@ export function createSseTerminalOutputBoundary(
       const parsed = payload === null ? undefined : parseSsePayload(payload);
       // Observe on the client reader itself: a tee inspection branch may lag
       // behind EOF, so its log context cannot determine the outgoing terminal.
-      const message = boundedBareUpstreamErrorMessage(parsed);
-      if (message !== undefined) upstreamError = message;
+      const bareError = boundedBareUpstreamError(parsed);
+      if (bareError !== undefined) upstreamError = bareError;
       const safetyBuffering = dropSafetyBuffering && parsed !== undefined
         ? codexSafetyBufferingBlockAction(parsed) : "keep";
       if (safetyBuffering === "drop") continue;
@@ -1512,14 +1533,14 @@ export function consumeForInspection(
   options?: InspectionConsumerOptions,
 ): void {
   const reader = body.getReader();
-  let bareUpstreamError: string | undefined;
+  let bareUpstreamError: BareUpstreamError | undefined;
   const inspector = (options?.inspectorFactory ?? createSseInspector)({
     onTerminal,
     logCtx,
     onCompletedResponse,
     onParsedPayload: payload => {
-      const message = boundedBareUpstreamErrorMessage(payload);
-      if (message !== undefined) bareUpstreamError = message;
+      const bareError = boundedBareUpstreamError(payload);
+      if (bareError !== undefined) bareUpstreamError = bareError;
       options?.onParsedPayload?.(payload);
     },
     onFirstOutput,
