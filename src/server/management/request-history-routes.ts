@@ -21,7 +21,7 @@ import { requestLogEntryFromPersistedUsage } from "../request-log";
 import { requestLogDto } from "./shared";
 import { jsonResponse } from "../auth-cors";
 import type { ManagementContext } from "./context";
-import type { PersistedUsageEntry } from "../../usage/log";
+import { physicalUsageAttempts, type PersistedUsageEntry } from "../../usage/log";
 
 function parseQueryInt(raw: string | null): number | undefined | "invalid" {
   if (raw === null) return undefined;
@@ -32,14 +32,10 @@ function parseQueryInt(raw: string | null): number | undefined | "invalid" {
 }
 
 function finalAttemptTarget(entry: PersistedUsageEntry): { provider: string; model: string } {
-  const attempts = entry.attempts;
-  if (Array.isArray(attempts) && attempts.length > 0) {
-    const last = attempts[attempts.length - 1];
-    if (last && typeof last.provider === "string" && typeof last.model === "string") {
-      return { provider: last.provider, model: last.model };
-    }
-  }
-  return { provider: entry.provider, model: entry.model };
+  const last = physicalUsageAttempts(entry.attempts ?? []).at(-1);
+  return last
+    ? { provider: last.provider, model: last.model }
+    : { provider: entry.provider, model: entry.model };
 }
 
 export async function handleRequestHistoryRoutes(ctx: ManagementContext): Promise<Response | null> {

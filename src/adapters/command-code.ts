@@ -15,6 +15,7 @@ import { buildNonOpenAIToolCatalogNudgeForTools } from "./tool-catalog-nudge";
 import { parseDataUrl } from "./image";
 import { createAdapterPhysicalSend } from "./physical-send";
 import { SendBudgetExhaustedError } from "../lib/upstream-retry";
+import { fetchWithHeaderTimeout } from "../server/responses/fetch-helpers";
 
 // Retain the short ids emitted by the first local integration. New requests use the live catalog's
 // provider-native IDs directly; this map is compatibility-only and is not a model fallback list.
@@ -467,20 +468,19 @@ function requestWithoutReasoningEffort(request: AdapterRequest): AdapterRequest 
 }
 
 async function fetchCommandCode(request: AdapterRequest, ctx: AdapterFetchContext | undefined, executor: typeof globalThis.fetch): Promise<Response> {
-  const timeout = new AbortController();
-  const timer = setTimeout(() => timeout.abort(new DOMException("Timeout elapsed", "TimeoutError")), ctx?.timeoutMs ?? 200_000);
-  const callerSignal = ctx?.abortSignal ?? new AbortController().signal;
-  try {
-    return await executor(request.url, {
+  return fetchWithHeaderTimeout(
+    request.url,
+    {
       method: request.method,
       headers: request.headers,
       body: request.body,
-      redirect: "manual",
-      signal: AbortSignal.any([callerSignal, timeout.signal]),
-    });
-  } finally {
-    clearTimeout(timer);
-  }
+    },
+    ctx?.abortSignal ?? new AbortController().signal,
+    ctx?.timeoutMs ?? 200_000,
+    false,
+    executor,
+    true,
+  );
 }
 
 function supportedCommandCodeEffort(provider: OcxProviderConfig, modelId: string, requested: string | undefined): string | undefined {

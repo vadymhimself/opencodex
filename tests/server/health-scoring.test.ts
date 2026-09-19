@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync} from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { appendUsageEntry, resetUsageReadCacheForTests, type PersistedUsageEntry } from "../../src/usage/log";
@@ -245,6 +245,92 @@ describe("health-aware scoring (RI-06)", () => {
     expect(finalTarget.sampleCount).toBe(1);
     expect(finalTarget.failures).toBeUndefined();
     expect(finalTarget.successRate).toBe(1);
+  });
+
+  test("latest same-route physical attempt ends the failure streak", () => {
+    appendUsageEntry({
+      ...row("same-route-retry", 200, 1500, {
+        provider: "combo",
+        model: "waterfall",
+      }),
+      attempts: [
+        { ordinal: 1, provider: "a", model: "m1", adapter: "openai-chat", status: 429, durationMs: 1000, sendCount: 1, recoveryKinds: [], usageStatus: "unreported" },
+        { ordinal: 2, provider: "a", model: "m1", adapter: "openai-chat", status: 200, durationMs: 500, sendCount: 1, recoveryKinds: [], usageStatus: "reported" },
+      ],
+    });
+
+    const evidence = healthEvidenceForCandidate({ provider: "a", model: "m1" });
+    expect(evidence).toMatchObject({ sampleCount: 2, successRate: 0.5 });
+    expect(evidence.failures).toBeUndefined();
+  });
+
+  test("single combo attempt contributes health to its physical target", () => {
+    appendUsageEntry({
+      ...row("combo-single", 200, 1500, {
+        provider: "combo",
+        model: "waterfall",
+      }),
+      attempts: [
+        { ordinal: 1, provider: "a", model: "m1", adapter: "openai-chat", status: 200, durationMs: 1500, sendCount: 1, recoveryKinds: [], usageStatus: "reported" },
+      ],
+    });
+
+    expect(healthEvidenceForCandidate({ provider: "a", model: "m1" })).toMatchObject({
+      sampleCount: 1,
+      successRate: 1,
+    });
+  });
+
+  test("final physical attempt retains incomplete stream health markers", () => {
+    appendUsageEntry({
+      ...row("combo-incomplete", 200, 1500, {
+        provider: "b",
+        model: "m2",
+        terminalStatus: "incomplete",
+      }),
+      attempts: [
+        { ordinal: 1, provider: "a", model: "m1", adapter: "openai-chat", status: 200, durationMs: 1000, sendCount: 1, recoveryKinds: [], usageStatus: "reported" },
+        { ordinal: 2, provider: "b", model: "m2", adapter: "openai-chat", status: 200, durationMs: 1500, streamAborted: true, sendCount: 1, recoveryKinds: [], usageStatus: "reported" },
+      ],
+    });
+
+    expect(healthEvidenceForCandidate({ provider: "a", model: "m1" })).toMatchObject({
+      sampleCount: 1,
+      successRate: 1,
+    });
+    expect(healthEvidenceForCandidate({ provider: "b", model: "m2" })).toMatchObject({
+      sampleCount: 1,
+      successRate: 0,
+      failures: 1,
+      incompleteStreamRate: 1,
+    });
+  });
+
+  test("historical attempt health counts only physical sends and unique ordinals", () => {
+    const entry = row("physical-attempts", 200, 1500, {
+      attempts: [
+        { ordinal: 1, provider: "a", model: "m1", adapter: "openai-chat", status: 200, durationMs: 1, sendCount: 0, locallyAnswered: true, recoveryKinds: [], usageStatus: "unreported" },
+        { ordinal: 1, provider: "a", model: "m1", adapter: "openai-chat", status: 503, durationMs: 4000, sendCount: 1, recoveryKinds: [], usageStatus: "unreported" },
+        { ordinal: 1, provider: "a", model: "m1", adapter: "openai-chat", status: 200, durationMs: 2, sendCount: 1, recoveryKinds: [], usageStatus: "unreported" },
+        { ordinal: 2, provider: "a", model: "m1", adapter: "openai-chat", status: 503, durationMs: 3, sendCount: 0, recoveryKinds: [], usageStatus: "unreported" },
+        { ordinal: 3, provider: "a", model: "m1", adapter: "openai-chat", status: 200, durationMs: 1000, sendCount: 1, recoveryKinds: [], usageStatus: "reported" },
+      ],
+    });
+    writeFileSync(join(testDir, "usage.jsonl"), `${JSON.stringify(entry)}\n`);
+
+    const evidence = healthEvidenceForCandidate({ provider: "a", model: "m1" });
+
+    expect(evidence.sampleCount).toBe(2);
+    expect(evidence.successRate).toBeCloseTo(0.5, 4);
+  });
+
+  test("explicit empty attempts do not fall back to the top-level outcome", () => {
+    appendUsageEntry(row("no-physical-attempt", 503, 4000, { attempts: [] }));
+
+    const evidence = healthEvidenceForCandidate({ provider: "a", model: "m1" });
+
+    expect(evidence.sampleCount).toBeUndefined();
+    expect(evidence.failures).toBeUndefined();
   });
 
   test("execution path applies live codex account cooldown to openai candidates", async () => {

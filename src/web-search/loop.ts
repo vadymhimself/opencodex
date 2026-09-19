@@ -16,11 +16,9 @@ import { redactSecretString } from "../lib/redact";
 import { readBoundedResponseBody } from "../lib/bounded-body";
 import { applyUpstreamRecoveryInit, fetchWithResetRetry, prepareSameTarget429Wait } from "../lib/upstream-retry";
 import { rateLimitRetryDelayMs } from "../providers/key-failover";
-import {
-  isTranslatorBudgetExceededError,
-  TRANSLATOR_MAX_TURN_BYTES,
-  TranslatorBudgetExceededError,
-} from "../lib/translator-budget";
+import { RequestPacingQueueOverloadError } from "../providers/request-pacing";
+import { mergeUsage } from "../server/responses/empty-completion-guard";
+import { isTranslatorBudgetExceededError } from "../lib/translator-budget";
 import { formatWebSearchResults } from "./format-result";
 import { parseStreamWithProgress, RoutedModelInactivityError, WebSearchStreamProtocolError } from "./progress-stream";
 import { WEB_SEARCH_TOOL_NAME } from "./synthetic-tool";
@@ -316,7 +314,13 @@ export interface WebSearchLoopDeps {
   streamRoutedModelOutput?: boolean;
   /** One-shot TTFT callback: first non-empty model output observed (WP4). */
   onFirstOutput?: () => void;
-  /** Raw adapter usage at the terminal event, pre wire-normalization (see bridgeToResponsesSSE onUsage). */
+  /** Raw provider transport used after bridge-owned pacing admission. */
+  fetchImpl?: typeof globalThis.fetch;
+  /** Reserve the routed provider's next request-start slot before each physical adapter dispatch. */
+  waitForRequestSlot?: (signal?: AbortSignal) => Promise<void>;
+  /** Raw adapter usage for each completed routed-model iteration, before a later iteration can rotate credentials. */
+  onIterationUsage?: (usage: OcxUsage | undefined) => void;
+  /** Aggregate raw adapter usage at the final terminal event, pre wire-normalization. */
   onUsage?: (usage: OcxUsage | undefined) => void;
   /** Observe the exact adapter request selected for each routed-model iteration. */
   onRequestBuilt?: (request: AdapterRequest) => void;
@@ -338,6 +342,11 @@ export interface WebSearchLoopDeps {
     retryAfterHeader: string | null,
     responseHeaders?: Headers,
   ) => ProviderAdapter | null | Promise<ProviderAdapter | null>;
+  /** Optional fail-closed credential recovery. The callback must inspect a clone and return null for unrecognized responses. */
+  onCredentialError?: (response: Response, signal: AbortSignal) =>
+    | { adapter: ProviderAdapter; recoveryKind: AttemptRecoveryKind }
+    | null
+    | Promise<{ adapter: ProviderAdapter; recoveryKind: AttemptRecoveryKind } | null>;
   /** Opt-in same-target 429 policy (key-auth providers). When present, 429 replays on the SAME key before on429 rotation. */
   retryOn429Policy?: Required<RateLimitRetryPolicy> | null;
   /** Called only when the final bridged Responses stream reaches completed or incomplete. */
@@ -352,7 +361,12 @@ export interface WebSearchLoopDeps {
  */
 export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Response> {
   const translatorBudget = deps.incomingMeta.translatorBudget;
-  const routedProviderFetch = deps.incomingMeta.providerFetch ?? globalThis.fetch;
+  const incomingFetch = deps.incomingMeta.providerFetch as (typeof globalThis.fetch & {
+    waitForPacing?: (signal?: AbortSignal) => Promise<void>;
+    unpacedFetch?: typeof globalThis.fetch;
+  }) | undefined;
+  const fetchImpl = deps.fetchImpl ?? incomingFetch?.unpacedFetch ?? incomingFetch ?? globalThis.fetch;
+  const waitForRequestSlot = deps.waitForRequestSlot ?? incomingFetch?.waitForPacing;
   const { parsed, selectedForwardHeaders, forwardProvider, hostedTool, settings, maxSearches, abortSignal, recordSidecarOutcome } = deps;
   const backend = deps.backend ?? "openai";
   const anthropicSidecar = deps.anthropicSidecar;
@@ -373,6 +387,7 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
   const toolsNoWebSearch = allTools.filter(t => !t.webSearch);
   let searchesExecuted = 0;
   let executedSearchCount = 0;
+  let hiddenUsage: OcxUsage | undefined;
   // Queries whose search already failed this turn — repeats are short-circuited so a model that keeps
   // re-asking the same failing query doesn't burn the whole search budget on it.
   const failedQueries = new Set<string>();
@@ -446,6 +461,20 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
     // clear() stops only its timer after final headers; the direct turn signal remains attached to
     // the returned response body through AbortSignal.any().
     let headerDeadline = clearableDeadline(connectTimeoutMs, signal);
+    const paceThenResetHeaderDeadline = async (): Promise<void> => {
+      headerDeadline.clear();
+      await waitForRequestSlot?.(signal);
+      headerDeadline = clearableDeadline(connectTimeoutMs, signal);
+    };
+    let firstPacingSlot = true;
+    const reserveDispatchSlot = async (): Promise<void> => {
+      if (firstPacingSlot) {
+        firstPacingSlot = false;
+        await paceThenResetHeaderDeadline();
+      } else {
+        await waitForRequestSlot?.(headerDeadline.signal);
+      }
+    };
     try {
       /**
        * Build and fetch one web-search iteration on the given adapter, under the iteration
@@ -478,10 +507,11 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
           cachedRequest = request;
           cachedAdapter = requestAdapter;
         }
-        const requestFetch = deps.fetchForRequest?.(request, iterParsed) ?? routedProviderFetch;
+        const requestFetch = deps.fetchForRequest?.(request, iterParsed) ?? fetchImpl;
         let response: Response;
         try {
           if (requestAdapter.fetchResponse) {
+            await reserveDispatchSlot();
             deps.onAttemptSend?.(recovery);
             response = await requestAdapter.fetchResponse(request, {
               abortSignal: headerDeadline.signal,
@@ -492,7 +522,8 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
             });
           } else {
             response = await fetchWithResetRetry(
-              (retryRecovery) => {
+              async (retryRecovery) => {
+                await reserveDispatchSlot();
                 // Record every helper-driven send (the callback runs for the first attempt and
                 // each connection-reset replay); preserve the caller's recovery kind
                 // (rate-limit-429 / key-429) when the retry layer supplies none.
@@ -522,6 +553,14 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
       };
 
       let prepared = await fetchOnce(adapter);
+      while (prepared.response.status === 403 && deps.onCredentialError) {
+        const rotated = await deps.onCredentialError(prepared.response, signal);
+        if (!rotated) break;
+        try { void prepared.response.body?.cancel().catch(() => {}); } catch { /* already closed */ }
+        adapter = rotated.adapter;
+        yield { type: "heartbeat" };
+        prepared = await fetchOnce(adapter, rotated.recoveryKind);
+      }
       // Same-target 429 wait-and-retry (opt-in `retryOn429`) BEFORE key rotation: a primary-key
       // rate-limit blip replays on the SAME key; rotation only runs after attempts exhaust.
       while (
@@ -603,6 +642,7 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
         throw new LoopError(504, `Provider response-header timeout after ${connectTimeoutMs}ms during web-search`);
       }
       if (signal.aborted) throw new LoopError(499, "client closed request during web-search");
+      if (error instanceof RequestPacingQueueOverloadError) throw error;
       if (error instanceof LoopError) throw error;
       throw new LoopError(502, `Provider unreachable: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
@@ -672,13 +712,6 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
       event.type === "done" || event.type === "incomplete" || event.type === "error" ? [index] : []);
     if (terminalIndexes.length !== 1 || terminalIndexes[0] !== events.length - 1) {
       throw new LoopError(502, `Web-search adapter stream protocol error: expected one final terminal event, received ${terminalIndexes.length}`);
-    }
-    const terminal = events[terminalIndexes[0]!];
-    if (terminal.type === "error") {
-      if (terminal.code === "translation_buffer_limit") {
-        throw new TranslatorBudgetExceededError("retained_collectors", TRANSLATOR_MAX_TURN_BYTES);
-      }
-      throw new LoopError(502, terminal.message);
     }
     return { ...scanEventsForWebSearch(events), streamedPassthroughCount };
   };
@@ -863,6 +896,24 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
           }
           // Raw-byte progress heartbeats reach the bridge; semantic events remain buffered.
           const split = yield* consumeIterationEvents(prepared);
+          const terminalIndex = split.passthrough.findLastIndex(event =>
+            event.type === "done" || event.type === "incomplete" || event.type === "error");
+          const terminal = split.passthrough[terminalIndex];
+          if ((terminal?.type === "done" || terminal?.type === "incomplete" || terminal?.type === "error") && terminal.usage) {
+            deps.onIterationUsage?.(terminal.usage);
+          }
+
+          // Adapter failure is already terminal. Never dispatch a sidecar search after it.
+          if (terminal?.type === "error") {
+            if (hiddenUsage) {
+              split.passthrough[terminalIndex] = {
+                ...terminal,
+                usage: mergeUsage(hiddenUsage, terminal.usage),
+              };
+            }
+            yield* replay(split.passthrough.slice(split.streamedPassthroughCount));
+            return;
+          }
 
           // Loop (search + re-ask) ONLY when the model's actionable output is purely web_search. A real
           // tool call (e.g. shell/apply_patch) means this turn is terminal for Codex — finalize so those
@@ -885,6 +936,9 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
               if (terminalEvent?.type === "done"
                 && (split.hasMalformedToolCall
                   || (!split.hasRealToolCall && !hasVisibleAssistantText(split.passthrough)))) {
+                // Discarded iteration still contributed tokens; retain it for request-level usage
+                // whether this pass retries below or fails the turn.
+                hiddenUsage = mergeUsage(hiddenUsage, terminalEvent.usage);
                 // #1001 fixed the silent success by failing here. A malformed call still fails: it
                 // reports a protocol problem, and replaying it would only re-ask an unwell upstream.
                 // Silence is different — it is recoverable, so retry exactly once with the results
@@ -916,8 +970,18 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
             }
             // Live-streamed leading events are exactly the first N passthrough entries — replay
             // only the buffered tail so nothing reaches the client twice.
+            if (hiddenUsage && (terminal?.type === "done" || terminal?.type === "incomplete")) {
+              split.passthrough[terminalIndex] = {
+                ...terminal,
+                usage: mergeUsage(hiddenUsage, terminal.usage),
+              };
+            }
             yield* replay(split.passthrough.slice(split.streamedPassthroughCount));
             return;
+          }
+          // Discarded iteration still contributed tokens; retain it for request-level usage.
+          if (terminal?.type === "done" || terminal?.type === "incomplete") {
+            hiddenUsage = mergeUsage(hiddenUsage, terminal.usage);
           }
           // The thinking that led to the search belongs to the FIRST call's assistant replay turn.
           const iterationThinking = extractIterationThinking(split.passthrough);
@@ -932,9 +996,15 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
               errorType: "upstream_error",
               code: e.code,
               message: "upstream translation buffer exceeded the safe limit",
+              ...(hiddenUsage ? { usage: hiddenUsage } : {}),
             };
           } else {
-            yield { type: "error", message: e instanceof LoopError ? e.message : (e instanceof Error ? e.message : String(e)) };
+            yield {
+              type: "error",
+              message: e instanceof LoopError ? e.message : (e instanceof Error ? e.message : String(e)),
+              ...(e instanceof LoopError ? { status: e.status } : {}),
+              ...(hiddenUsage ? { usage: hiddenUsage } : {}),
+            };
           }
           return;
         }

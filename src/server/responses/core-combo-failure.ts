@@ -1,7 +1,9 @@
 import { parseRetryAfterMs } from "../../combos";
 import type { ConsumedComboFailure, HandleResponsesOptions } from "./core-options";
 import type { OcxUsage } from "../../types";
-import { readBoundedResponseBody } from "../../lib/bounded-body";
+import { readBoundedResponseBody, readBoundedResponseBytes } from "../../lib/bounded-body";
+import { isAnthropicSourceReplayResponse, markAnthropicSourceReplayResponse } from "../relay";
+import { MAX_UPSTREAM_JSON_BODY_BYTES } from "./core-lifetime";
 import { codexQuotaFailureMessage, codexQuotaOutcomeMeta } from "./core-codex-account";
 import {
   isRateLimitOrQuotaFailureMessage,
@@ -31,6 +33,8 @@ export async function consumeComboFailure(
   now = Date.now(),
 ): Promise<ConsumedComboFailure> {
   const fallback = `Provider error ${response.status}`;
+  const preserveSourceResponse = isAnthropicSourceReplayResponse(response);
+  let passthroughResponse: Response | undefined;
   let classificationText = fallback;
   let usage: OcxUsage | undefined;
   let upstreamCode: string | undefined;
@@ -42,22 +46,48 @@ export async function consumeComboFailure(
   // display-safe body carries a recognized quota message.
   let quotaConfirmedByBody = false;
   try {
-    const body = await readBoundedResponseBody(response, {
-      signal,
-      // Match shouldRetryCodexPoolAccountQuota before treating a 5xx body as quota evidence.
-      fatalUtf8: response.status >= 500 && response.status < 600,
-    });
-    usage = usageFromComboFailureText(body.text);
+    let text = "";
+    let displaySafe = false;
+    let truncated = true;
+    if (preserveSourceResponse) {
+      // A replayed source keeps Anthropic's exact bytes, so read them whole and re-wrap rather
+      // than letting the bounded reader normalize or truncate what the caller gets back.
+      const bytes = await readBoundedResponseBytes(response, {
+        signal,
+        maxBytes: MAX_UPSTREAM_JSON_BODY_BYTES,
+        inactivityTimeoutMs: 90_000,
+      });
+      if (!bytes.oversized) {
+        passthroughResponse = markAnthropicSourceReplayResponse(new Response(bytes.bytes, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: response.headers,
+        }));
+        text = new TextDecoder().decode(bytes.bytes);
+        displaySafe = true;
+        truncated = false;
+      }
+    } else {
+      const body = await readBoundedResponseBody(response, {
+        signal,
+        // Match shouldRetryCodexPoolAccountQuota before treating a 5xx body as quota evidence.
+        fatalUtf8: response.status >= 500 && response.status < 600,
+      });
+      text = text;
+      displaySafe = body.displaySafe;
+      truncated = body.truncated;
+    }
+    usage = usageFromComboFailureText(text);
     if (
       response.status >= 500 && response.status < 600
-      && body.displaySafe && !body.truncated
+      && displaySafe && !truncated
     ) {
-      const quotaMessage = codexQuotaFailureMessage(body.text);
+      const quotaMessage = codexQuotaFailureMessage(text);
       quotaConfirmedByBody = quotaMessage !== undefined
         && isRateLimitOrQuotaFailureMessage(quotaMessage);
     }
-    if (body.displaySafe) {
-      const normalized = normalizeUpstreamErrorText(body.text, fallback);
+    if (displaySafe) {
+      const normalized = normalizeUpstreamErrorText(text, fallback);
       classificationText = normalized.safeText;
       upstreamCode = normalized.code;
       upstreamMessage = normalized.message;
@@ -108,6 +138,7 @@ export async function consumeComboFailure(
       },
     ),
     classificationText,
+    ...(passthroughResponse ? { passthroughResponse } : {}),
     ...(normalizedUpstreamCode !== undefined ? { upstreamCode: normalizedUpstreamCode } : {}),
     ...(!cyberFailure && cooldownRetryAfter !== undefined ? { retryAfter: cooldownRetryAfter } : {}),
     // The EFFECTIVE classification decides, not the raw status. An upstream that wraps a quota

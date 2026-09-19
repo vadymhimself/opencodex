@@ -389,6 +389,9 @@ describe("anthropic extended-thinking gate", () => {
     // without the field and the model thinks anyway, on a 64-token budget it shares
     // with generation (#545).
     "Claude-Sonnet-5",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-opus-5",
   ])("%s + reasoning 'none' sends an explicit thinking disable (#545)", async (modelId) => {
     const b = await bodyOf(parsed("none", { maxOutputTokens: 64, stopSequences: ["</block>"] }, modelId));
     expect(b.thinking).toEqual({ type: "disabled" });
@@ -406,17 +409,14 @@ describe("anthropic extended-thinking gate", () => {
 
   test.each([
     "claude-fable-5",
-    "claude-opus-4-7",
-    "claude-opus-4-8",
     "claude-haiku-4-5",
     "claude-sonnet-4-6",
     "anthropic/claude-fable-5",
     "claude-fable-5/foo",
     "not-a-claude-model",
   ])("%s + 'none' sends NO explicit disable (#545 gate stays narrow)", async (modelId) => {
-    // Fable always thinks and rejects an explicit disable; the Opus 4.7/4.8 adaptive wire
-    // leaves thinking off when omitted. Widening the gate to every adaptive family would
-    // trade a silent truncation for a 400.
+    // Fable always thinks and rejects an explicit disable. Widening the gate to every
+    // adaptive family would trade a silent truncation for a 400.
     const b = await bodyOf(parsed("none", {}, modelId));
     expect(b.thinking).toBeUndefined();
   });

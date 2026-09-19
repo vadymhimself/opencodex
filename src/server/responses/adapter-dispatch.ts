@@ -45,6 +45,7 @@ import { resolveProviderTransport } from "../../providers/xai-transport";
 import { resolveCopilotApiBaseUrl } from "../../oauth/github-copilot";
 import { resolveWireProtocolOverride } from "../adapter-resolve";
 import { bindRouteReasoningReplayScope } from "./core-replay";
+import { rotateAnthropicProviderOnCredentialDenial } from "./anthropic-source-replay";
 import {
   ANTHROPIC_POOL_MAX_FAILOVERS_PER_REQUEST,
   rotateAnthropicAccountOn429,
@@ -632,6 +633,23 @@ export async function prepareAdapterExchange(
         // stop. Re-enter the loop guard instead, which returns it unchanged.
         if (isNonReplayableResponse(upstreamResponse)) continue recovery;
      }
+
+      // An Anthropic OAuth credential denial (403 oauth_org_not_allowed) is not a quota verdict:
+      // the account is marked for reauth and the turn continues on the next eligible account.
+      const deniedCredentialRecovery = await rotateAnthropicProviderOnCredentialDenial({
+        config, route, inboundWire, logCtx, transportState, parsed,
+        response: upstreamResponse,
+        signal: upstream.signal,
+      });
+      if (deniedCredentialRecovery) {
+        try { void upstreamResponse.body?.cancel().catch(() => {}); } catch { /* already consumed/closed */ }
+        invalidateSameTargetRequest();
+        transportState.activeAdapter = deniedCredentialRecovery.adapter;
+        const result = await rebuildAndRefetch(deniedCredentialRecovery.recoveryKind);
+        if ("failed" in result) return result.failed;
+        upstreamResponse = result;
+        continue recovery;
+      }
 
       // Same-target 429 wait-and-retry (opt-in `retryOn429`, issue #487). Codex never retries
       // 429 itself (it retries 5xx only), and single-key pools cannot use the failover below,

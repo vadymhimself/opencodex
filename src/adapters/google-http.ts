@@ -9,10 +9,10 @@ import {
   abortError,
   cancelResponseBodyBestEffort,
   fetchWithAttemptDeadline,
+  isConnectionResetError,
   retryBackoffDelayMs,
   sleepWithAbort,
   SendBudgetExhaustedError,
-  isConnectionResetError,
 } from "../lib/upstream-retry";
 
 const GOOGLE_RETRY_ATTEMPTS = 3;

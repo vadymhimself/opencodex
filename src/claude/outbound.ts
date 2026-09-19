@@ -94,13 +94,23 @@ export function anthropicUsage(usage: unknown, webSearchRequests = 0): Rec {
   const cacheWrite = typeof details.cache_write_tokens === "number" ? details.cache_write_tokens : 0;
   const input = typeof u.input_tokens === "number" ? u.input_tokens : 0;
   const output = typeof u.output_tokens === "number" ? u.output_tokens : 0;
+  const serverToolUse: Record<string, number> = {};
+  if (isRec(u.anthropic_server_tool_use)) {
+    for (const [name, value] of Object.entries(u.anthropic_server_tool_use)) {
+      if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+        serverToolUse[name] = value;
+      }
+    }
+  }
+  if (webSearchRequests > 0 && serverToolUse.web_search_requests === undefined) {
+    serverToolUse.web_search_requests = webSearchRequests;
+  }
   return {
     input_tokens: Math.max(0, input - cached - cacheWrite),
     output_tokens: output,
     cache_read_input_tokens: cached,
     cache_creation_input_tokens: cacheWrite,
-    // Only successful searches are billed/counted (Anthropic contract; Claude Code cost accounting).
-    ...(webSearchRequests > 0 ? { server_tool_use: { web_search_requests: webSearchRequests } } : {}),
+    ...(Object.keys(serverToolUse).length > 0 ? { server_tool_use: serverToolUse } : {}),
   };
 }
 
@@ -187,6 +197,40 @@ function webSearchPairFromItem(item: Rec): { id: string; input: Rec; resultConte
   }
   const id = typeof item.id === "string" && item.id.length > 0 ? item.id : `srvtoolu_${uuid()}`;
   return { id, input, resultContent, completed };
+}
+
+function privateAnthropicBlock(item: Rec, key: string): Rec | undefined {
+  return isRec(item[key]) ? item[key] : undefined;
+}
+
+function privateAnthropicCitationDelta(value: unknown): Rec | undefined {
+  return isRec(value)
+    && value.type === "citations_delta"
+    && isRec(value.citation)
+    ? value
+    : undefined;
+}
+
+function privateAnthropicCitations(part: Rec): Rec[] {
+  if (!Array.isArray(part._ocx_anthropic_citation_deltas)) return [];
+  return part._ocx_anthropic_citation_deltas
+    .map(privateAnthropicCitationDelta)
+    .filter((delta): delta is Rec => delta !== undefined)
+    .map(delta => delta.citation as Rec);
+}
+
+function privateAnthropicTerminal(response: Rec): {
+  stopReason?: string;
+  stopSequence?: string | null;
+} {
+  const stopReason = typeof response._ocx_anthropic_stop_reason === "string"
+    ? response._ocx_anthropic_stop_reason
+    : undefined;
+  const rawSequence = response._ocx_anthropic_stop_sequence;
+  const stopSequence = rawSequence === null || typeof rawSequence === "string"
+    ? rawSequence
+    : undefined;
+  return { stopReason, stopSequence };
 }
 
 /**
@@ -381,14 +425,41 @@ export function responsesSseToAnthropicSse(
         emit("content_block_start", { type: "content_block_start", index, content_block: { type: "text", text: "" } });
         open = { kind, index };
       };
-      const finish = (stopReason: string, usage: unknown) => {
+      const emitAnthropicBlock = (block: Rec) => {
+        ensureStarted();
+        closeOpenBlock();
+        const index = blockIndex++;
+        if (block.type === "server_tool_use") {
+          const input = block.input;
+          emit("content_block_start", {
+            type: "content_block_start",
+            index,
+            content_block: { ...block, input: {} },
+          });
+          if (input !== undefined) {
+            emit("content_block_delta", {
+              type: "content_block_delta",
+              index,
+              delta: { type: "input_json_delta", partial_json: JSON.stringify(input) },
+            });
+          }
+        } else {
+          emit("content_block_start", {
+            type: "content_block_start",
+            index,
+            content_block: block,
+          });
+        }
+        emit("content_block_stop", { type: "content_block_stop", index });
+      };
+      const finish = (stopReason: string, stopSequence: string | null, usage: unknown) => {
         if (terminated) return;
         terminated = true;
         ensureStarted();
         closeOpenBlock();
         emit("message_delta", {
           type: "message_delta",
-          delta: { stop_reason: stopReason, stop_sequence: null },
+          delta: { stop_reason: stopReason, stop_sequence: stopSequence },
           usage: anthropicUsage(usage, webSearchRequests),
         });
         emit("message_stop", { type: "message_stop" });
@@ -459,6 +530,17 @@ export function responsesSseToAnthropicSse(
             emit("content_block_delta", {
               type: "content_block_delta", index: active.index,
               delta: { type: "text_delta", text: data.delta },
+            });
+            break;
+          }
+          case "response.anthropic_citation.delta": {
+            const delta = privateAnthropicCitationDelta(data.delta);
+            if (!delta) break;
+            ensureBlock("text");
+            emit("content_block_delta", {
+              type: "content_block_delta",
+              index: open!.index,
+              delta,
             });
             break;
           }
@@ -582,6 +664,14 @@ export function responsesSseToAnthropicSse(
             if (item.type === "web_search_call") {
               ensureStarted();
               closeOpenBlock();
+              const rawTool = privateAnthropicBlock(item, "_ocx_anthropic_server_tool");
+              const rawResult = privateAnthropicBlock(item, "_ocx_anthropic_server_tool_result");
+              if (rawTool || rawResult) {
+                if (rawTool) emitAnthropicBlock(rawTool);
+                if (rawResult) emitAnthropicBlock(rawResult);
+                if (rawResult && item.status !== "failed") webSearchRequests++;
+                break;
+              }
               const pair = webSearchPairFromItem(item);
               const toolIndex = blockIndex++;
               emit("content_block_start", {
@@ -600,6 +690,11 @@ export function responsesSseToAnthropicSse(
               });
               emit("content_block_stop", { type: "content_block_stop", index: resultIndex });
               if (pair.completed) webSearchRequests++;
+              break;
+            }
+            if (item.type === "anthropic_server_block") {
+              const block = privateAnthropicBlock(item, "block");
+              if (block) emitAnthropicBlock(block);
               break;
             }
             // Close the matching open block (message/reasoning items close implicitly on
@@ -662,16 +757,30 @@ export function responsesSseToAnthropicSse(
               fail(529, "upstream turn ended without a final answer", true);
               break;
             }
-            finish(sawToolUse ? "tool_use" : "end_turn", response.usage);
+            const terminal = privateAnthropicTerminal(response);
+            finish(
+              terminal.stopReason ?? (sawToolUse ? "tool_use" : "end_turn"),
+              terminal.stopSequence ?? null,
+              response.usage,
+            );
             break;
           }
           case "response.incomplete": {
             const response = isRec(data.response) ? data.response : {};
             const details = isRec(response.incomplete_details) ? response.incomplete_details : {};
+            const terminal = privateAnthropicTerminal(response);
             if (details.reason === "max_output_tokens") {
-              finish("max_tokens", response.usage);
+              finish(
+                terminal.stopReason ?? "max_tokens",
+                terminal.stopSequence ?? null,
+                response.usage,
+              );
             } else if (details.reason === "content_filter") {
-              finish("refusal", response.usage);
+              finish(
+                terminal.stopReason ?? "refusal",
+                terminal.stopSequence ?? null,
+                response.usage,
+              );
             } else {
               const message = typeof details.message === "string" && details.message.trim()
                 ? details.message
@@ -874,8 +983,14 @@ export function responsesJsonToAnthropicMessage(json: unknown, model: string, tr
       case "message": {
         if (!Array.isArray(raw.content)) break;
         for (const part of raw.content) {
-          if (isRec(part) && part.type === "output_text" && typeof part.text === "string" && part.text.length > 0) {
-            content.push({ type: "text", text: part.text });
+          if (!isRec(part) || part.type !== "output_text" || typeof part.text !== "string") continue;
+          const citations = privateAnthropicCitations(part);
+          if (part.text.length > 0 || citations.length > 0) {
+            content.push({
+              type: "text",
+              text: part.text,
+              ...(citations.length > 0 ? { citations } : {}),
+            });
           }
         }
         break;
@@ -920,11 +1035,24 @@ export function responsesJsonToAnthropicMessage(json: unknown, model: string, tr
         break;
       }
       case "web_search_call": {
-        // Server-side search: emit the Anthropic pair. Does NOT set sawToolUse.
+        // Server-side search: prefer opaque Anthropic blocks when source replay produced them.
+        const rawTool = privateAnthropicBlock(raw, "_ocx_anthropic_server_tool");
+        const rawResult = privateAnthropicBlock(raw, "_ocx_anthropic_server_tool_result");
+        if (rawTool || rawResult) {
+          if (rawTool) content.push(rawTool);
+          if (rawResult) content.push(rawResult);
+          if (rawResult && raw.status !== "failed") webSearchRequests++;
+          break;
+        }
         const pair = webSearchPairFromItem(raw);
         content.push({ type: "server_tool_use", id: pair.id, name: "web_search", input: pair.input });
         content.push({ type: "web_search_tool_result", tool_use_id: pair.id, content: pair.resultContent });
         if (pair.completed) webSearchRequests++;
+        break;
+      }
+      case "anthropic_server_block": {
+        const block = privateAnthropicBlock(raw, "block");
+        if (block) content.push(block);
         break;
       }
       default:
@@ -944,11 +1072,13 @@ export function responsesJsonToAnthropicMessage(json: unknown, model: string, tr
   if (body.status === "completed" && body.end_turn === false && !sawToolUse) {
     return anthropicErrorBody(529, "upstream turn ended without a final answer", "overloaded_error");
   }
-  const stopReason = body.status === "incomplete" && details.reason === "max_output_tokens"
-    ? "max_tokens"
-    : body.status === "incomplete" && details.reason === "content_filter"
-      ? "refusal"
-    : sawToolUse ? "tool_use" : "end_turn";
+  const terminal = privateAnthropicTerminal(body);
+  const stopReason = terminal.stopReason
+    ?? (body.status === "incomplete" && details.reason === "max_output_tokens"
+      ? "max_tokens"
+      : body.status === "incomplete" && details.reason === "content_filter"
+        ? "refusal"
+        : sawToolUse ? "tool_use" : "end_turn");
 
   return {
     id: `msg_${uuid()}`,
@@ -957,7 +1087,7 @@ export function responsesJsonToAnthropicMessage(json: unknown, model: string, tr
     content,
     model,
     stop_reason: stopReason,
-    stop_sequence: null,
+    stop_sequence: terminal.stopSequence ?? null,
     usage: anthropicUsage(body.usage, webSearchRequests),
   };
 }
@@ -978,8 +1108,10 @@ export async function collectAnthropicMessage(
   let buffer = "";
   const content: Rec[] = [];
   let openBlock: Rec | null = null;
+  let openCitationBytes = 0;
   let toolJson = "";
   let stopReason: string | null = "end_turn";
+  let stopSequence: string | null = null;
   let usage: Rec = anthropicUsage(undefined);
   let error: Rec | null = null;
   const replaceRetained = (previous: string, next: string, kind: "live_transient" | "retained_collectors") => {
@@ -997,7 +1129,9 @@ export async function collectAnthropicMessage(
     }
     translatorBudget.chargeRetained(Buffer.byteLength(JSON.stringify(openBlock)), { kind: "retained_collectors" });
     content.push(openBlock);
+    translatorBudget.releaseRetained(openCitationBytes, { kind: "retained_collectors" });
     openBlock = null;
+    openCitationBytes = 0;
     toolJson = "";
   };
 
@@ -1018,6 +1152,19 @@ export async function collectAnthropicMessage(
           openBlock.thinking = replaceRetained(previous, previous + delta.thinking, "retained_collectors");
         } else if (delta.type === "signature_delta" && typeof delta.signature === "string") {
           openBlock.signature = delta.signature;
+        } else if (
+          openBlock.type === "text"
+          && privateAnthropicCitationDelta(delta)
+        ) {
+          const citations = Array.isArray(openBlock.citations) ? openBlock.citations : [];
+          const citation = structuredClone(delta.citation);
+          const citationBytes = Buffer.byteLength(JSON.stringify(citation))
+            + (citations.length === 0 ? 2 : 1);
+          const reservation = translatorBudget.reserveTransient(citationBytes, { kind: "retained_collectors" });
+          citations.push(citation);
+          reservation.commitRetained();
+          openBlock.citations = citations;
+          openCitationBytes += citationBytes;
         } else if (delta.type === "input_json_delta" && typeof delta.partial_json === "string") {
           toolJson = replaceRetained(toolJson, toolJson + delta.partial_json, "retained_collectors");
         }
@@ -1029,6 +1176,9 @@ export async function collectAnthropicMessage(
       case "message_delta": {
         const delta = isRec(data.delta) ? data.delta : {};
         if (typeof delta.stop_reason === "string") stopReason = delta.stop_reason;
+        if (delta.stop_sequence === null || typeof delta.stop_sequence === "string") {
+          stopSequence = delta.stop_sequence;
+        }
         if (isRec(data.usage)) usage = data.usage;
         break;
       }
@@ -1077,7 +1227,7 @@ export async function collectAnthropicMessage(
     content,
     model,
     stop_reason: stopReason,
-    stop_sequence: null,
+    stop_sequence: stopSequence,
     usage,
   };
 }

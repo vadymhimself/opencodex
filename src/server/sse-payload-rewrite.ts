@@ -1,5 +1,6 @@
 import type { TranslatorBudget } from "../lib/translator-budget";
 import { Buffer } from "node:buffer";
+import { sseDelimiterLengthAt } from "./sse-frame-buffer";
 
 /**
  * Shared client-facing SSE payload rewrite shell.
@@ -64,14 +65,22 @@ export function composeSseBlockRewrites(...rewrites: SseBlockRewrite[]): SseBloc
 }
 
 /** Split one complete SSE event block while retaining its original blank-line delimiter. */
-export function nextSseBlock(buffer: string): { block: string; delimiter: string; rest: string } | null {
-  const match = buffer.match(/\r?\n\r?\n/);
-  if (!match || match.index === undefined) return null;
-  return {
-    block: buffer.slice(0, match.index),
-    delimiter: match[0],
-    rest: buffer.slice(match.index + match[0].length),
-  };
+export function nextSseBlock(
+  buffer: string,
+  searchFrom = 0,
+): { block: string; delimiter: string; rest: string } | null {
+  const byteAt = (index: number): number => buffer.charCodeAt(index);
+  for (let index = Math.max(0, searchFrom); index < buffer.length; index += 1) {
+    const delimiterLength = sseDelimiterLengthAt(index, buffer.length, byteAt);
+    if (delimiterLength === undefined) return null;
+    if (delimiterLength === 0) continue;
+    return {
+      block: buffer.slice(0, index),
+      delimiter: buffer.slice(index, index + delimiterLength),
+      rest: buffer.slice(index + delimiterLength),
+    };
+  }
+  return null;
 }
 
 /**
@@ -184,11 +193,16 @@ export function sseDataPayload(block: string): string | null {
   const len = block.length;
 
   while (lineStart < len) {
-    const nextNewline = block.indexOf("\n", lineStart);
-    let lineEnd = nextNewline === -1 ? len : nextNewline;
-    const nextStart = nextNewline === -1 ? len : nextNewline + 1;
-    if (lineEnd > lineStart && block.charCodeAt(lineEnd - 1) === 13) {
-      lineEnd -= 1;
+    // A lone CR ends a line as well as LF and CRLF: `sseDelimiterLengthAt` frames events on
+    // `\r\r`, so a stream with CR line endings reaches here with CR-separated data fields.
+    let lineEnd = len;
+    let nextStart = len;
+    for (let index = lineStart; index < len; index++) {
+      const code = block.charCodeAt(index);
+      if (code !== 10 && code !== 13) continue;
+      lineEnd = index;
+      nextStart = code === 13 && block.charCodeAt(index + 1) === 10 ? index + 2 : index + 1;
+      break;
     }
 
     const lineLen = lineEnd - lineStart;
@@ -220,8 +234,8 @@ export function sseDataPayload(block: string): string | null {
 
 /** Replace an SSE event's data field while preserving non-data fields and newline style. */
 export function replaceSseDataPayload(block: string, payload: string): string {
-  const newline = block.includes("\r\n") ? "\r\n" : "\n";
-  const lines = block.split(/\r?\n/);
+  const newline = block.includes("\r\n") ? "\r\n" : block.includes("\r") ? "\r" : "\n";
+  const lines = block.split(/\r\n|\r|\n/);
   const rewritten: string[] = [];
   let replaced = false;
   for (const line of lines) {
@@ -322,7 +336,9 @@ export function relaySseWithBlockRewrite(
       if (cancelled) return emitted;
       // A trailing fragment has no delimiter of its own; multiple emitted
       // blocks must still be framed as separate events (#893 review).
-      const tailDelimiter = tail.includes("\r\n") ? "\r\n\r\n" : "\n\n";
+      const tailDelimiter = tail.includes("\r\n")
+        ? "\r\n\r\n"
+        : tail.includes("\r") ? "\r\r" : "\n\n";
       for (let i = 0; i < tailBlocks.length; i++) {
         enqueueText(controller, tailBlocks[i]! + (i < tailBlocks.length - 1 ? tailDelimiter : ""));
         emitted += 1;

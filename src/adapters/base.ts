@@ -1,5 +1,4 @@
 import type { AdapterEvent, OcxParsedRequest } from "../types";
-import type { AttemptRecoveryKind } from "../usage/log";
 import type { TranslatorBudget } from "../lib/translator-budget";
 import type { RequestExecutionBudget } from "../lib/request-execution-budget";
 import type { AttemptRecoveryKind, AttemptRecoveryWithheld } from "../usage/log";

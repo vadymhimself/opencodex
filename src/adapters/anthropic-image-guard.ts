@@ -171,7 +171,12 @@ export function collectImageRefs(messages: unknown[]): ImageBlockRef[] {
 }
 
 function textify(ref: ImageBlockRef, text: string): void {
-  ref.container[ref.index] = { type: "text", text };
+  const cacheControl = (ref.container[ref.index] as { cache_control?: unknown })?.cache_control;
+  ref.container[ref.index] = {
+    type: "text",
+    text,
+    ...(cacheControl !== undefined ? { cache_control: cacheControl } : {}),
+  };
 }
 
 /**

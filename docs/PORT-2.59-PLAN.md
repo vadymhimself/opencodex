@@ -57,3 +57,71 @@ way every step is committable, testable, and revertable.
 ## Log
 
 - 2026-09-19: branch created on 2.59.0; inventory complete.
+
+## Deliberate behaviour deviations
+
+Recorded so the port's shape is auditable; each is a case where upstream's version was taken
+over the fork's and the behaviour is NOT identical.
+
+1. **Reasoning envelope text is no longer replayed as thinking text** (`src/claude/outbound.ts`).
+   The fork's `emitReasoningEnvelope` exposed `envelope.txt` back to the caller as thinking
+   content. 2.59 decodes envelopes budget-aware (`decodeReasoningEnvelope`) and deliberately does
+   not surface hidden envelope text. Upstream taken; the fork helper is dropped. Affects what a
+   caller sees in reasoning blocks, not routing, quota or caching.
+2. **`onRetry` replaced by the send-budget API** (`src/adapters/base.ts`): upstream's
+   `sendBudget` / `onPhysicalSend` / `onRecoveryWithheld` counts every physical send including an
+   adapter's inner retries, which the fork hook could not see.
+3. **Lenient usage parsing dropped** (`src/adapters/anthropic.ts`): invalid upstream usage is now
+   unreported rather than counted as zero.
+4. **The 60s Anthropic account cooldown cap is gone**: 2.59 treats a server `Retry-After` as
+   authoritative and caps local fallbacks at ten minutes. The fork's exhaustion branch is kept, so
+   a proven-empty window still takes the ten-minute ceiling instead of the 60s default.
+5. **Bare `error` events are no longer classified in `captureTerminalHttpStatus`**
+   (`src/server/request-log.ts`). The fork classified them from `json.error`, pre-setting
+   `terminalHttpStatus = 502`; 2.59 decides a bare error's status downstream via
+   `bareErrorStatus`, and the fork branch shadowed it, making every bare error look like a
+   transport failure. Upstream taken. Two fork tests that pinned the old policy are dropped.
+6. **`max_output_tokens` is stripped again on non-canonical forward gateways**
+   (`src/adapters/openai-responses.ts`): upstream's `stripCanonicalForwardSamplingParams`
+   supersedes the fork's canonical-only stripping. Affects forward-mode gateways only.
+
+## Fork behaviour kept over upstream
+
+The reverse of the list above: places where 2.59 changed behaviour and the fork's version was
+retained on purpose. All bias toward "unknown" rather than a confident wrong number, which is the
+correct direction for a cost and quota report.
+
+1. **`computeEntryCost` fails closed when any attempt is unpriced** — a partially priced request
+   reports no cost rather than an understated one.
+2. **Unpriced dominates priced in request counts** (`src/usage/summary.ts`).
+3. **`cacheTokensFromUsage` routes through `normalizeCostTokens`**, so contradictory cache
+   telemetry stays unavailable instead of being averaged into a plausible-looking number.
+4. **`usageAttributions` guards on `entry.attempts === undefined`**, not `!entry.attempts?.length`.
+   A row whose attempts are all non-physical (locally answered, `sendCount: 0`) must not fall back
+   to its stale parent usage: upstream's own rule — never emit the attempts AND the request total —
+   holds strictly harder this way, since an all-hidden row emits neither.
+5. **`onTransportDispatch`** is kept alongside upstream's `nativeControl` / `beforeContinuation`
+   hooks, in the fork's positional slot because a reserve-dispatch test passes it positionally.
+6. **The shared `mergeUsage`** from `empty-completion-guard.ts` is used in `terminal-guard.ts`
+   instead of upstream's private duplicate: it carries `contextTotalTokens` and
+   `anthropicServerToolUse`.
+
+## Inherited upstream failures (baseline, 2026-09-19)
+
+Gate 3 cannot mean "everything green": upstream 2.59.0 does not pass its own suite on this
+platform. Verified by copying `upstream/main`'s unmodified test files into /tmp, repointing only
+their import paths, and running them against this tree — both reproduce, and the combo list is
+byte-identical to the pre-port baseline.
+
+- `tests/server/server-combo-failover-e2e.test.ts`: 162 pass / **12 fail** upstream.
+  Failing: model-scoped image 400 after 429; optional `reasoning.effort` 400 -> 200 (both stream
+  modes); optional `user` 400 -> 200 (both stream modes); target that cannot hold input plus
+  requested output; body-confirmed quota inside a 5xx cooling for its reset window; passthrough
+  failed usage captured once; context overflow advancing while exhausted targets return sanitized
+  status; model-lifecycle 410; monthly quota then Orca free-prompt cap; provider-specific
+  prompt-too-long 400.
+- `tests/web-search/web-search-timeout-contract.test.ts`: 6 pass / **1 fail** upstream
+  (`a never-settling 429 body cancel cannot block rotation under the cumulative header deadline`).
+
+**Gate 3 therefore reads: no failure outside this inherited set.** A new failure is port damage;
+one of these is upstream's own. Re-measure the baseline if upstream is bumped again.

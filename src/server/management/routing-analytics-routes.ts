@@ -66,7 +66,10 @@ export async function handleRoutingAnalyticsRoutes(ctx: ManagementContext): Prom
     provider: url.searchParams.get("provider")?.trim() || undefined,
     model: url.searchParams.get("model")?.trim() || undefined,
     profileId: url.searchParams.get("profileId")?.trim() || undefined,
-    surface: url.searchParams.get("surface")?.trim() || undefined,
+    surface: ((): "all" | "claude" | "codex" | "grok" | undefined => {
+      const raw = url.searchParams.get("surface")?.trim();
+      return raw === "all" || raw === "claude" || raw === "codex" || raw === "grok" ? raw : undefined;
+    })(),
     from,
     to,
   }, { maxRows });

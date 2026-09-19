@@ -184,7 +184,7 @@ async function fetchWithResetRecovery(
         headers,
         body: request.body,
         ...(recovered ? { keepalive: false } : {}),
-      }, timeoutMs, ctx.abortSignal, ctx.stream);
+      }, timeoutMs, ctx.abortSignal, ctx.stream, ctx.executor);
     } catch (error) {
       if (ctx.abortSignal?.aborted || !isConnectionResetError(error) || attempt === RESET_ATTEMPTS - 1) throw error;
       lastError = error;

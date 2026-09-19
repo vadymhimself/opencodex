@@ -333,6 +333,69 @@ describe("server same-target 429 retry (end-to-end)", () => {
     }
   });
 
+  test("key-auth openai-responses passthrough rotates after the same-key retry", async () => {
+    const originalFetch = globalThis.fetch;
+    const seenAuth: string[] = [];
+    globalThis.fetch = (async (input, init) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (url === "https://passthrough.test/v1/responses") {
+        const auth = new Headers(init?.headers).get("authorization") ?? "";
+        seenAuth.push(auth);
+        if (auth.includes("key-beta")) {
+          return new Response(JSON.stringify({
+            id: "resp-ok",
+            object: "response",
+            status: "completed",
+            output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "ok after rotation" }] }],
+          }), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        return new Response(JSON.stringify({ error: { message: "rate limited" } }), {
+          status: 429,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return originalFetch(input, init);
+    }) as typeof fetch;
+
+    let server: ReturnType<typeof startServer> | null = null;
+    try {
+      const config = {
+        port: 0,
+        hostname: "127.0.0.1",
+        defaultProvider: "passthrough",
+        providers: {
+          passthrough: {
+            adapter: "openai-responses",
+            baseUrl: "https://passthrough.test/v1",
+            authMode: "key",
+            apiKey: "key-alpha-000111222333",
+            apiKeyPool: [
+              { id: "k1", key: "key-alpha-000111222333", addedAt: 1 },
+              { id: "k2", key: "key-beta-444555666777", addedAt: 2 },
+            ],
+            retryOn429: { attempts: 1, intervalMs: 120, respectRetryAfter: false },
+          },
+        },
+      } as OcxConfig;
+      saveConfig(config);
+      server = startServer(0);
+      const res = await postResponses(server.url, "passthrough/model");
+      expect(res.status).toBe(200);
+      expect(await res.text()).toContain("ok after rotation");
+      expect(seenAuth).toEqual([
+        "Bearer key-alpha-000111222333",
+        "Bearer key-alpha-000111222333",
+        "Bearer key-beta-444555666777",
+      ]);
+    } finally {
+      try {
+        await server?.stop(true);
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    }
+  });
+
   test("retry budget stays per request across multi-key failover (never re-arms)", async () => {
     const originalFetch = globalThis.fetch;
     let sends = 0;

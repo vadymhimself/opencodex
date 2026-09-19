@@ -43,6 +43,7 @@ export const RESPONSES_CORE_MODULES = [
   "adapter-dispatch.ts",
   "adapter-continuation.ts",
   "adapter-delivery.ts",
+  "anthropic-source-replay.ts",
 ] as const;
 
 export type ResponsesCoreModule = typeof RESPONSES_CORE_MODULES[number];

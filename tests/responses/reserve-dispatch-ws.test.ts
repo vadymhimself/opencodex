@@ -223,11 +223,14 @@ describe("synchronous Reserve dispatch callbacks on WebSocket", () => {
     const seen: string[] = [];
     const quotaValues: string[] = [];
     let fallbacks = 0;
+    let dispatches = 0;
     const fallback = Object.assign(async () => { fallbacks += 1; return new Response("unexpected"); }, { preconnect() {} });
     const pending = codexWsUpstreamFetch(URL, init(), fallback, "1.4.0", headers => {
       quotaValues.push(headers.get("x-codex-primary-used-percent")!);
     }, headers => {
       seen.push(headers.get("authorization")!);
+    }, () => {
+      dispatches += 1;
     });
     const socket = DelayedWebSocket.instances[0]!;
     socket.dispatchEvent(new Event("open"));
@@ -249,6 +252,7 @@ describe("synchronous Reserve dispatch callbacks on WebSocket", () => {
     expect(quotaValues).toEqual(["37", "49"]);
     expect(response.headers.get("x-codex-primary-used-percent")).toBe("37");
     expect(seen).toEqual(["Bearer fixture-reserve", "Bearer fixture-reserve"]);
+    expect(dispatches).toBe(1);
     expect(socket.sent).toHaveLength(1);
     expect(JSON.parse(socket.sent[0]!)).toMatchObject({ type: "response.create", model: "gpt-reserve" });
     expect(fallbacks).toBe(0);
@@ -260,6 +264,7 @@ describe("synchronous Reserve dispatch callbacks on WebSocket", () => {
     const refusal = new Error("permission expired before fallback");
     let permitted = true;
     let httpSends = 0;
+    let dispatches = 0;
     let constructed!: (socket: DelayedWebSocket) => void;
     const created = new Promise<DelayedWebSocket>(resolve => { constructed = resolve; });
     DelayedWebSocket.constructed = constructed;
@@ -267,7 +272,10 @@ describe("synchronous Reserve dispatch callbacks on WebSocket", () => {
       adapter: "openai-responses", authMode: "forward", baseUrl: "https://chatgpt.com/backend-api/codex",
       fetch: Object.assign(async () => { httpSends += 1; return new Response("unexpected"); }, { preconnect() {} }),
     };
-    const executor = providerFetch(provider, "1.4.0", { beforeDispatch: () => { if (!permitted) throw refusal; } });
+    const executor = providerFetch(provider, "1.4.0", {
+      beforeDispatch: () => { if (!permitted) throw refusal; },
+      onTransportDispatch: () => { dispatches += 1; },
+    });
     const pending = executor(URL, init());
     const observed = pending.then(
       () => ({ status: "fulfilled" as const }),
@@ -282,5 +290,32 @@ describe("synchronous Reserve dispatch callbacks on WebSocket", () => {
     expect(outcome.error).toBe(refusal);
     expect(socket.sent).toEqual([]);
     expect(httpSends).toBe(0);
+    expect(dispatches).toBe(0);
+  });
+
+  test("an upgrade failure records only the successful HTTP fallback dispatch", async () => {
+    install();
+    let checks = 0;
+    let httpSends = 0;
+    let dispatches = 0;
+    let constructed!: (socket: DelayedWebSocket) => void;
+    const created = new Promise<DelayedWebSocket>(resolve => { constructed = resolve; });
+    DelayedWebSocket.constructed = constructed;
+    const provider: OcxProviderConfig & { fetch: typeof fetch } = {
+      adapter: "openai-responses", authMode: "forward", baseUrl: "https://chatgpt.com/backend-api/codex",
+      fetch: Object.assign(async () => { httpSends += 1; return new Response("fallback"); }, { preconnect() {} }),
+    };
+    const executor = providerFetch(provider, "1.4.0", {
+      beforeDispatch: () => { checks += 1; },
+      onTransportDispatch: () => { dispatches += 1; },
+    });
+    const pending = executor(URL, init());
+    const socket = await created;
+    socket.close();
+    expect((await pending).status).toBe(200);
+    expect(socket.sent).toEqual([]);
+    expect(checks).toBe(2);
+    expect(httpSends).toBe(1);
+    expect(dispatches).toBe(1);
   });
 });
