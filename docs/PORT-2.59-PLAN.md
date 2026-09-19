@@ -61,6 +61,29 @@ way every step is committable, testable, and revertable.
 - **P3 tests.** Port fork tests, adapting to moved modules.
 - **P4 gates.** Items 1-4 above, plus `scripts/claude-cache-count-parity-eval.ts`.
 - **P5 staged deploy.** Mini, one hour of gates 5-6, then laptop.
+  1. Resolve the install prefix from the LIVE process, never PATH (see the two-tree hazard above).
+  2. Install and restart in one command; prove it by readback -- `ocx --version` AND `ocx health`.
+     The install exit code is not evidence: an install into a tree nothing runs also exits 0.
+  3. THEN load the burn guard on that host: `launchctl load -w <plist>`, 10-minute poll. It is
+     staged unloaded on both hosts. Loading it before a deploy is pointless and not harmless --
+     a trip would reinstall 2.43 over 2.43 and restart a healthy gateway for nothing.
+  4. Watch one hour. Roll back on a TRIP; investigate, do not auto-act, on an ALERT.
+
+### Why the guard splits the laptop's zero-attempt failures by signature
+
+The laptop's 2.43 ring carries ~6.4% zero-attempt failures, every one of them
+`requestedModel: combo/waterfall` + `No available targets for combo: waterfall`. The fault is
+INTERMITTENT, and that was established the hard way: it went quiet at 09-19 11:53 for 7.3h and
+156 clean requests, which I read as fixed and reported as fixed. It then recurred at
+**09-19 19:32:49, on 2.43, with nothing deployed**. Earlier gaps in the same ring run to 24.0h
+and 841 rows.
+
+So a post-quiet baseline would record 0% for a live fault and the next recurrence would roll back
+2.59 for something 2.59 did not cause. The guard therefore trips on the RESIDUAL -- zero-attempt
+failures that are NOT that signature, a true 0.00% baseline on both hosts -- and only alerts on
+the known signature. Accepted blind spot: a real 2.59 regression emitting the same string alerts
+rather than trips. The doomed-send trip stays armed and is the more direct burn signal.
+
 
 ## Log
 
