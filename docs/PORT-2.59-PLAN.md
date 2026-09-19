@@ -198,6 +198,28 @@ absent symbol is `transitionRequestAttempt`, and it is superseded rather than lo
 - The one remaining direct `noteAttemptSend` (`request-send-budget.ts:114`) is upstream's
   adapter-inner-retry accounting, which is same-account by construction and must not split.
 
+**CORRECTION -- the supersession claim above is wrong for the Anthropic OAuth pool lane.** It
+holds for chat-native's key-429 case and was verified there. It does not hold here, and the
+difference is that a label-change comparison needs a label on BOTH sides:
+
+- The pool's initial resolution never stamps an account label. The fork did not either -- it
+  carried the account in `logCtx.provider` via `formatAnthropicProviderForLog`. So a pool turn's
+  first send is legitimately unlabelled, and that is fork behaviour, not a port omission.
+- `sealRequestAttemptIdentity` exempts a sent attempt whose label is `undefined`, so a
+  late-arriving label still lands. For this lane "unlabelled after the first send" is the NORMAL
+  state, so a genuine rotation is misread as a late arrival: the new account's label is stamped
+  onto the already-sent first attempt, `noteProviderAttemptSend` then sees
+  `previous === next`, and no second row opens.
+- The fork did not rely on labels at all here. `core.ts:3899` called
+  `transitionRequestAttempt(..., forceNew: true)` from a helper fired on ANY credential recovery
+  with a defined `credentialRecoveryStatus`.
+
+An explicit split on credential recovery is therefore load-bearing and must be restored in some
+form. Measured consequence while it is absent: the three OAuth rotation tests rotate correctly --
+`needsReauth` flips on the denied account -- and then fail on
+`expect(entry?.attempts).toHaveLength(2)`, receiving 1. Two accounts' sends fold into one row, so
+per-account attribution for pool turns is wrong in exactly the way the quota work cares about.
+
 - `claude-messages-endpoint`: `custom forward openai-responses route never receives the main
   ChatGPT credential` is a **deviation #6 baseline entry, not a defect**. Probed rather than
   inferred: the captured upstream body arrives as `["model","input","store","stream","temperature",
