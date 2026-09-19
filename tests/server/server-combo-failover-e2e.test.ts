@@ -1869,10 +1869,10 @@ describe("server combo failover 030 activation matrix", () => {
 
     const target = { provider: "a", model: "m1" };
     // The configured 200ms cooldown would have expired here; the advertised window has not.
-    expect(isComboTargetInCooldown("free", target, t0 + 59_999)).toBe(true);
-    expect(isComboTargetInCooldown("free", target, t0 + 30_000)).toBe(true);
-    // Reset metadata cannot extend the existing 60-second combo cooldown ceiling.
-    expect(isComboTargetInCooldown("free", target, t0 + 60_000)).toBe(false);
+    expect(isComboTargetInCooldown("free", target, t0 + 60_000)).toBe(true);
+    expect(isComboTargetInCooldown("free", target, t0 + 9 * 60_000)).toBe(true);
+    // Reset metadata cannot extend the exhaustion cooldown ceiling.
+    expect(isComboTargetInCooldown("free", target, t0 + 10 * 60_000)).toBe(false);
   });
 
   test("disabled image input rejects the request before any combo target is called", async () => {
