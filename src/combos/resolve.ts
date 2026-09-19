@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { OcxComboTarget, OcxConfig } from "../types";
 import { getCachedProviderRoutingQuota } from "../providers/quota-routing-cache";
 import type { ProviderQuota } from "../providers/quota-types";
@@ -64,7 +65,10 @@ function targetProviderIsUsable(config: OcxConfig, target: OcxComboTarget, now: 
   if (!Object.hasOwn(config.providers, target.provider)) return false;
   const provider = config.providers[target.provider];
   if (!provider || provider.disabled === true) return false;
-  return !cachedProviderQuotaIsExhausted(getCachedProviderRoutingQuota(target.provider, provider, now), now);
+  // target.model scopes per-model family windows: Fable at 100% must not veto an Opus target.
+  return !cachedProviderQuotaIsExhausted(
+    getCachedProviderRoutingQuota(target.provider, provider, now), now, target.model,
+  );
 }
 
 function quotaWindowExhausted(percent: number | undefined, resetAt: number | undefined, now: number): boolean {
@@ -72,15 +76,28 @@ function quotaWindowExhausted(percent: number | undefined, resetAt: number | und
   return typeof resetAt !== "number" || !Number.isFinite(resetAt) || resetAt > now;
 }
 
+// customWindows is a generic carrier: most labels are provider-wide counters ("Prepaid credits",
+// "Free trial", "burst", "Spark") and must gate every model. Anthropic also rides it for per-model
+// family counters, where Fable at 100% says nothing about Opus. Only those skip a non-matching model.
+const MODEL_FAMILY_WINDOW_LABELS = new Set(["fable", "opus", "sonnet", "haiku"]);
+
+function customWindowAppliesToModel(label: string, model: string | undefined): boolean {
+  const family = label.trim().toLowerCase();
+  if (!MODEL_FAMILY_WINDOW_LABELS.has(family)) return true;
+  return model === undefined || model.toLowerCase().includes(family);
+}
+
 export function cachedProviderQuotaIsExhausted(
   quota: ProviderQuota | null,
   now = Date.now(),
+  model?: string,
 ): boolean {
   if (!quota) return false;
   if (quotaWindowExhausted(quota.fiveHourPercent, quota.fiveHourResetAt, now)) return true;
   if (quotaWindowExhausted(quota.weeklyPercent, quota.weeklyResetAt, now)) return true;
   if (quotaWindowExhausted(quota.monthlyPercent, quota.monthlyResetAt, now)) return true;
-  if (quota.customWindows?.some(window => quotaWindowExhausted(window.percent, window.resetAt, now))) return true;
+  if (quota.customWindows?.some(window => customWindowAppliesToModel(window.label, model)
+    && quotaWindowExhausted(window.percent, window.resetAt, now))) return true;
   if (quota.creditsUsd?.unlimited !== true
       && typeof quota.creditsUsd?.percent === "number"
       && Number.isFinite(quota.creditsUsd.percent)
@@ -197,6 +214,15 @@ function resetWindowIndex(
   return selected;
 }
 
+function correlatedRandom(seed: string, comboId: string): number {
+  const digest = createHash("sha256")
+    .update(comboId)
+    .update("\0")
+    .update(seed)
+    .digest();
+  return digest.readUIntBE(0, 6) / 0x1_0000_0000_0000;
+}
+
 export function pickComboTarget(
   config: OcxConfig,
   comboId: string,
@@ -204,6 +230,7 @@ export function pickComboTarget(
     exclude?: Iterable<string>;
     eligible?: (target: Required<OcxComboTarget>) => boolean;
     now?: number;
+    randomSeed?: string;
   } = {},
 ): ComboPick | null {
   const writerGeneration = captureConfigGeneration();
@@ -245,7 +272,9 @@ export function pickComboTarget(
       .filter(({ target }) => eligible(target));
     if (eligibleTargets.length > 0) {
       const totalWeight = eligibleTargets.reduce((sum, entry) => sum + entry.target.weight, 0);
-      let random = Math.random() * totalWeight;
+      let random = (options.randomSeed === undefined
+        ? Math.random()
+        : correlatedRandom(options.randomSeed, comboId)) * totalWeight;
       for (const entry of eligibleTargets) {
         random -= entry.target.weight;
         if (random <= 0) {
@@ -337,6 +366,7 @@ export function advanceComboAfterFailure(
     now?: number;
     cooldownMs?: number;
     eligible?: (target: Required<OcxComboTarget>) => boolean;
+    randomSeed?: string;
     cooldownScope?: ComboFailureCooldownScope;
     status?: number;
     code?: string | null;
@@ -362,6 +392,7 @@ export function advanceComboAfterFailure(
   return pickComboTarget(config, pick.comboId, {
     exclude: pick.attempted,
     now: options.now,
+    randomSeed: options.randomSeed,
     eligible: target => !isComboTargetInCooldown(pick.comboId, target, options.now)
       && (options.eligible?.(target) ?? true),
   });
@@ -376,6 +407,7 @@ export async function pickComboTargetWithWait(
     waitForCooldownMs: number;
     abortSignal?: AbortSignal;
     now?: number;
+    randomSeed?: string;
     sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   },
 ): Promise<ComboPick | null> {
@@ -385,7 +417,12 @@ export async function pickComboTargetWithWait(
   const eligible = (target: Required<OcxComboTarget>): boolean =>
     !isComboTargetInCooldown(comboId, target, now)
     && (customEligible?.(target) ?? true);
-  const pick = pickComboTarget(config, comboId, { exclude: excluded, eligible, now });
+  const pick = pickComboTarget(config, comboId, {
+    exclude: excluded,
+    eligible,
+    now,
+    randomSeed: options.randomSeed,
+  });
   if (pick || options.waitForCooldownMs <= 0 || options.abortSignal?.aborted) return pick;
   const combo = getCombo(config, comboId);
   if (!combo) throw new UnknownComboError(comboId);
@@ -417,6 +454,7 @@ export async function pickComboTargetWithWait(
   return pickComboTarget(config, comboId, {
     exclude: excluded,
     now: now + delay,
+    randomSeed: options.randomSeed,
     eligible: targetCandidate =>
       !isComboTargetInCooldown(comboId, targetCandidate, now + delay)
       && (customEligible?.(targetCandidate) ?? true),
@@ -463,11 +501,18 @@ export function clearComboSelectionState(comboId?: string): void {
   selectionState.delete(comboId);
 }
 
-export function tryPickComboModel(config: OcxConfig, modelId: string): ComboPick | null {
+export function tryPickComboModel(
+  config: OcxConfig,
+  modelId: string,
+  options: {
+    eligible?: (target: Required<OcxComboTarget>) => boolean;
+    randomSeed?: string;
+  } = {},
+): ComboPick | null {
   const comboId = resolveComboId(config, modelId);
   if (!comboId) return null;
   if (!getCombo(config, comboId)) throw new UnknownComboError(comboId);
-  const picked = pickComboTarget(config, comboId);
+  const picked = pickComboTarget(config, comboId, options);
   if (!picked) throw new NoAvailableComboTargetsError(comboId);
   return picked;
 }

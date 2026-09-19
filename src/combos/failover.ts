@@ -14,7 +14,16 @@ interface TargetCooldown {
 }
 
 const DEFAULT_COOLDOWN_MS = 60_000;
-const MAX_COOLDOWN_MS = 10 * 60_000;
+const MAX_COOLDOWN_MS = 60_000;
+/**
+ * A proven-empty account window is worth ten minutes rather than the generic 60s default: the
+ * window rolls in hours, so a minute-long cooldown re-sent to it constantly — 72h of production
+ * ledger showed 942 doomed sends on one depleted Codex window. It stays decoupled from
+ * MAX_COOLDOWN_MS (lowered to 60s so a transient 429 cannot starve every combo target for
+ * minutes) and is not pinned to the advertised reset either, because quota usually frees
+ * earlier (#433) and a longer pin would skip a provider that had recovered.
+ */
+const QUOTA_CAP_COOLDOWN_MS = 10 * 60_000;
 /** Short cooldown for request-rate 429s (for example provider code 1302) that omit Retry-After. */
 export const COMBO_REQUEST_RATE_COOLDOWN_MS = 5_000;
 
@@ -221,6 +230,14 @@ export function coolComboTarget(
   // A server-provided Retry-After is authoritative, including an immediate `0` directive.
   // A quota reset is the next-most-specific signal (#3256); configured and default cooldowns
   // are only fallbacks when upstream supplied neither usable value.
+  // A proven-empty account window takes the full ceiling, not the generic 60s default: the
+  // window rolls in hours, so a minute-long cooldown re-sends to a depleted account every
+  // minute (72h of ledger showed 942 such doomed sends on one Codex window).
+  const exhausted = isProviderScopedQuotaCap(
+    options?.status,
+    options?.message ?? "",
+    options?.code,
+  );
   const serverDelayMs = parseRetryAfterMs(options?.retryAfter, now, {
     preserveImmediate: true,
     preserveServerDelay: true,
@@ -228,7 +245,7 @@ export function coolComboTarget(
   const cooldownMs = serverDelayMs
     ?? parseResetCooldownMs(options?.resetAt, now)
     ?? options?.cooldownMs
-    ?? (isTransientRequestRateLimit({
+    ?? (exhausted ? QUOTA_CAP_COOLDOWN_MS : isTransientRequestRateLimit({
       status: options?.status,
       code: options?.code,
       message: options?.message,
@@ -304,6 +321,15 @@ function normalizedFailureCode(code?: string | null): string {
   return code?.trim().toLowerCase().replaceAll("-", "_") ?? "";
 }
 
+/**
+ * Account-window exhaustion, by structured code or upstream prose. Status is deliberately not
+ * consulted: the ChatGPT Codex backend reports a depleted plan window as HTTP 502 with
+ * `upstream_server_error`, never the documented 429, so a status gate left the exhausted
+ * target selectable and every later turn re-hit it for the life of the window.
+ */
+const ACCOUNT_EXHAUSTION_CODES = new Set(["usage_limit_exceeded", "usage_limit_reached"]);
+const ACCOUNT_EXHAUSTION_TEXT = /usage limit (?:has been )?reached/;
+
 function isProviderScopedQuotaCap(
   status: number | undefined,
   message: string,
@@ -311,12 +337,10 @@ function isProviderScopedQuotaCap(
 ): boolean {
   const normalizedCode = normalizedFailureCode(code);
   const text = message.toLowerCase();
-  if (
-    status === 429
-    && (normalizedCode === "gousagelimiterror" || text.includes("monthly usage limit reached"))
-  ) {
+  if (ACCOUNT_EXHAUSTION_CODES.has(normalizedCode) || ACCOUNT_EXHAUSTION_TEXT.test(text)) {
     return true;
   }
+  if (status === 429 && normalizedCode === "gousagelimiterror") return true;
   return text.includes("err_free_prompt_cap")
     || (text.includes("free tier") && text.includes("single request"));
 }
