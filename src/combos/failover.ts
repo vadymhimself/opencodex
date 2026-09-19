@@ -15,12 +15,14 @@ interface TargetCooldown {
 const DEFAULT_COOLDOWN_MS = 60_000;
 const MAX_COOLDOWN_MS = 60_000;
 /**
- * A proven-empty account window is worth the full ceiling rather than the generic 60s default:
- * the window rolls in hours, so a minute-long cooldown re-sent to it constantly. The ceiling
- * itself stays at MAX_COOLDOWN_MS on purpose — quota usually frees before the advertised reset
- * (#433), so a longer pin would skip a provider that had recovered.
+ * A proven-empty account window is worth ten minutes rather than the generic 60s default: the
+ * window rolls in hours, so a minute-long cooldown re-sent to it constantly — 72h of production
+ * ledger showed 942 doomed sends on one depleted Codex window. It stays decoupled from
+ * MAX_COOLDOWN_MS (lowered to 60s so a transient 429 cannot starve every combo target for
+ * minutes) and is not pinned to the advertised reset either, because quota usually frees
+ * earlier (#433) and a longer pin would skip a provider that had recovered.
  */
-const QUOTA_CAP_COOLDOWN_MS = MAX_COOLDOWN_MS;
+const QUOTA_CAP_COOLDOWN_MS = 10 * 60_000;
 /** Short cooldown for request-rate 429s (for example provider code 1302) that omit Retry-After. */
 export const COMBO_REQUEST_RATE_COOLDOWN_MS = 5_000;
 
@@ -226,16 +228,24 @@ export function coolComboTarget(
     options?.message ?? "",
     options?.code,
   );
+  const resetDerivedMs = parseResetCooldownMs(options?.resetAt, now);
   const cooldownMs = parseRetryAfterMs(options?.retryAfter, now, { preserveImmediate: true })
-    ?? parseResetCooldownMs(options?.resetAt, now)
+    ?? resetDerivedMs
     ?? options?.cooldownMs
     ?? (exhausted ? QUOTA_CAP_COOLDOWN_MS : isTransientRequestRateLimit({
       status: options?.status,
       code: options?.code,
       message: options?.message,
     }) ? COMBO_REQUEST_RATE_COOLDOWN_MS : DEFAULT_COOLDOWN_MS);
+  // An empty window keeps the ten-minute ceiling, whether it was confirmed by the error body
+  // or advertised through reset metadata: a minute-long cooldown re-sends to a provably empty
+  // account every minute. Transient 429s keep the 60s cap so one burst cannot starve every
+  // target for minutes.
+  const ceilingMs = exhausted || resetDerivedMs !== undefined
+    ? QUOTA_CAP_COOLDOWN_MS
+    : MAX_COOLDOWN_MS;
   targetCooldowns.set(cooldownMapKey(comboId, target), {
-    cooldownUntil: now + Math.min(Math.max(cooldownMs, 1), MAX_COOLDOWN_MS),
+    cooldownUntil: now + Math.min(Math.max(cooldownMs, 1), ceilingMs),
   });
   sweepExpiredOnWrite(now);
 }

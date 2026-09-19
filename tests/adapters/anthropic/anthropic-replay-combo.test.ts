@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
-import { canReplayAnthropicSource } from "../../src/adapters/anthropic";
-import type { OcxProviderConfig } from "../../src/types";
+import { canReplayAnthropicSource } from "../../../src/adapters/anthropic";
+import type { OcxProviderConfig } from "../../../src/types";
 
 const provider = {
   adapter: "anthropic",

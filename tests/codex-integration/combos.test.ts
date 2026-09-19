@@ -502,8 +502,8 @@ describe("combo target cooldowns", () => {
       code: "1308",
       message: "Usage limit reached for 5 hour",
     });
-    expect(isComboTargetInCooldown("free", target, 1_000 + 60_000 - 1)).toBe(true);
-    expect(isComboTargetInCooldown("free", target, 1_000 + 60_000)).toBe(false);
+    expect(isComboTargetInCooldown("free", target, 1_000 + 10 * 60_000 - 1)).toBe(true);
+    expect(isComboTargetInCooldown("free", target, 1_000 + 10 * 60_000)).toBe(false);
   });
 
   test("honors explicit Retry-After over the request-rate default", () => {
