@@ -1725,10 +1725,17 @@ export function noteProviderAttemptSend(
   // -> `transitionRequestAttempt` with `forceNew`); this is that rule expressed on the split
   // that already lives here.
   const recoveryStatus = credentialRecoveryStatus(recovery);
-  // The three axes are not redundant, and none is dead code. The recovery axis catches rotations
-  // that carry a kind; the label and provider axes catch rotations that arrive without one, which
-  // is how the Anthropic 403 path reaches this split at all. Dropping either side reads as a
-  // simplification and silently narrows the set of rotations that open their own row.
+  // The three axes are not redundant, and none is dead code -- measured by dropping each side
+  // and re-running, not assumed. Without the label and provider comparisons, a rotation that
+  // carries no recognized recovery kind stops splitting: "key attempt accounting > rotation
+  // preserves reported failure usage..." (tests/usage) and "a pre-stream quota retry updates
+  // attribution to the serving alternate account" (responses-account-label) both fail. Without
+  // the recovery axis, the same-account 401 refresh stops splitting, because neither the label
+  // nor the provider string moves when the account does not change: responses-native-main-refresh
+  // and responses-pool-401-refresh both fail. (The Anthropic 403 path is NOT the case that needs
+  // the comparison axes -- it carries `anthropic-oauth-403`, so the recovery axis alone still
+  // splits it; the replay lane stays green in that mutation.) Narrowing to any one axis reads as
+  // a simplification and silently drops a class of rotation.
   if (attempt && attempt.sendCount > 0
     && (recoveryStatus !== undefined || accountLabelChanged || accountProviderChanged)) {
     // An input estimate is not evidence that a failed send used that many tokens.
