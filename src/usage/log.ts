@@ -81,6 +81,25 @@ export type AttemptRecoveryKind =
   | "reasoning-effort-downgrade";
 
 /**
+ * The HTTP status a credential recovery is recovering FROM, or undefined when the recovery is
+ * not credential-scoped (a transient 5xx, a same-key 429 wait, an image tier retry).
+ *
+ * Lives here, next to the kinds themselves, because two unrelated consumers need the same
+ * answer: the request log, which must close one attempt row and open another whenever the
+ * credential changes, and the replay lane, which reports the status the rotation answered.
+ */
+export function credentialRecoveryStatus(recovery?: AttemptRecoveryKind): 401 | 403 | 429 | undefined {
+  if (recovery === "oauth-401" || recovery === "key-401") return 401;
+  if (recovery === "anthropic-oauth-403") return 403;
+  if (
+    recovery === "key-429"
+    || recovery === "anthropic-oauth-429"
+    || recovery === "oauth-account-429"
+  ) return 429;
+  return undefined;
+}
+
+/**
  * Why a recovery this request was otherwise willing to make did not happen.
  *
  * Recorded separately from `recoveryKinds` and from `sendCount`, because the question it

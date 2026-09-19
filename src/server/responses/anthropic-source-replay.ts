@@ -9,6 +9,7 @@
 import type { OcxConfig, OcxParsedRequest, OcxProviderConfig } from "../../types";
 import type { AnthropicMessagesSource, ProviderAdapter } from "../../adapters/base";
 import type { AttemptRecoveryKind } from "../../usage/log";
+export { credentialRecoveryStatus } from "../../usage/log";
 import {
   ANTHROPIC_POOL_MAX_FAILOVERS_PER_REQUEST,
   formatAnthropicProviderForLog,
@@ -161,17 +162,6 @@ export async function rotateAnthropicProviderOnCredentialDenial(args: {
   } catch {
     return null;
   }
-}
-
-export function credentialRecoveryStatus(recovery?: AttemptRecoveryKind): 401 | 403 | 429 | undefined {
-  if (recovery === "oauth-401" || recovery === "key-401") return 401;
-  if (recovery === "anthropic-oauth-403") return 403;
-  if (
-    recovery === "key-429"
-    || recovery === "anthropic-oauth-429"
-    || recovery === "oauth-account-429"
-  ) return 429;
-  return undefined;
 }
 
 export async function finalizeAnthropicSourceReplay(
