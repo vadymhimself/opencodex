@@ -1,0 +1,11 @@
+Do exactly these steps in order, one tool call at a time, and do not edit, create, or delete any file.
+
+1. Read src/combos/failover.ts in full.
+2. Read src/codex/quota-rejection.ts in full.
+3. Read src/config/paths.ts in full.
+4. Run: grep -c "cooldown" src/combos/failover.ts
+5. Run: grep -c "export function" src/codex/quota-rejection.ts
+6. Read tests/routing/router-combo-failover-classification.test.ts in full.
+7. Run: grep -rn "QUOTA_CAP_COOLDOWN_MS" src | head -5
+
+Then reply with one line per step in the form `<step>: <result>` where result is the line count for a read step and the exact command output for a run step. Do not summarize the code, do not offer opinions, and make no further tool calls after step 7.

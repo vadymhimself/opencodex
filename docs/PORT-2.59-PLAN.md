@@ -129,5 +129,8 @@ byte-identical to the pre-port baseline.
   `artifacts.ts`, `pinned-https-get.ts`) are byte-identical to upstream; the fork touched only
   `images/loop.ts` in that lane, and these tests do not import it.
 
+- `tests/responses`: 2664 pass / **16 fail**, confirmed pre-existing by neutralising the port's
+  two runtime-live deltas in that lane and re-running to an identical result.
+
 **Gate 3 therefore reads: no failure outside this inherited set.** A new failure is port damage;
 one of these is upstream's own. Re-measure the baseline if upstream is bumped again.
