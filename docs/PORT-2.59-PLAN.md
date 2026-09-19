@@ -123,5 +123,11 @@ byte-identical to the pre-port baseline.
 - `tests/web-search/web-search-timeout-contract.test.ts`: 6 pass / **1 fail** upstream
   (`a never-settling 429 body cancel cannot block rotation under the cumulative header deadline`).
 
+- `tests/images/*` (SSRF / artifact-download lane): 65 pass / **50 fail** — `callXaiImages` (20),
+  `downloadImageToArtifact` scheme enforcement (12), `pinnedHttpsGet` (6), `pruneOldArtifacts` (5)
+  and 7 others. Both the test files and the modules they exercise (`xai-client.ts`,
+  `artifacts.ts`, `pinned-https-get.ts`) are byte-identical to upstream; the fork touched only
+  `images/loop.ts` in that lane, and these tests do not import it.
+
 **Gate 3 therefore reads: no failure outside this inherited set.** A new failure is port damage;
 one of these is upstream's own. Re-measure the baseline if upstream is bumped again.

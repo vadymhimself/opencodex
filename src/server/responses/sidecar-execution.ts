@@ -157,7 +157,10 @@ export async function executeResponsesSidecars(
   const rotateSidecarProviderOn429 = async (
     retryAfter: string | null,
     responseHeaders?: Headers,
-  ): Promise<ProviderAdapter | null> => {
+  ): Promise<{ adapter: ProviderAdapter; recoveryKind: AttemptRecoveryKind } | null> => {
+    // Which pool answered decides how the attempt row reads: an account rotation is not a key
+    // rotation, and logging one as the other hides which credential a 429 actually moved off.
+    let recoveryKind: AttemptRecoveryKind = "oauth-account-429";
     const rotated = rotateProviderTransportOn429(config, route.providerName, route.provider, {
       retryAfter,
       now: Date.now(),
@@ -166,6 +169,7 @@ export async function executeResponsesSidecars(
     });
     if (rotated) {
       route.provider = rotated;
+      recoveryKind = "key-429";
     } else if (
       // A POSITIVE gate, not an early return. An early `return null` here made every later arm
       // unreachable: Anthropic never has a genericFailoverAccountId (isGenericFailoverProvider
@@ -265,7 +269,7 @@ export async function executeResponsesSidecars(
       provider: route.provider,
       adapterName: rotatedAdapter.name,
     });
-    return rotatedAdapter;
+    return { adapter: rotatedAdapter, recoveryKind };
   };
   // A 403 credential denial is recoverable for a sidecar turn the same way it is on the main
   // dispatch path: rotate to the next eligible Anthropic account instead of ending the turn.
@@ -360,6 +364,11 @@ export async function executeResponsesSidecars(
         recordAdapterTier(logCtx, request);
       },
       ...(vidPlan?.timeoutMs ? { videoTimeoutMs: vidPlan.timeoutMs } : {}),
+      // Each hidden round is billed to the account that served it, so its usage lands on the
+      // attempt open at that moment rather than on whichever attempt survives to the terminal.
+      onIterationUsage: usage => {
+        if (usage && logCtx.activeAttempt) logCtx.activeAttempt.usage = usage;
+      },
       onUsage: usage => {
         // Cursor may assign _cursorConversationId inside the image loop's first runTurn;
         // backfill so Logs can filter/total that opening request (parity with the normal
@@ -367,7 +376,7 @@ export async function executeResponsesSidecars(
         if (!logCtx.conversationId && parsed._cursorConversationId) {
           logCtx.conversationId = normalizeLogConversationId(parsed._cursorConversationId);
         }
-        transportState.bindKeyUsageFromBridge(usage);
+        transportState.bindKeyUsageFromBridge(usage, { requestAggregate: true });
       },
       onCredentialError: rotateSidecarProviderOnCredentialError,
       on429: rotateSidecarProviderOn429,
@@ -445,8 +454,11 @@ export async function executeResponsesSidecars(
       },
       onAttemptSend: (recovery?: AttemptRecoveryKind) =>
         transportState.noteRoutedAttemptSend(logCtx.usageLogInputTokens, recovery),
+      onIterationUsage: usage => {
+        if (usage && logCtx.activeAttempt) logCtx.activeAttempt.usage = usage;
+      },
       onUsage: usage => {
-        transportState.bindKeyUsageFromBridge(usage);
+        transportState.bindKeyUsageFromBridge(usage, { requestAggregate: true });
       },
       recordSidecarOutcome: wsPlan.forwardSidecar?.recordOutcome,
       connectTimeoutMs: config.connectTimeoutMs ?? 200_000,

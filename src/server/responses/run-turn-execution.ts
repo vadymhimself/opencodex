@@ -292,7 +292,16 @@ export async function executeResponsesRunTurn(
           codexAuthContext: admissionState.authCtx,
           forwardHeaders: requestState.selectedForwardHeaders,
         });
-        sealRequestAttemptIdentity(logCtx.activeAttempt, logCtx.provider, rotatedAdapter.name, logCtx.accountLogLabel);
+        // Seal the rotated adapter identity but keep the attempt's CURRENT account label: the
+        // replay has not been sent yet, and stamping the new account here made
+        // noteProviderAttemptSend see previous === next, so the rotation never opened a second
+        // attempt row and both accounts' sends folded into one.
+        sealRequestAttemptIdentity(
+          logCtx.activeAttempt,
+          logCtx.provider,
+          rotatedAdapter.name,
+          logCtx.activeAttempt?.accountLogLabel,
+        );
         recordAttemptCredentialSource(logCtx.activeAttempt, route.providerName, route.provider, rotatedAdapter.name);
         // The caller replays the turn on this rotation, and a runTurn adapter dispatches through
         // its own reservation ladder -- Cursor reserves once per physical send. Confirming here
