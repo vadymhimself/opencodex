@@ -44,6 +44,7 @@ import {
   usageForFinalLog,
   usageStatusForFinalLog,
   usageTotalTokens,
+  credentialRecoveryStatus,
   type AttemptRecoveryKind,
   type AttemptRecoveryWithheld,
   type CacheTelemetryProvenance,
@@ -1636,10 +1637,24 @@ export function sealRequestAttemptIdentity(
 ): void {
   if (!attempt) return;
   if (attempt.provider !== provider || attempt.adapter !== adapter) delete attempt.credentialSource;
-  attempt.provider = provider;
+  // The adapter keeps re-stamping: a mid-turn wire rotation is still this same physical send.
   attempt.adapter = adapter;
-  if (isCodexUsageAccountLogLabel(accountLogLabel)) attempt.accountLogLabel = accountLogLabel;
-  else delete attempt.accountLogLabel;
+  if (attempt.sendCount === 0) {
+    attempt.provider = provider;
+    if (isCodexUsageAccountLogLabel(accountLogLabel)) attempt.accountLogLabel = accountLogLabel;
+    else delete attempt.accountLogLabel;
+    return;
+  }
+  // Once this row has sent, its ACCOUNT is settled — those tokens were spent on it. Re-stamping
+  // the account-qualified provider string here also laundered the rotation before
+  // `noteProviderAttemptSend` could see it, so the next account inherited this row instead of
+  // opening its own. Anthropic pool turns depend on that string: they carry no account label at
+  // all, because `stampOAuthAccountLabel` skips that base provider.
+  // A label that merely arrives late (resolved after the send, same account) still lands, since
+  // that case leaves the attempt unlabelled rather than labelled differently.
+  if (attempt.accountLogLabel === undefined && isCodexUsageAccountLogLabel(accountLogLabel)) {
+    attempt.accountLogLabel = accountLogLabel;
+  }
 }
 
 /** Preserve metered JSON failures before key recovery consumes/cancels their body. */
@@ -1687,17 +1702,36 @@ export function noteProviderAttemptSend(
   stampApiKeyAccountLabel(logCtx, providerName, provider);
   const next = logCtx.accountLogLabel;
   if (attempt && usesApiKeyAccount(provider)) keyUsageOwners.add(attempt);
-  // Any ACCOUNT change ends the attempt, not just an API-key one. OAuth pool labels are
-  // `p`/`o` + 6 hex, which the key-only pattern never matched, so a rotation folded the second
-  // account's sends, usage and label into the first attempt row: the request then reported one
-  // attempt on the wrong account, and per-account usage attribution was silently wrong.
-  if (attempt && attempt.sendCount > 0 && previous !== next
-    && (ACCOUNT_LOG_LABEL_RE.test(previous ?? "") || ACCOUNT_LOG_LABEL_RE.test(next ?? ""))) {
+  // Any ACCOUNT change ends the attempt, not just an API-key one, and a rotation shows up on
+  // one of two axes. Key and Codex pool accounts change the LABEL: the key-only pattern never
+  // matched `p`/`o` + 6 hex, so those rotations used to fold the second account's sends, usage
+  // and label into the first row. Anthropic's pool has no label at all — `stampOAuthAccountLabel`
+  // skips that base provider — and carries its account inside the log PROVIDER string
+  // ("anthropic (pabc123)"), which is the axis the fork's own transition compared. Either way
+  // the send about to happen belongs to a different credential than the one this row already
+  // spent tokens on, so it gets its own row.
+  const accountLabelChanged = previous !== next
+    && (ACCOUNT_LOG_LABEL_RE.test(previous ?? "") || ACCOUNT_LOG_LABEL_RE.test(next ?? ""));
+  // Safe to compare because a sent attempt's provider is frozen by `sealRequestAttemptIdentity`:
+  // the only way these diverge after a send is the account moving underneath it.
+  const accountProviderChanged = attempt !== undefined
+    && attempt.provider !== logCtx.provider
+    && logCtx.provider.length > 0;
+  // Third axis, and the only one that needs no comparison: a credential recovery says outright
+  // that the credential this row already sent on was refused. The same-account 401 refresh is
+  // the case the other two miss -- the account never changes, so neither the label nor the
+  // provider string moves, yet the refused send and its replay are separate physical attempts
+  // with separate outcomes. The fork split these unconditionally (`transitionCredentialRecovery`
+  // -> `transitionRequestAttempt` with `forceNew`); this is that rule expressed on the split
+  // that already lives here.
+  const recoveryStatus = credentialRecoveryStatus(recovery);
+  if (attempt && attempt.sendCount > 0
+    && (recoveryStatus !== undefined || accountLabelChanged || accountProviderChanged)) {
     // An input estimate is not evidence that a failed send used that many tokens.
     delete attempt.inputTokenEstimate;
     finishRequestAttempt(attempt, attempt.status >= 100 ? attempt.status
-      : recovery === "key-401" ? 401 : recovery?.includes("403") ? 403
-      : recovery?.includes("429") ? 429 : 502,
+      : recoveryStatus ?? (recovery?.includes("403") ? 403
+      : recovery?.includes("429") ? 429 : 502),
     Date.now() - (logCtx.activeAttemptStartedAt ?? Date.now()), attempt.usage);
     const completed = { ...attempt, recoveryKinds: [...attempt.recoveryKinds],
       ...(attempt.usage ? { usage: { ...attempt.usage } } : {}),
@@ -1713,7 +1747,12 @@ export function noteProviderAttemptSend(
     }
     for (const key of Object.keys(attempt)) delete (attempt as unknown as Record<string, unknown>)[key];
     Object.assign(attempt, fresh);
+    // The finished row owns what it spent. Leaving the previous leg's usage, its aggregate
+    // marker or its bridge flag in place would attribute the replay's tokens to the account
+    // that just failed.
     delete logCtx.usage;
+    delete logCtx.usageIsRequestAggregate;
+    delete logCtx.usageFromBridge;
     logCtx.activeAttemptStartedAt = Date.now();
   }
   if (attempt) {

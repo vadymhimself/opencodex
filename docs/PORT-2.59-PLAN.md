@@ -165,6 +165,29 @@ met and left a hole. Expect more of these than of either plain regression.
    as it parses. Fixed at the non-streaming tap in `src/server/claude-messages.ts` by routing
    through `recordKeyWireAttemptUsage` with a direct attempt write as the non-key fallback.
 
+2. **Anthropic pool rotations folded two accounts into one attempt row.**
+   The attempt split in `noteProviderAttemptSend` (`src/server/request-log.ts`) compares the
+   account LABEL across a send. Anthropic pool turns never carry one: `stampOAuthAccountLabel`
+   (`src/providers/label.ts:68`) returns early for base `openai` and `anthropic`, so an Anthropic
+   attempt has no `accountLogLabel` on ANY send, by design. That provider's account identity
+   lives in the account-qualified log provider string instead — `anthropic (pfc164f)`, written by
+   `formatAnthropicProviderForLog` — which is the axis the fork's own `transitionRequestAttempt`
+   compared. Label-only comparison is therefore not merely unfired on that lane, it is
+   structurally incapable of firing, and a 403 credential-denial rotation reported one attempt on
+   the wrong account with both accounts' tokens on it.
+   Two stacked defects, both needed fixing: the split gate now compares the provider string as
+   well as the label, AND `sealRequestAttemptIdentity` no longer re-stamps a sent attempt's
+   provider — its pre-send re-stamp was laundering the rotation on the very axis the gate reads.
+   Rotation itself was separately dead until the Anthropic pool branch started setting
+   `replayOAuthCredentialSnapshot` (`src/server/responses/request-transport.ts`), which
+   `rotateAnthropicProviderOnCredentialDenial` gates on; without it the 403 simply stood.
+
+   **Consequence to carry forward:** per-account attribution for the Anthropic pool rests
+   entirely on `attempt.provider`. Anything grouping per-account usage by `accountLogLabel` —
+   including the burn guard staged for the deploy, which groups by attempt fields — shows
+   Anthropic pool traffic as unlabelled. Group by the provider string for that provider, or
+   treat an absent label on an `anthropic` attempt as "pool account, see provider".
+
 ## Inherited upstream failures (baseline, 2026-09-19)
 
 Gate 3 cannot mean "everything green": upstream 2.59.0 does not pass its own suite on this

@@ -499,6 +499,10 @@ export async function prepareResponsesTransport(
         const admitted = await commitResolvedOAuthSelection(await getAnthropicPoolAccessSnapshot(selection.accountId), true, selection.reason);
         if (!admitted) return formatErrorResponse(409, "conflict_error", "OAuth account selection changed; retry the request");
         anthropicPoolAccountId = admitted.accountId;
+        // Same stamp the generic OAuth branch makes below: recovery compares this snapshot to
+        // decide whether a credential denial may rotate. Without it the pool looks like it has
+        // no served account, so an expired subscription's 403 stands instead of moving on.
+        replayOAuthCredentialSnapshot = { accountId: admitted.accountId, generation: admitted.generation };
         route.provider = { ...route.provider, apiKey: admitted.accessToken };
         logCtx.provider = formatAnthropicProviderForLog("anthropic", admitted.accountId, config);
       } else {
