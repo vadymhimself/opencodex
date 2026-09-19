@@ -111,9 +111,19 @@ over the fork's and the behaviour is NOT identical.
    adapter's inner retries, which the fork hook could not see.
 3. **Lenient usage parsing dropped** (`src/adapters/anthropic.ts`): invalid upstream usage is now
    unreported rather than counted as zero.
-4. **The 60s Anthropic account cooldown cap is gone**: 2.59 treats a server `Retry-After` as
-   authoritative and caps local fallbacks at ten minutes. The fork's exhaustion branch is kept, so
-   a proven-empty window still takes the ten-minute ceiling instead of the 60s default.
+4. **PARTLY REVERSED after it was caught regressing.** 2.59 treats a server `Retry-After` as
+   authoritative and uncapped. Taking that wholesale left `QUOTA_CAP_COOLDOWN_MS` present but
+   INERT, because the write clamped every cooldown with `Math.min(..., MAX_COOLDOWN_MS)` and
+   `MAX_COOLDOWN_MS` is 60s: a proven-empty account window was re-offered every minute, which is
+   the 942-doomed-sends bug the fork exists to fix. It was invisible because the test that guards
+   it (`tests/routing/router-combo-failover-classification.test.ts`) did not parse -- see the
+   port-interaction section.
+   Settled rule, matching the live 2.43 build and passing BOTH sides' tests:
+   - the ceiling is reason-dependent: `QUOTA_CAP_COOLDOWN_MS` (10 min) for an exhausted window or
+     a reset-derived delay, `MAX_COOLDOWN_MS` (60s) for a transient 429;
+   - a server `Retry-After` is authoritative UP TO ten minutes and clamped beyond it. Upstream's
+     own test wants a 120s `Retry-After` honoured; the fork's invariant wants a 2h one clamped.
+     Both are right about different magnitudes.
 5. **Bare `error` events are no longer classified in `captureTerminalHttpStatus`**
    (`src/server/request-log.ts`). The fork classified them from `json.error`, pre-setting
    `terminalHttpStatus = 502`; 2.59 decides a bare error's status downstream via
@@ -187,6 +197,19 @@ met and left a hole. Expect more of these than of either plain regression.
    including the burn guard staged for the deploy, which groups by attempt fields — shows
    Anthropic pool traffic as unlabelled. Group by the provider string for that provider, or
    treat an absent label on an `anthropic` attempt as "pool account, see provider".
+
+2. **A bare upstream `error` frame lost its classification, so client refusals arrived as 502.**
+   `upstreamErrorTailFrame` (`src/server/relay.ts`) is upstream-only: when a 200 SSE ends with no
+   protocol terminal it synthesizes a `response.failed`, stamping a fixed
+   `{type: "upstream_error", code: "upstream_server_error"}` and keeping only the message. The
+   fork had no tail synthesis at all, so a bare error's own `invalid_request_error` survived to
+   the surface. Ported together, every classifier downstream was told the turn was a 5xx: Claude
+   Code saw `502 overloaded_error` — retryable — for an upstream that had refused the request
+   outright, and the same relabelling hid Anthropic OAuth subscription denials that credential
+   rotation keys off. Fixed by carrying the frame's declared `type`/`code` into the synthesized
+   terminal, and by deriving the non-streaming Claude error status from the collected error
+   instead of a flat 502 (`api_error` still maps to 502, so unclassified errors are unchanged).
+   Not a deviation and not a dropped fork behaviour: neither side has this bug alone.
 
 ## Inherited upstream failures (baseline, 2026-09-19)
 

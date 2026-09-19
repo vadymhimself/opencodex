@@ -523,6 +523,9 @@ describe("response_format capability refusal, second gateway", () => {
       expect(comboFailureDecision(400, JSON.stringify({ error: { ...refusal, message } })))
         .toBe("stop");
     }
+  });
+});
+
 describe("exhausted account windows stay cooled", () => {
   test("prose-only exhaustion holds the target for ten minutes, not one", () => {
     // The generic 60s default re-offered a provably empty account roughly every minute. 72h of

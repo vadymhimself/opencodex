@@ -242,18 +242,32 @@ export function coolComboTarget(
     preserveImmediate: true,
     preserveServerDelay: true,
   });
+  const resetDerivedMs = parseResetCooldownMs(options?.resetAt, now);
   const cooldownMs = serverDelayMs
-    ?? parseResetCooldownMs(options?.resetAt, now)
+    ?? resetDerivedMs
     ?? options?.cooldownMs
     ?? (exhausted ? QUOTA_CAP_COOLDOWN_MS : isTransientRequestRateLimit({
       status: options?.status,
       code: options?.code,
       message: options?.message,
     }) ? COMBO_REQUEST_RATE_COOLDOWN_MS : DEFAULT_COOLDOWN_MS);
+  // The ceiling depends on WHY we are cooling. A proven-empty account window rolls in hours, so
+  // capping it at the generic 60s re-offers a depleted account every minute -- 72h of ledger
+  // showed 942 such doomed sends on one Codex window. A transient 429 keeps the 60s cap so one
+  // burst cannot starve every target for ten minutes. Capping both at MAX_COOLDOWN_MS leaves
+  // QUOTA_CAP_COOLDOWN_MS present but inert, which is the regression this comment exists to stop.
+  const ceilingMs = exhausted || resetDerivedMs !== undefined
+    ? QUOTA_CAP_COOLDOWN_MS
+    : MAX_COOLDOWN_MS;
+  // A server `Retry-After` is authoritative UP TO the ten-minute ceiling, and only up to it.
+  // Upstream honours it uncapped; the fork clamped it to the ceiling. Both are right about
+  // different magnitudes: honouring 120s avoids hammering a provider that just told us to wait,
+  // while honouring hours pins that target for hours, and a combo whose targets are all pinned
+  // answers "No available targets". Quota commonly frees before the advertised reset, so
+  // re-probing at the ceiling costs one request and un-pins the combo.
+  const effectiveCeilingMs = serverDelayMs !== undefined ? QUOTA_CAP_COOLDOWN_MS : ceilingMs;
   targetCooldowns.set(cooldownMapKey(comboId, target), {
-    // Only the locally chosen fallback is capped at ten minutes. An explicit
-    // server lower bound (including one hour) remains authoritative.
-    cooldownUntil: now + (serverDelayMs ?? Math.min(Math.max(cooldownMs, 1), MAX_COOLDOWN_MS)),
+    cooldownUntil: now + Math.min(Math.max(cooldownMs, 1), effectiveCeilingMs),
   });
   sweepExpiredOnWrite(now);
 }
