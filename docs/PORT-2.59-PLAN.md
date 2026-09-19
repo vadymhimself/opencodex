@@ -64,9 +64,16 @@ way every step is committable, testable, and revertable.
   1. Resolve the install prefix from the LIVE process, never PATH (see the two-tree hazard above).
   2. Install and restart in one command; prove it by readback -- `ocx --version` AND `ocx health`.
      The install exit code is not evidence: an install into a tree nothing runs also exits 0.
-  3. THEN load the burn guard on that host: `launchctl load -w <plist>`, 10-minute poll. It is
-     staged unloaded on both hosts. Loading it before a deploy is pointless and not harmless --
-     a trip would reinstall 2.43 over 2.43 and restart a healthy gateway for nothing.
+  3. THEN load the burn guard on that host. Re-run `ocx-burn-guard.sh baseline` IMMEDIATELY
+     before loading: the staged state file's `last_ts` dates from when the baseline was taken, so
+     an old one makes the first check emit a ring-gap alert. Self-correcting on the next poll,
+     but it looks like a fault if nobody expects it. Then:
+         launchctl load -w ~/Library/LaunchAgents/com.gigradar.ocx-burn-guard.plist
+         launchctl list | grep burn-guard    # confirm it took
+     `StartInterval` 600, `RunAtLoad` true, so arming checks immediately rather than in ten
+     minutes. Staged unloaded on both hosts; `plutil -lint` passes. Loading before a deploy is
+     pointless and not harmless -- a trip would reinstall 2.43 over 2.43 and restart a healthy
+     gateway for nothing.
   4. Watch one hour. Roll back on a TRIP; investigate, do not auto-act, on an ALERT.
 
 ### Why the guard splits the laptop's zero-attempt failures by signature
