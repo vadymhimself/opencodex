@@ -132,5 +132,19 @@ byte-identical to the pre-port baseline.
 - `tests/responses`: 2664 pass / **16 fail**, confirmed pre-existing by neutralising the port's
   two runtime-live deltas in that lane and re-running to an identical result.
 
+## Gate 2 result: 31 of 32 fork exports present, 1 deliberately superseded
+
+Derived mechanically from `f47552136`'s own added exports rather than from memory. The single
+absent symbol is `transitionRequestAttempt`, and it is superseded rather than lost:
+
+- Its chat-native call site fired only on `recovery === "key-429"`. The split now lives in
+  `noteProviderAttemptSend`, which fires whenever the account label actually changed. That is
+  broader (it covers OAuth pool labels, which the key-only pattern never matched) and safer: a
+  rotation that lands on the SAME account must not split, or one account reports as two attempts.
+- Its two `core.ts` sites went with that file. All four account-changing send paths in 2.59 route
+  through `noteProviderAttemptSend`.
+- The one remaining direct `noteAttemptSend` (`request-send-budget.ts:114`) is upstream's
+  adapter-inner-retry accounting, which is same-account by construction and must not split.
+
 **Gate 3 therefore reads: no failure outside this inherited set.** A new failure is port damage;
 one of these is upstream's own. Re-measure the baseline if upstream is bumped again.
