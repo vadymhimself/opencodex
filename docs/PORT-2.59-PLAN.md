@@ -31,6 +31,14 @@ way every step is committable, testable, and revertable.
 
 - 2.43 stays deployed until every gate passes. Rollback tarball: `bitkyc08-opencodex-2.43.0.tgz`,
   tags `gw-known-good-2.43.0` (f47552136) and `gw-deployed-2.43.0-quota` (origin/main).
+- **Install into the tree that actually runs, not the one on PATH.** The laptop carries TWO
+  2.43.0 installs. `launchd` (`com.opencodex.proxy.plist`) hardcodes `/opt/homebrew/bin/ocx`, so
+  the supervised gateway is always the homebrew tree; `which ocx` resolves to an nvm tree last
+  written Sep 18. They are not identical -- homebrew has the ten-minute ceiling
+  (`QUOTA_CAP_COOLDOWN_MS = 10 * 60_000`), nvm still has `MAX_COOLDOWN_MS`. An `npm i -g` off
+  PATH installs 2.59 where nothing executes it, exits 0, and leaves 2.43 serving. Resolve the
+  prefix from the live process, verify by readback (`ocx --version` plus `ocx health`), and check
+  the Mini for the same split before deploying there.
 - Install and restart in ONE command per host: a changed package tree under a running gateway
   makes it answer `restart_required` to everything.
 - Stage on the Mac mini first, watch one hour, then the laptop. Never both at once.
