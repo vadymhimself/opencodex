@@ -355,6 +355,54 @@ recent row in the ring, so it is still going. Hourly 12:00-19:00: 0,1,7,7,5,5,40
 are on 2.43, so this is not a 2.59 symptom. Residual zero-attempt is still 0.00% on both, so the
 signature split holds and the trip stays armed.
 
+### Root cause of "No available targets for combo: waterfall" (BOTH hosts, 2.43 and 2.59)
+
+`combos/waterfall` has two targets: `anthropic/claude-opus-5` and `openai/gpt-6-astra`. The split
+is by request shape and it is near-absolute: 1753 streaming requests all served by anthropic with
+zero faults; 94 non-streaming, of which anthropic served 2 and 75 faulted.
+
+The chain:
+1. `comboTargetAcceptsAnthropicSource` drops the anthropic target for a body carrying
+   `output_config.effort` WITHOUT `thinking: adaptive|disabled`. Probed directly against the live
+   config: that shape returns false, while plain bodies, typed tools, function tools and
+   `thinking: adaptive` all return true. `max_tokens > 64000` also drops it
+   (anthropic `defaultMaxOutputTokens` is 64000).
+2. That leaves openai as the ONLY target for those requests.
+3. openai reads `weeklyPercent: 100` and returned 502 on ~50 of ~67 attempts.
+4. A 502 is neither a quota cap nor a transient rate limit, so `coolComboTarget` takes
+   `DEFAULT_COOLDOWN_MS` (60s). Each 502 blacks out the last remaining target for a minute.
+5. A request arriving in that window finds zero eligible targets: 529, `durationMs: 0`, zero
+   attempts. No upstream was ever contacted.
+
+Anthropic was never the problem -- zero 429s in the entire ring, and it served 3-8 successful
+turns in the same minutes as the faults.
+
+**Why this is a defect, not strictness.** A NON-canonical target is eligible whenever the source
+does not REQUIRE exact replay, because it can be translated. The canonical Anthropic target is
+dropped outright when it cannot replay exactly, even when translation would serve. The one target
+guaranteed able to answer an Anthropic request is held to the strictest standard.
+
+**Counterfactual on availability (not an execution of the patch):** measuring each fault's
+distance to the nearest `combo/waterfall` turn that resolved to `anthropic/claude-opus-5` with a
+200 -- a cooled or quota-filtered target cannot produce a 200, so a nearby success proves the
+target was pickable: 73 within 30s, 2 within 60s, **75/75**. Re-verify against the ring once the
+fix lands.
+
+### Account-layer cooldown ceilings (checked, and one cliff recorded)
+
+- **Anthropic accounts are capped at 60 seconds** (`oauth/anthropic-routing.ts`, DEFAULT and MAX
+  both `60_000`, clamped at both parse sites). No anthropic account can be blacked out longer
+  than a minute by the routing layer. This is what ruled out an anthropic-side blackout and left
+  the eligibility filter as the only explanation.
+- **`exhaustedCooldownMs` in `account-quota-rank.ts` carries a [5 minute, 24 HOUR] range** and its
+  exhausted branch BYPASSES the generic 60s clamp at `generic-account-failover.ts:231`. It is
+  hard-gated `if (provider !== "kiro") return null;` on its first line, and neither host has a
+  kiro provider (both configs list exactly `anthropic`, `openai`; no kiro credentials). So it is
+  NOT reachable today. Recorded because it is a real cliff the day a kiro provider is added: one
+  429 with no `Retry-After` could park an account for up to a day with nothing at the generic
+  layer limiting it. The trigger to revisit is a CONFIG CHANGE, not a runtime signal -- no guard
+  detector for it, since a permanently-zero baseline detects nothing.
+
 ### Outstanding, classified, NOT defects
 
 - **`opencode-go-session-header.test.ts` (28 failures)**: an EXPECTATION CHANGE, not a duplicate
