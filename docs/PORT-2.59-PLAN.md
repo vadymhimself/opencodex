@@ -24,7 +24,7 @@ way every step is committable, testable, and revertable.
    measured by the group-by-(conversation, model, provider), pairs <300s, miss when
    `cacheReadInputTokens < 0.5 x (prev read + prev write)` test. Never compare read share
    across windows: it tracks conversation depth and account switches, not gateway behaviour.
-6. Burn checks clean on the staged host: zero doomed sends (real send -> 429/502/529), zero
+6. Burn checks clean on the staged host: zero doomed sends (real send -> **429 ONLY**), zero
    `503` with no attempts.
 
 ## Safety rules
@@ -332,6 +332,28 @@ inherited when upstream's own tree has **1**. The real baseline is measured in a
 | cli | 1938 / 1 | |
 
 Re-measure the same way before trusting any baseline claim in this document.
+
+### The doomed-send rejection set is 429 only -- 502/529 would have rolled back on an outage
+
+This document originally said `429/502/529`, and the guard inherited that wording. It is wrong:
+502 and 529 are upstream CAPACITY errors, not quota exhaustion, and re-sending after one is
+ordinary retry behaviour. Measured consequence: re-baselining the Mini jumped doomed from 0.10%
+to 1.55% -- all 31 events provider `openai`, in a single 7-minute burst (18:51:45-18:58:40), every
+rejection a 502 and not one 429. An upstream provider outage was feeding the one signal wired to
+auto-rollback. **Had the guard been armed, the Mini would have rolled back because OpenAI had a
+bad seven minutes.**
+
+Narrowed to 429 only, at no cost in real signal: laptop live ring 4 doomed before and after,
+recorded evidence 3 before and after -- genuine Anthropic quota events across four accounts. Mini
+goes 31 to 0. A 400-row 502 blip is now silent; a 400-row 429 burn still trips.
+
+### The waterfall fault is on BOTH hosts, and is currently active
+
+It was zero on the Mini in every earlier capture, which is why the Mini was treated as the clean
+host. The Mini's current ring carries 75 events, first 13:52:41 and last 19:52:30 -- the most
+recent row in the ring, so it is still going. Hourly 12:00-19:00: 0,1,7,7,5,5,40,10. Both hosts
+are on 2.43, so this is not a 2.59 symptom. Residual zero-attempt is still 0.00% on both, so the
+signature split holds and the trip stays armed.
 
 ### Outstanding, classified, NOT defects
 
