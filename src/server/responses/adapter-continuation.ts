@@ -81,6 +81,7 @@ export function createAdapterContinuations(
     | "anthropicPoolAccountId"
     | "anthropicPoolFailovers"
     | "anthropicSessionKey"
+    | "anthropicMessagesSource"
     | "commitResolvedOAuthSelection"
     | "genericFailoverAccountId"
     | "genericFailovers"
@@ -171,6 +172,11 @@ export function createAdapterContinuations(
             headers: requestState.selectedForwardHeaders,
             translatorBudget,
             ...(transportState.imageTierBias > 0 ? { imageTierBias: transportState.imageTierBias } : {}),
+            // Same per-attempt rule as the dispatch ladder: a continuation that loses the source
+            // would send translated bytes on a turn the caller was promised would be replayed.
+            ...(transportState.activeAdapter.name === "anthropic" && transportState.anthropicMessagesSource
+              ? { anthropicMessagesSource: transportState.anthropicMessagesSource }
+              : {}),
           });
           recordAdapterReasoning(logCtx, continuationRequest);
           recordAdapterTier(logCtx, continuationRequest);

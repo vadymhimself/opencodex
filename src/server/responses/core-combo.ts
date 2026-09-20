@@ -428,7 +428,16 @@ export async function executeComboResponses(
   }
   // One immutable combo selection trace, before any child dispatch; child
   // adoption below must never replace it with a concrete child route trace.
-  logCtx.routeDecision = comboRouteDecisionTrace(config, comboId, pick, requestedModel);
+  // Pass the request-compatibility predicate so a target this request could never run on is
+  // traced as `request-incompatible` rather than an ordinary `not-selected` runner-up.
+  logCtx.routeDecision = comboRouteDecisionTrace(
+    config,
+    comboId,
+    pick,
+    requestedModel,
+    undefined,
+    targetEligible,
+  );
 
   const originalReasoning = body && typeof body === "object" && !Array.isArray(body)
     ? (body as { reasoning?: unknown }).reasoning
@@ -726,6 +735,9 @@ export async function executeComboResponses(
     const wantsStream = (rawBody as { stream?: unknown } | null)?.stream === true;
     // Local byte admission has its own diagnostic; do not relabel it as an upstream refusal.
     const classifyOverflow = failure.response.status === 413
+      // A canonical replay owes the caller the source's exact bytes. Synthesizing the overflow
+      // answer would replace a real upstream 413 with this proxy's own 200 SSE.
+      && !failure.passthroughResponse
       && (wantsStream || (failure.upstreamCode !== "outbound_body_too_large"
         && failure.upstreamCode !== "translation_buffer_limit"));
     lastFailureClassifiesOverflow = classifyOverflow;

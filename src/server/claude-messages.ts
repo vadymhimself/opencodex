@@ -1267,17 +1267,19 @@ async function handleClaudeMessagesWithBudget(
         "translation_buffer_limit",
       );
     }
-    // The collected error already carries the upstream's classification; answering a flat 502
-    // would relabel an explicit client refusal as a retryable proxy failure. `api_error` maps
-    // back to 502, so an unclassified upstream error keeps today's status.
+    // An explicit client refusal must not be relabelled as a retryable proxy failure, so a
+    // client-class classification on the collected error wins. Server-class ones stay 502:
+    // the upstream's own 5xx shape (`overloaded_error`, `api_error`) says nothing this layer
+    // can improve on, and promoting it to 529 would invent a backoff the turn never earned.
+    const classifiedStatus = isError
+      ? httpStatusFromTerminalError({
+        type: typeof translatedError?.type === "string" ? translatedError.type : undefined,
+        code: typeof translatedError?.code === "string" ? translatedError.code : undefined,
+        message: typeof translatedError?.message === "string" ? translatedError.message : undefined,
+      })
+      : 200;
     return new Response(JSON.stringify(message), {
-      status: isError
-        ? httpStatusFromTerminalError({
-          type: typeof translatedError?.type === "string" ? translatedError.type : undefined,
-          code: typeof translatedError?.code === "string" ? translatedError.code : undefined,
-          message: typeof translatedError?.message === "string" ? translatedError.message : undefined,
-        })
-        : 200,
+      status: isError ? (classifiedStatus < 500 ? classifiedStatus : 502) : 200,
       headers: { "Content-Type": "application/json" },
     });
   }

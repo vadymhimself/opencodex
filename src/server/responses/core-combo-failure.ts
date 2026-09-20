@@ -73,7 +73,7 @@ export async function consumeComboFailure(
         // Match shouldRetryCodexPoolAccountQuota before treating a 5xx body as quota evidence.
         fatalUtf8: response.status >= 500 && response.status < 600,
       });
-      text = text;
+      text = body.text;
       displaySafe = body.displaySafe;
       truncated = body.truncated;
     }

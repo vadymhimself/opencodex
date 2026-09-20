@@ -1022,7 +1022,6 @@ export async function preparePassthroughExchange(
         // every other build site; a replay is exactly when a grown payload reappears.
         const replayBodyRefusal = refuseOversizedOutboundBody(request);
         if (replayBodyRefusal) return replayBodyRefusal;
-        transportState.noteRoutedAttemptSend(passthroughEstimate, "oauth-401");
         upstreamResponse = await fetchWithHeaderTimeout(
           request.url,
           { method: request.method, headers: request.headers, body: request.body },
@@ -1035,6 +1034,9 @@ export async function preparePassthroughExchange(
           // budget even when a rejected pacing wait means nothing reaches the network. Wrapping
           // the executor moves the signal to the last moment before the send, where a throw from
           // here on is a genuine transport attempt.
+          // The attempt-send rides the SAME hook as the dispatch signal above, and for the same
+          // reason: accounting it at the call site books a physical send that a rejected pacing
+          // wait never made, which is both a phantom attempt row and a spent recovery budget.
           storedPoolReplayDispatchNotifier(
             providerFetch(route.provider, options.codexWsRuntimeIdentity, {
               nativeControl: nativeResponseControlEligible(route.provider, options.nativeControl) && options.inboundTransport === "websocket" && !options.comboAttempt
@@ -1047,7 +1049,10 @@ export async function preparePassthroughExchange(
               beforeDispatch: isCanonicalOpenAiForwardProvider(route.provider)
                 ? createCodexReserveDispatchGuard(admissionState.authCtx, options.codexAuthPolicy ?? config, route.modelId, options.admission, options.visionDescribeTerminal === true) : undefined,
             }),
-            codex401ReplayKind === "stored" ? options.onStoredPool401ReplayDispatched : undefined,
+            () => {
+              transportState.noteRoutedAttemptSend(passthroughEstimate, "oauth-401");
+              if (codex401ReplayKind === "stored") options.onStoredPool401ReplayDispatched?.();
+            },
           ),
           route.provider.authMode === "forward",
         ).then(adoptObservedResponse);
@@ -1323,6 +1328,11 @@ export async function preparePassthroughExchange(
       // limit, and rotating on it would cool down a key that refused nothing.
       && !isNonReplayableResponse(upstreamResponse)
       && hasKeyPoolFailover(route.provider)
+      // Checked HERE rather than left to rebuildAndRefetch's own reservation, for the same
+      // reason the same-target loop above checks it early: the rotation cancels the 429 body
+      // before replaying, so a refusal discovered after that can no longer hand back the real
+      // rate-limit answer and would surface a synthetic budget error in its place.
+      && !sendBudgetExhausted(transientSendAttempts())
     ) {
       const rotated = rotateProviderTransportOn429(config, route.providerName, route.provider, {
         retryAfter: upstreamResponse.headers.get("retry-after"),
