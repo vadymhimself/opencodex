@@ -853,11 +853,12 @@ async function handleClaudeMessagesWithBudget(
         };
       }
     }
-    // EXPERIMENT: snapshot before the effort rewrite, per the comment above.
-    if (isRec(anthropicBody)) {
-      originalAnthropicBody = structuredClone(anthropicBody);
-      comboRandomSeed = anthropicRequestCorrelationKey(anthropicBody);
-    }
+    // The source snapshot is the CALLER's bytes, so it is taken before the effort rewrite below
+    // (which the comment above already promised). Snapshotting after it recorded our own
+    // rewrite as the caller's request: the rewrite adds `output_config.effort` and deletes
+    // `thinking`, and that pairing is exactly what `canReplayAnthropicSource` refuses, so a
+    // canonical Anthropic target was filtered out of its own combo as `request-incompatible`.
+    if (isRec(anthropicBody)) originalAnthropicBody = structuredClone(anthropicBody);
     if (isRec(anthropicBody) && effortOverride) {
       anthropicBody.output_config = {
         ...(isRec(anthropicBody.output_config) ? anthropicBody.output_config : {}),
@@ -865,6 +866,9 @@ async function handleClaudeMessagesWithBudget(
       };
       delete anthropicBody.thinking;
     }
+    // Deliberately AFTER the rewrite: count and generation must derive the same correlation key
+    // from the same canonicalized fields, and both reach this line with the rewrite applied.
+    if (isRec(anthropicBody)) comboRandomSeed = anthropicRequestCorrelationKey(anthropicBody);
     const translation = anthropicToResponsesTranslation(anthropicBody, config.claudeCode, translatorBudget);
     internalBody = translation.body;
     if (originalAnthropicBody) {
