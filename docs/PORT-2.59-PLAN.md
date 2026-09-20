@@ -61,6 +61,14 @@ way every step is committable, testable, and revertable.
 - **P3 tests.** Port fork tests, adapting to moved modules.
 - **P4 gates.** Items 1-4 above, plus `scripts/claude-cache-count-parity-eval.ts`.
 - **P5 staged deploy.** Mini, one hour of gates 5-6, then laptop.
+  0. BUILD the deploy artifact from THIS BRANCH: `npm pack`. There is no pre-built 2.59 artifact
+     to deploy. The repo root holds `UPSTREAM-REFERENCE-ONLY-DO-NOT-DEPLOY-2.59.0.tgz`, which is
+     STOCK UPSTREAM -- verified to contain zero `QUOTA_CAP_COOLDOWN_MS`/`ceilingMs` code and no
+     `anthropic-source-replay` module. Installing it would erase every fix in this port. It was
+     previously named `bitkyc08-opencodex-2.59.0.tgz`, sitting beside the rollback tarball and
+     looking exactly like the thing to deploy. Confirm any candidate artifact before installing:
+         tar -xzOf <tgz> package/src/combos/failover.ts | grep -c ceilingMs      # must be > 0
+         tar -tzf <tgz> | grep -c anthropic-source-replay                        # must be > 0
   1. Resolve the install prefix from the LIVE process, never PATH (see the two-tree hazard above).
   2. Install and restart in one command; prove it by readback -- `ocx --version` AND `ocx health`.
      The install exit code is not evidence: an install into a tree nothing runs also exits 0.
