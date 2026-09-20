@@ -335,6 +335,26 @@ Re-measure the same way before trusting any baseline claim in this document.
 
 ### Outstanding, classified, NOT defects
 
+- **`opencode-go-session-header.test.ts` (28 failures)**: an EXPECTATION CHANGE, not a duplicate
+  send. The file is byte-identical to upstream's and passes 88/0 there. It rigs entropy
+  (`mockReturnValue(0.9)` with `mockReturnValueOnce(0)`) to encode two INDEPENDENT draws --
+  preliminary route checks target[0], dispatch independently picks target[1]. The fork passes
+  `comboRandomSeed` (`anthropicRequestCorrelationKey`, a sha256 over count-relevant body fields)
+  to both, so `combos/resolve.ts:275` uses `correlatedRandom(seed, comboId)` instead of
+  `Math.random()`, the mocked sequence is never consumed, and both picks agree. That agreement is
+  the feature: `count_tokens and following generation share a random combo target` depends on it.
+  Setting `comboRandomSeed = undefined` turns the file 88/0 and is the sole cause of all 28.
+  Do NOT "fix" these by dropping the seed.
+  The second request is not a duplicate: target[0] returns `404 model_not_found` and advancing on
+  failure is strategy-independent. Attempt rows, seeded vs not:
+
+      seeded:   [{o:1, provider:"other", sends:1, status:404}, {o:2, provider:"renamed-go", sends:1, status:0}]
+      unseeded: [{o:1, provider:"renamed-go", sends:1, status:0}]
+
+  Burn is bounded: the correlation key is per-request-body so it varies across turns rather than
+  pinning a conversation to one target, and `isComboTargetInCooldown` sits inside
+  `pickComboTarget`'s eligibility filter, so a repeatedly-failing target drops out of the pick.
+
 - **kiro (3 failures)**: `kiro-retry.test.ts` (2) and `kiro-stream.test.ts` (1) carry fork
   assertions upstream does not have -- kiro retries flowing through the request executor with a
   next-dispatch recovery label. Upstream's own versions pass upstream. This is fork behaviour not
