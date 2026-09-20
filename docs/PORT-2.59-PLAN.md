@@ -439,6 +439,29 @@ stop matching and land in the RESIDUAL, where they would trip a rollback on a pr
 Matching the structural fields instead (`errorCode == "server_is_overloaded"` with zero attempts)
 removes that dependency.
 
+### Cost signals count ROWS; availability signals count OUTAGES
+
+Retry ladders inflate row counts 2-4x over genuine outages (laptop 20 rows -> 5 outages, Mini 75
+-> 38, laptop evidence 128 -> 63), because one caller backing off at 2s/2s/2s/5s/8s writes six
+rows for one failure. The obvious fix -- put the trip floor on collapsed incidents instead of
+rows -- was implemented, regression-tested, and REVERTED: it silenced both the "new failure mode"
+case and the sub-floor burn repro, because a sustained burn inside one conversation collapses to
+a single incident and never produces a second one. It would have traded 2-4x over-sensitivity for
+a PERMANENT blind spot on exactly the shape the guard exists to catch.
+
+The incident count is still computed and printed as context:
+`TRIP zero-attempt-503 30 rows [5 incidents] over 430 rows = 6.98%`.
+
+The rule that came out of it, and the reason it must not be "unified" later:
+- **doomed-sends counts ROWS.** Every doomed send is a physical request that costs money; six
+  retries are six wasted sends, not one.
+- **availability signals count OUTAGES**, which is why their row floors read as more sensitive
+  than documented: 5 genuine outages producing 30 rows will trip where the note said 25 rows.
+  Accepted deliberately -- the residual baseline is a true zero on every ring measured, so any
+  residual event at all is a failure mode never seen on 2.43. The floor filters flukes, it does
+  not require severity, and on a freshly-deployed build erring toward acting is the right error:
+  a false rollback costs a restart onto a known-good build, a missed burn costs money.
+
 ### Account-layer cooldown ceilings (checked, and one cliff recorded)
 
 - **Anthropic accounts are capped at 60 seconds** (`oauth/anthropic-routing.ts`, DEFAULT and MAX
