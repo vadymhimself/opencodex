@@ -198,7 +198,7 @@ met and left a hole. Expect more of these than of either plain regression.
    account LABEL across a send. Anthropic pool turns never carry one: `stampOAuthAccountLabel`
    (`src/providers/label.ts:68`) returns early for base `openai` and `anthropic`, so an Anthropic
    attempt has no `accountLogLabel` on ANY send, by design. That provider's account identity
-   lives in the account-qualified log provider string instead — `anthropic (pfc164f)`, written by
+   lives in the account-qualified log provider string instead — `anthropic-pfc164f` (hyphen form: `${providerName}-${ordinal}`), written by
    `formatAnthropicProviderForLog` — which is the axis the fork's own `transitionRequestAttempt`
    compared. Label-only comparison is therefore not merely unfired on that lane, it is
    structurally incapable of firing, and a 403 credential-denial rotation reported one attempt on

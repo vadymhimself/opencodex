@@ -1707,7 +1707,7 @@ export function noteProviderAttemptSend(
   // matched `p`/`o` + 6 hex, so those rotations used to fold the second account's sends, usage
   // and label into the first row. Anthropic's pool has no label at all — `stampOAuthAccountLabel`
   // skips that base provider — and carries its account inside the log PROVIDER string
-  // ("anthropic (pabc123)"), which is the axis the fork's own transition compared. Either way
+  // ("anthropic-pabc123", hyphen form from `formatAnthropicProviderForLog`), which is the axis the fork's own transition compared. Either way
   // the send about to happen belongs to a different credential than the one this row already
   // spent tokens on, so it gets its own row.
   const accountLabelChanged = previous !== next
