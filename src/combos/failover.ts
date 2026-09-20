@@ -256,7 +256,11 @@ export function coolComboTarget(
   // showed 942 such doomed sends on one Codex window. A transient 429 keeps the 60s cap so one
   // burst cannot starve every target for ten minutes. Capping both at MAX_COOLDOWN_MS leaves
   // QUOTA_CAP_COOLDOWN_MS present but inert, which is the regression this comment exists to stop.
-  const ceilingMs = exhausted || resetDerivedMs !== undefined
+  // The 60s ceiling caps values this gateway INFERRED. An operator's configured `cooldownMs` is
+  // not an inference -- it is the one explicit lever for "stop hammering this target", validated
+  // up to ten minutes at the config surface -- so truncating it to 60s gives five to ten times
+  // the doomed sends on exactly the control a burn-bitten operator reaches for.
+  const ceilingMs = exhausted || resetDerivedMs !== undefined || options?.cooldownMs !== undefined
     ? QUOTA_CAP_COOLDOWN_MS
     : MAX_COOLDOWN_MS;
   // A server `Retry-After` is authoritative UP TO the ten-minute ceiling, and only up to it.
