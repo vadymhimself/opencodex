@@ -44,6 +44,8 @@ export type AnthropicRateLimitHeaders = Pick<Headers, "get">;
 const PROVIDER = "anthropic";
 /** Backoff only when upstream supplies no usable deadline. */
 const DEFAULT_COOLDOWN_MS = 60_000;
+/** Ceiling for a reset-derived account cooldown; matches the combo layer's exhausted-window cap. */
+const QUOTA_CAP_COOLDOWN_MS = 10 * 60_000;
 const AFFINITY_IDLE_TTL_MS = 24 * 60 * 60_000;
 const MAX_AFFINITY_ENTRIES = 2_000;
 const MAX_AFFINITY_COMPONENT_BYTES = 512;
@@ -722,7 +724,18 @@ export function rotateAnthropicAccountOn429(
   // account is back in the rotation a minute later.
   const parsedRetry = parseRetryAfterMs(retryAfterHeader, now);
   const resetDerived = parsedRetry === undefined ? parseRateLimitResetMs(rateLimitHeaders, now) : undefined;
-  const cooldownMs = parsedRetry ?? resetDerived ?? DEFAULT_COOLDOWN_MS;
+  // Both are clamped. An UNBOUNDED account cooldown is how a pool loses an account for hours on
+  // one upstream header, and an account removed from the pool is what single-homes a combo onto
+  // its remaining target -- the "No available targets" outage, reached from the account layer.
+  // `Retry-After` keeps the fork's 60s ceiling: it answers request rate, which resolves in
+  // seconds. A reset-derived delay names a genuinely drained window, so it gets the same
+  // ten-minute ceiling the combo layer gives an exhausted window -- long enough not to re-probe
+  // a spent account every minute, short enough that a stale reset cannot park it for hours.
+  const cooldownMs = parsedRetry !== undefined
+    ? Math.min(parsedRetry, DEFAULT_COOLDOWN_MS)
+    : resetDerived !== undefined
+      ? Math.min(resetDerived, QUOTA_CAP_COOLDOWN_MS)
+      : DEFAULT_COOLDOWN_MS;
   upstreamHealth.set(failedAccountId, {
     cooldownUntil: now + cooldownMs,
     cooldownSource: parsedRetry !== undefined
