@@ -229,31 +229,49 @@ met and left a hole. Expect more of these than of either plain regression.
    instead of a flat 502 (`api_error` still maps to 502, so unclassified errors are unchanged).
    Not a deviation and not a dropped fork behaviour: neither side has this bug alone.
 
-## Inherited upstream failures (baseline, 2026-09-19)
+3. **`text = text` in `core-combo-failure.ts` blinded every combo failure decision.**
+   Porting the canonical-replay branch into `consumeComboFailure` split the body read in two, and
+   the non-replay arm assigned `text = text` instead of `text = body.text`. Every combo failure
+   therefore classified against an empty body: `classificationText` fell back to
+   `Provider error <status>`, `upstreamCode` stayed undefined, and `codexQuotaFailureMessage`
+   never matched. On the burn path that is the expensive half — body-confirmed quota evidence is
+   how a depleted window earns the ten-minute cooldown, so without it a combo child kept
+   re-offering an exhausted account, and a hopping 413 stopped on its first target instead of
+   advancing. One character; it closed 12 failures in `server-combo-failover-e2e` and 10 in
+   `tests/responses`, and it had been mistaken for an inherited upstream baseline for a day.
 
-Gate 3 cannot mean "everything green": upstream 2.59.0 does not pass its own suite on this
-platform. Verified by copying `upstream/main`'s unmodified test files into /tmp, repointing only
-their import paths, and running them against this tree — both reproduce, and the combo list is
-byte-identical to the pre-port baseline.
+## Inherited upstream failures (baseline, corrected 2026-09-20)
 
-- `tests/server/server-combo-failover-e2e.test.ts`: 162 pass / **12 fail** upstream.
-  Failing: model-scoped image 400 after 429; optional `reasoning.effort` 400 -> 200 (both stream
-  modes); optional `user` 400 -> 200 (both stream modes); target that cannot hold input plus
-  requested output; body-confirmed quota inside a 5xx cooling for its reset window; passthrough
-  failed usage captured once; context overflow advancing while exhausted targets return sanitized
-  status; model-lifecycle 410; monthly quota then Orca free-prompt cap; provider-specific
-  prompt-too-long 400.
-- `tests/web-search/web-search-timeout-contract.test.ts`: 6 pass / **1 fail** upstream
-  (`a never-settling 429 body cancel cannot block rotation under the cumulative header deadline`).
+**The 2026-09-19 numbers in this section were wrong and gate 3 must not use them.** They were
+produced by copying upstream's unmodified *test files* into /tmp and running them against **this
+tree's source**. That measures our source, not upstream's, so every port defect those files touch
+was recorded as inherited. The honest method is the stock worktree at `134c92a01`
+(`/tmp/upstream259`, node_modules symlinked), running each suite in both trees and diffing the
+sorted failure lists.
 
-- `tests/images/*` (SSRF / artifact-download lane): 65 pass / **50 fail** — `callXaiImages` (20),
-  `downloadImageToArtifact` scheme enforcement (12), `pinnedHttpsGet` (6), `pruneOldArtifacts` (5)
-  and 7 others. Both the test files and the modules they exercise (`xai-client.ts`,
-  `artifacts.ts`, `pinned-https-get.ts`) are byte-identical to upstream; the fork touched only
-  `images/loop.ts` in that lane, and these tests do not import it.
+Re-measured that way:
 
-- `tests/responses`: 2664 pass / **16 fail**, confirmed pre-existing by neutralising the port's
-  two runtime-live deltas in that lane and re-running to an identical result.
+- `tests/server/server-combo-failover-e2e.test.ts`: upstream 174/0, ours **176 pass / 0 fail**.
+  The twelve "inherited" failures previously listed here were one port defect —
+  `text = text` in `core-combo-failure.ts` (below). None were upstream's.
+- `tests/responses`: upstream 2670 pass / **1 fail**, ours 2679 / **1 fail** — the same single
+  failure in both (`Windows spill queue advances past never-settling principal and icacls
+  runners`). The previously recorded "16 inherited" were ours: ten were the same `text = text`
+  defect, the rest were fixed alongside it.
+- `tests/codex-integration`: upstream 5612 tests / **29 fail**, ours 5614 / **36 fail**. The 29
+  are identical in both trees and genuinely inherited. The 7 extra are ours and all sit in one
+  describe — see deviation 4: our clamp of a server `Retry-After` to the ten-minute ceiling is
+  what they measure, against an upstream test file that is byte-identical in both trees.
+- `tests/web-search`: upstream 288/0, ours **290 / 2**. The 2 are fork-only tests (absent from
+  the stock tree) that contradict upstream behaviour we took on purpose: one pins `ctx.onRetry`,
+  removed in favour of `onPhysicalSend` (deviation 2) — its identical twin in `tests/images` was
+  dropped for that reason — and one expects a single `onIterationUsage` call where upstream's
+  forced-answer pass now retries once and reports both iterations. The previously recorded
+  "1 inherited failure" in this lane was ours: the pacing wiring cleared and re-armed the
+  cumulative header deadline on the first dispatch even when no pacing hook was wired, which
+  renewed a budget that had measured no wait. Fixed in `src/web-search/loop.ts`.
+- `tests/images/*`: recorded on 2026-09-19 by the old method and NOT yet re-measured against the
+  stock tree. Treat as unverified until it is.
 
 ## Gate 2 result: 31 of 32 fork exports present, 1 deliberately superseded
 
@@ -387,6 +405,39 @@ distance to the nearest `combo/waterfall` turn that resolved to `anthropic/claud
 200 -- a cooled or quota-filtered target cannot produce a 200, so a nearby success proves the
 target was pickable: 73 within 30s, 2 within 60s, **75/75**. Re-verify against the ring once the
 fix lands.
+
+### EITHER provider's 502 triggers the fault -- single-homing is the root cause
+
+On the Mini the 502s came from openai; on the laptop two isolated events are each preceded by
+7 seconds by an ANTHROPIC 502 that carried attempts:
+
+    23:11:19  502  anthropic-p126351  ->  23:11:26  503 zero-attempt
+    01:11:19  502  anthropic-p126351  ->  01:11:25  503 zero-attempt
+
+An anthropic 502 cools the anthropic target for 60s, and a non-stream waterfall request arriving
+inside that window finds anthropic cooled AND openai unavailable, so both targets are gone. Same
+failure with the roles reversed. Neither provider's flakiness is the cause -- the cause is that
+these requests have only one usable target to begin with.
+
+### "zero-attempt 503" names TWO different quantities -- do not confuse them
+
+This ambiguity has now cost two separate investigations, so it is recorded in words:
+
+- **total zero-attempt 5xx** -- every zero-attempt 5xx row. On the laptop's current ring: 20.
+- **residual zero-attempt** -- the same set EXCLUDING the known waterfall signature. On that same
+  ring: 0.
+
+**Only the RESIDUAL is wired to auto-rollback.** The total is tracked and alerts separately as
+`known_fault`. A raw zero-attempt count compared against the trip threshold will look alarming
+and mean nothing. The guard's own design note originally claimed "the trip signal has a true-zero
+baseline", which is true of the residual and false of the total.
+
+The weakest joint in the design, and its mitigation: the signature was matched on
+`upstreamError` STARTING WITH "No available targets" -- a string-match on an upstream message. If
+that wording ever changes, or the same fault appears under a different combo id, those events
+stop matching and land in the RESIDUAL, where they would trip a rollback on a pre-existing fault.
+Matching the structural fields instead (`errorCode == "server_is_overloaded"` with zero attempts)
+removes that dependency.
 
 ### Account-layer cooldown ceilings (checked, and one cliff recorded)
 
