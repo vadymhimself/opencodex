@@ -315,5 +315,39 @@ per-account attribution for pool turns is wrong in exactly the way the quota wor
   Fix is one line aligning `aggregateAttemptUsage` with the rule `summary.ts` already uses --
   deliberately deferred so this port does not carry opportunistic changes.
 
+## The inherited baseline was re-measured properly (the earlier one was wrong)
+
+The original "63 failures" was derived by running upstream's own test FILES against THIS tree,
+which is not the same thing and gave badly wrong numbers -- `tests/responses` was recorded as 16
+inherited when upstream's own tree has **1**. The real baseline is measured in a worktree at
+`134c92a01` (stock upstream 2.59.0, this branch's base):
+
+| dir | upstream 2.59 | notes |
+|---|---|---|
+| responses | 2670 / **1** | the 1 is `Windows spill queue advances past never-settling principal` |
+| providers | 4466 / **31** | every one of these also fails here |
+| codex-integration | 5546 / **29** | |
+| ci-workflows | 839 / 0 | |
+| claude-integration | 679 / 0 | |
+| cli | 1938 / 1 | |
+
+Re-measure the same way before trusting any baseline claim in this document.
+
+### Outstanding, classified, NOT defects
+
+- **kiro (3 failures)**: `kiro-retry.test.ts` (2) and `kiro-stream.test.ts` (1) carry fork
+  assertions upstream does not have -- kiro retries flowing through the request executor with a
+  next-dispatch recovery label. Upstream's own versions pass upstream. This is fork behaviour not
+  yet ported, not a regression.
+- **`a combo stops on a zero-output failure from the stored-account replay stream`**: passes in
+  isolation (28/28 repeated) both before and after the pool-401 fix; fails only in some
+  full-suite orderings. Flaky-under-ordering, not a defect.
+- **`tests/server` whole-directory runs**: 243 failures when the directory shares one `bun test`
+  process, while the same suites pass individually (`server-combo-failover-e2e` 164/12,
+  `server-key-failover-e2e` 42/42, `server-auth` 112/112). `mock.module` leakage across files,
+  pre-existing. Run per file.
+- **`tests/routing` and `tests/adapters` hang** when run as a whole directory. `--timeout` is
+  per-test and does not catch a hang between tests. Run per file with a wall-clock kill.
+
 **Gate 3 therefore reads: no failure outside this inherited set.** A new failure is port damage;
 one of these is upstream's own. Re-measure the baseline if upstream is bumped again.
