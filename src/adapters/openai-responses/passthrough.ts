@@ -299,10 +299,15 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
         outBody = normalizeResponsesToolResultAdjacency(outBody);
       }
       if (forward) {
-        outBody = stripUnsupportedForwardParams(outBody);
         // Only the canonical ChatGPT backend rejects the retired field; a self-hosted or
         // third-party forward gateway may still accept it, so this must not be widened.
         if (isCanonicalOpenAiForwardProvider(provider)) {
+          // `max_output_tokens` belongs under this guard for the same reason, and it is a COST
+          // control: a caller sets it to bound what a turn may spend. The canonical backend
+          // rejects it outright, so stripping there is required to make the request work at all
+          // -- but stripping it on a gateway that honours it silently removes the caller's cap
+          // and lets the turn generate far more than it asked to pay for.
+          outBody = stripUnsupportedForwardParams(outBody);
           outBody = stripCanonicalForwardSamplingParams(outBody);
           outBody = stripDeprecatedPromptCacheRetention(outBody, parsed.modelId);
           outBody = stripCanonicalForwardPromptCacheOptions(outBody);

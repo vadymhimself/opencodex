@@ -137,9 +137,19 @@ over the fork's and the behaviour is NOT identical.
    `terminalHttpStatus = 502`; 2.59 decides a bare error's status downstream via
    `bareErrorStatus`, and the fork branch shadowed it, making every bare error look like a
    transport failure. Upstream taken. Two fork tests that pinned the old policy are dropped.
-6. **`max_output_tokens` is stripped again on non-canonical forward gateways**
-   (`src/adapters/openai-responses.ts`): upstream's `stripCanonicalForwardSamplingParams`
-   supersedes the fork's canonical-only stripping. Affects forward-mode gateways only.
+6. **REVERSED under the standing rule that quota-burn fixes outrank upstream.** Upstream applies
+   `stripUnsupportedForwardParams` to EVERY forward provider; the fork stripped only on the
+   canonical ChatGPT backend. `max_output_tokens` is a COST control -- a caller sets it to bound
+   what a turn may spend. The canonical backend rejects the field outright (`{"detail":
+   "Unsupported parameter: ..."}`), so stripping there is required to make the request work at
+   all, but stripping it on a gateway that HONOURS it silently removes the caller's cap and lets
+   the turn generate far more than it asked to pay for. The call now sits inside the
+   `isCanonicalOpenAiForwardProvider` guard, next to the comment that already stated the
+   principle ("a self-hosted or third-party forward gateway may still accept it, so this must not
+   be widened") while the call sat outside it.
+   This was previously recorded as an accepted deviation with its failing test treated as a
+   baseline entry. Judged as a cost path rather than a compatibility one, it was a defect: fixing
+   it took the replay lane to 115 pass / 0 fail.
 
 ## Fork behaviour kept over upstream
 
@@ -281,8 +291,9 @@ form. Measured consequence while it is absent: the three OAuth rotation tests ro
 `expect(entry?.attempts).toHaveLength(2)`, receiving 1. Two accounts' sends fold into one row, so
 per-account attribution for pool turns is wrong in exactly the way the quota work cares about.
 
-- `claude-messages-endpoint`: `custom forward openai-responses route never receives the main
-  ChatGPT credential` is a **deviation #6 baseline entry, not a defect**. Probed rather than
+- ~~`claude-messages-endpoint`: `custom forward openai-responses route never receives the main
+  ChatGPT credential`~~ **-- NO LONGER A BASELINE ENTRY.** Reclassified as a real defect and fixed
+  under the quota-burn-priority rule; see deviation 6. The original (now superseded) reasoning: Probed rather than
   inferred: the captured upstream body arrives as `["model","input","store","stream","temperature",
   "top_p","stop","user","prompt_cache_key"]`, so upstream's canonical-only sampling gate works
   correctly on a non-canonical forward route. The single failing expectation is
