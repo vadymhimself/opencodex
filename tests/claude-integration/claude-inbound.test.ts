@@ -245,7 +245,11 @@ This is how Claude Code surfaces messages the user sends mid-turn — within the
     });
     expect(representable.requiresExactAnthropicReplay).toBe(false);
     expect(representable.body.tools).toEqual([
-      { type: "function", name: "Read", parameters: { type: "object" } },
+      // `strict: false` is upstream behaviour this fork test predates, and it is protective:
+      // Responses reads an OMITTED strict as permission to normalize the schema into strict
+      // mode, which turns an optional input_schema parameter into a required one and breaks
+      // the call. A broken tool call is a retry, and a retry is spend, so upstream wins here.
+      { type: "function", name: "Read", parameters: { type: "object" }, strict: false },
       { type: "web_search" },
     ]);
 
