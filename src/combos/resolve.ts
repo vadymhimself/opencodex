@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { OcxComboTarget, OcxConfig } from "../types";
 import { getCachedProviderRoutingQuota } from "../providers/quota-routing-cache";
-import type { ProviderQuota } from "../providers/quota-types";
+import type { ProviderQuota, ProviderQuotaWindow } from "../providers/quota-types";
 import { sleepWithAbort } from "../lib/upstream-retry";
 import {
   coolComboTarget,
@@ -79,13 +79,23 @@ function quotaWindowExhausted(percent: number | undefined, resetAt: number | und
 // customWindows is a generic carrier: most labels are provider-wide counters ("Prepaid credits",
 // "Free trial", "burst", "Spark") and must gate every model. Anthropic also rides it for per-model
 // family counters, where Fable at 100% says nothing about Opus. Only those skip a non-matching model.
-const MODEL_FAMILY_WINDOW_LABELS = new Set(["fable", "opus", "sonnet", "haiku"]);
-
-function customWindowAppliesToModel(label: string, model: string | undefined): boolean {
-  const family = label.trim().toLowerCase();
+//
+// This keys on `window.scope`, which the PRODUCER sets only when it proved model scope
+// structurally, NEVER on the label text. Reading the label was a doomed-send hole: producers such
+// as Antigravity pass an upstream display name straight through, so a provider-wide group named
+// "Opus" would be skipped for every non-Opus model and a spent window would go unenforced. An
+// absent scope gates everything, which is upstream's behaviour and fails closed.
+function customWindowAppliesToModel(window: ProviderQuotaWindow, model: string | undefined): boolean {
+  if (window.scope !== "model") return true;
+  if (model === undefined) return true;
+  const family = window.label.trim().toLowerCase();
+  // A family this gateway cannot match against a model id (a name Anthropic adds later) still
+  // gates everything. Failing closed there costs a diverted target; failing open would leave a
+  // spent window unenforced.
   if (!MODEL_FAMILY_WINDOW_LABELS.has(family)) return true;
-  return model === undefined || model.toLowerCase().includes(family);
+  return model.toLowerCase().includes(family);
 }
+const MODEL_FAMILY_WINDOW_LABELS = new Set(["fable", "opus", "sonnet", "haiku"]);
 
 export function cachedProviderQuotaIsExhausted(
   quota: ProviderQuota | null,
@@ -96,7 +106,7 @@ export function cachedProviderQuotaIsExhausted(
   if (quotaWindowExhausted(quota.fiveHourPercent, quota.fiveHourResetAt, now)) return true;
   if (quotaWindowExhausted(quota.weeklyPercent, quota.weeklyResetAt, now)) return true;
   if (quotaWindowExhausted(quota.monthlyPercent, quota.monthlyResetAt, now)) return true;
-  if (quota.customWindows?.some(window => customWindowAppliesToModel(window.label, model)
+  if (quota.customWindows?.some(window => customWindowAppliesToModel(window, model)
     && quotaWindowExhausted(window.percent, window.resetAt, now))) return true;
   if (quota.creditsUsd?.unlimited !== true
       && typeof quota.creditsUsd?.percent === "number"

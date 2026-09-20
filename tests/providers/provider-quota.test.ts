@@ -364,10 +364,16 @@ describe("fetchProviderQuotaReports", () => {
     // so only the model-specific windows remain as custom entries.
     expect(byProvider.anthropic?.quota.fiveHourPercent).toBe(41.5);
     expect(byProvider.anthropic?.quota.fiveHourResetAt).toBe(Date.parse("2026-07-05T12:00:00Z"));
+    // `scope: "model"` is set by the producer because Anthropic proved model scope structurally
+    // (a `seven_day_<family>` body key, or `kind: "weekly_scoped"` with a `scope.model` name).
+    // Routing keys on this rather than on the label text.
     expect(byProvider.anthropic?.quota.customWindows).toEqual([
-      { label: "Opus", percent: 88 },
-      { label: "Sonnet", percent: 19 },
+      { label: "Opus", scope: "model", percent: 88 },
+      { label: "Sonnet", scope: "model", percent: 19 },
     ]);
+    // Antigravity passes an upstream display name straight through and proves nothing about
+    // scope, so its windows carry NO scope flag and gate every model. That is the case the
+    // label-text check got wrong: a group named "Opus" here must not be read as per-model.
     expect(byProvider["google-antigravity"]?.quota.customWindows).toEqual([
       { label: "Gem", percent: 36, resetAt: Date.parse("2026-07-05T14:00:00Z") },
       { label: "Cla", percent: 79, resetAt: Date.parse("2026-07-05T15:00:00Z") },
