@@ -38,7 +38,7 @@ import { isPlainObject } from "./internal";
 import { normalizeToolSchemas, promoteClientLoadedTools, stripUnsupportedHostedTools } from "./tool-schema";
 import { annotateEmptyResponsesToolOutputs, backfillWebSearchQueries, normalizeResponsesToolResultAdjacency, repairOrphanedInputItems, repairOversizedReplayCallIds, repairUnidentifiedToolOutputItems, restoreBridgedWebSearchCalls } from "./tool-output-recovery";
 import { bridgeSearchReplayScope } from "../../responses/bridge-search-replay-cache";
-import { applyTierDecisionToResponsesBody, normalizeCanonicalForwardContinuationEnvelope, normalizeCanonicalForwardPromptEnvelope, stripCanonicalForwardSamplingParams, stripPreviousResponseId, stripStatefulResponsesParams, stripUnsupportedForwardParams } from "./canonical-forward";
+import { applyTierDecisionToResponsesBody, normalizeCanonicalForwardContinuationEnvelope, normalizeCanonicalForwardPromptEnvelope, stripCanonicalForwardSamplingParams, stripForwardMetadata, stripPreviousResponseId, stripStatefulResponsesParams, stripUnsupportedForwardParams } from "./canonical-forward";
 import { normalizeImageGenClientTools, preferConfiguredHostedTools } from "./image-gen";
 import { stripMuseSparkUnsupportedWebSearchFields, stripOpenAiOnlyWebSearchFields } from "./web-search";
 
@@ -299,14 +299,16 @@ export function createResponsesPassthroughAdapter(provider: OcxProviderConfig): 
         outBody = normalizeResponsesToolResultAdjacency(outBody);
       }
       if (forward) {
+        // `metadata` is outside every forward allowlist, so it goes on any forward route.
+        outBody = stripForwardMetadata(outBody);
         // Only the canonical ChatGPT backend rejects the retired field; a self-hosted or
         // third-party forward gateway may still accept it, so this must not be widened.
         if (isCanonicalOpenAiForwardProvider(provider)) {
-          // `max_output_tokens` belongs under this guard for the same reason, and it is a COST
-          // control: a caller sets it to bound what a turn may spend. The canonical backend
-          // rejects it outright, so stripping there is required to make the request work at all
-          // -- but stripping it on a gateway that honours it silently removes the caller's cap
-          // and lets the turn generate far more than it asked to pay for.
+          // `max_output_tokens` belongs under this guard, and it is a COST control: a caller
+          // sets it to bound what a turn may spend. The canonical backend rejects it outright,
+          // so stripping there is required to make the request work at all -- but stripping it
+          // on a gateway that honours it silently removes the caller's cap and lets the turn
+          // generate far more than it asked to pay for.
           outBody = stripUnsupportedForwardParams(outBody);
           outBody = stripCanonicalForwardSamplingParams(outBody);
           outBody = stripDeprecatedPromptCacheRetention(outBody, parsed.modelId);

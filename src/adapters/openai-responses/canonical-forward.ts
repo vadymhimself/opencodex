@@ -80,6 +80,22 @@ export function stripUnsupportedForwardParams(body: unknown): unknown {
   return rest;
 }
 
+/**
+ * Strip only `metadata`, for forward gateways that are NOT the canonical backend.
+ *
+ * `metadata` is absent from every forward allowlist we target, so dropping it is safe
+ * everywhere. `max_output_tokens` is NOT: it is a caller's spend cap, honoured by
+ * self-hosted and third-party gateways, and removing it there lets a turn generate far
+ * more than it asked to pay for. Only the canonical ChatGPT backend rejects it outright,
+ * which is why the full strip stays behind `isCanonicalOpenAiForwardProvider`.
+ */
+export function stripForwardMetadata(body: unknown): unknown {
+  if (!isPlainObject(body)) return body;
+  if (!Object.prototype.hasOwnProperty.call(body, "metadata")) return body;
+  const { metadata: _meta, ...rest } = body;
+  return rest;
+}
+
 /** Sampling controls the canonical ChatGPT backend rejects; other forward gateways accept them. */
 const CANONICAL_FORWARD_UNSUPPORTED_SAMPLING = ["temperature", "top_p", "stop", "user"] as const;
 
