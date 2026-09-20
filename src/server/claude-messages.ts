@@ -853,16 +853,17 @@ async function handleClaudeMessagesWithBudget(
         };
       }
     }
+    // EXPERIMENT: snapshot before the effort rewrite, per the comment above.
+    if (isRec(anthropicBody)) {
+      originalAnthropicBody = structuredClone(anthropicBody);
+      comboRandomSeed = anthropicRequestCorrelationKey(anthropicBody);
+    }
     if (isRec(anthropicBody) && effortOverride) {
       anthropicBody.output_config = {
         ...(isRec(anthropicBody.output_config) ? anthropicBody.output_config : {}),
         effort: effortOverride,
       };
       delete anthropicBody.thinking;
-    }
-    if (isRec(anthropicBody)) {
-      originalAnthropicBody = structuredClone(anthropicBody);
-      comboRandomSeed = anthropicRequestCorrelationKey(anthropicBody);
     }
     const translation = anthropicToResponsesTranslation(anthropicBody, config.claudeCode, translatorBudget);
     internalBody = translation.body;
