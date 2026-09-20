@@ -439,6 +439,26 @@ stop matching and land in the RESIDUAL, where they would trip a rollback on a pr
 Matching the structural fields instead (`errorCode == "server_is_overloaded"` with zero attempts)
 removes that dependency.
 
+### Tightening a system silently invalidates fixtures that relied on the looser behaviour
+
+Twice today, coverage looked present and was not, and neither failure announced itself:
+
+- `tests/routing/router-combo-failover-classification.test.ts` did not PARSE, so the tests
+  guarding the ten-minute cooldown ceiling never ran for the entire port. The ceiling regression
+  sat undetected behind a file reporting `0 pass / 1 fail`.
+- Hardening the burn guard's signature predicate flipped three of its own fixtures from TRIP to
+  ALERT -- including the sub-floor burn repro -- because those fixtures were built with the
+  errorCode the tighter predicate now masks. The regression silently lost coverage of the two
+  behaviours the guard exists to protect, AT THE MOMENT the guard became more correct.
+
+The general form: a fixture encodes an assumption about the system, and tightening the system
+invalidates fixtures that relied on the looser behaviour WITHOUT failing. TRIP becoming ALERT is a
+PASS-shaped outcome in any suite that only checks for crashes.
+
+The defence is not vigilance, it is asserting the expected VERDICT per case so a silent downgrade
+fails loudly. Any regression harness here should assert its expected outcome, not print a table
+for a human to read.
+
 ### Cost signals count ROWS; availability signals count OUTAGES
 
 Retry ladders inflate row counts 2-4x over genuine outages (laptop 20 rows -> 5 outages, Mini 75
