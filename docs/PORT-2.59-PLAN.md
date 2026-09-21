@@ -129,9 +129,18 @@ over the fork's and the behaviour is NOT identical.
    Settled rule, matching the live 2.43 build and passing BOTH sides' tests:
    - the ceiling is reason-dependent: `QUOTA_CAP_COOLDOWN_MS` (10 min) for an exhausted window or
      a reset-derived delay, `MAX_COOLDOWN_MS` (60s) for a transient 429;
-   - a server `Retry-After` is authoritative UP TO ten minutes and clamped beyond it. Upstream's
-     own test wants a 120s `Retry-After` honoured; the fork's invariant wants a 2h one clamped.
-     Both are right about different magnitudes.
+   - a server `Retry-After` is clamped by the SAME reason-dependent ceiling as everything else.
+     An earlier version of this gave ANY server delay the ten-minute ceiling, which blacked a
+     target out for ten minutes on a transient 429 carrying `Retry-After: 600` -- ten times the
+     deployed build, from a failure class that is explicitly not exhaustion. Deployed clamps
+     every `Retry-After` at 60s (`origin/main:src/combos/failover.ts`, both parse branches).
+     **The earlier note justified that behaviour as "matching the live 2.43 build". It did not.**
+
+     Consequence, recorded as a deviation: upstream's
+     `429 Retry-After 120 keeps A cooling at 60 seconds and restores it at 120` now fails, because
+     it wants a 120s transient delay honoured. The fork's quota behaviour outranks upstream's, and
+     on a two-target combo 60s of blackout already produces zero-attempt 529s. So
+     `server-combo-failover-e2e` is 175/1 rather than 176/0, and that one failure is deliberate.
 5. **Bare `error` events are no longer classified in `captureTerminalHttpStatus`**
    (`src/server/request-log.ts`). The fork classified them from `json.error`, pre-setting
    `terminalHttpStatus = 502`; 2.59 decides a bare error's status downstream via

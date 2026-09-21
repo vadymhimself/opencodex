@@ -263,15 +263,21 @@ export function coolComboTarget(
   const ceilingMs = exhausted || resetDerivedMs !== undefined || options?.cooldownMs !== undefined
     ? QUOTA_CAP_COOLDOWN_MS
     : MAX_COOLDOWN_MS;
-  // A server `Retry-After` is authoritative UP TO the ten-minute ceiling, and only up to it.
-  // Upstream honours it uncapped; the fork clamped it to the ceiling. Both are right about
-  // different magnitudes: honouring 120s avoids hammering a provider that just told us to wait,
-  // while honouring hours pins that target for hours, and a combo whose targets are all pinned
-  // answers "No available targets". Quota commonly frees before the advertised reset, so
-  // re-probing at the ceiling costs one request and un-pins the combo.
-  const effectiveCeilingMs = serverDelayMs !== undefined ? QUOTA_CAP_COOLDOWN_MS : ceilingMs;
+  // A server `Retry-After` is clamped by the SAME reason-dependent ceiling as everything else:
+  // it is evidence of how long to wait, not a licence to exceed the ceiling for its class.
+  //
+  // An earlier version of this gave any server delay the ten-minute ceiling, which made a
+  // TRANSIENT 429 carrying `Retry-After: 600` black a target out for ten minutes -- ten times
+  // what the deployed build does, from a failure class that is explicitly not exhaustion, and
+  // contradicting the rule stated four lines above. On a two-target combo, 60s of blackout
+  // already produces zero-attempt 529s; ten minutes of it is the same outage an order of
+  // magnitude wider. Deployed clamps every `Retry-After` at 60s
+  // (`origin/main:src/combos/failover.ts` `MAX_COOLDOWN_MS`, both parse branches).
+  //
+  // Upstream's own test wants a 120s `Retry-After` honoured on a transient 429. That is a
+  // deliberate deviation recorded in the plan: the fork's quota behaviour outranks upstream's.
   targetCooldowns.set(cooldownMapKey(comboId, target), {
-    cooldownUntil: now + Math.min(Math.max(cooldownMs, 1), effectiveCeilingMs),
+    cooldownUntil: now + Math.min(Math.max(cooldownMs, 1), ceilingMs),
   });
   sweepExpiredOnWrite(now);
 }
