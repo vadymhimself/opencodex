@@ -284,7 +284,17 @@ Re-measured that way:
 
 ## Gate 2 result: 31 of 32 fork exports present, 1 deliberately superseded
 
-Derived mechanically from `f47552136`'s own added exports rather than from memory. The single
+Derived mechanically from added exports rather than from memory -- but ORIGINALLY FROM THE WRONG
+COMMIT. `f47552136` is not the lane that ran in production: `origin/main` is that commit plus five
+more, three touching `src` (`1150a5da2`, `2687eb831`, `9ff58e185`). Nothing those added was
+covered by the first audit, and the dropped Anthropic 60s cooldown cap was one of four things
+`1150a5da2` changed -- the only one that did not land.
+
+RE-DERIVED from `git diff 06ec55363 origin/main -- src`: 32 added exports, ALL present. The two
+sibling cooldown caps from the same commit (`generic-account-failover.ts:28`,
+`key-failover.ts:25`) both survived; the Anthropic one was the sole casualty and is fixed at
+`ddb2bc9ce`/`3344f3d41`. Note the cap was a plain constant, so an EXPORT scan could never have
+found it -- use the file-level diff, not just exports. The single
 absent symbol is `transitionRequestAttempt`, and it is superseded rather than lost:
 
 - Its chat-native call site fired only on `recovery === "key-429"`. The split now lives in
