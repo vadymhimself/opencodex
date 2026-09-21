@@ -1,6 +1,6 @@
 import { registerComboForcedEffortCases } from "../helpers/combo-forced-effort-cases";
 import { comboProviderFactory } from "../helpers/combo-provider";
-import { tryAdmitTurn } from "../../src/server/lifecycle";
+import { abortAndReleaseAllTurns, getActiveTurnCount, tryAdmitTurn } from "../../src/server/lifecycle";
 import { registerComboContextOverflowCases } from "../helpers/combo-context-overflow-cases";
 import { registerComboContextHeadroomCases } from "../helpers/combo-context-headroom-cases";
 import { sessionLaneIdFromRequest } from "../../src/server/request-log-conversation";
@@ -2217,6 +2217,40 @@ describe("server combo failover 030 activation matrix", () => {
       expect(response.status).toBe(200);
       expect(turnAdmissionLease.isTransferred()).toBe(true);
       await response.text();
+    } finally {
+      turnAdmissionLease.release();
+    }
+  });
+
+  test("a drain reaches the upstream of an accepted combo stream", async () => {
+    // The re-attached lease binds a NEW controller wrapping the child's body, not the child's
+    // own upstream controller. This pins that the chain still reaches upstream: a shutdown
+    // drain must cancel the live SSE, not just detach the client end of it.
+    let upstreamCancelled = false;
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const upstream = serve(() => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(
+          `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: "hi" }, finish_reason: null }] })}\n\n`,
+        ));
+      },
+      cancel() { upstreamCancelled = true; release(); },
+    }), { headers: { "content-type": "text/event-stream" } }));
+    const config = comboConfig({ a: provider("openai-chat", baseUrl(upstream), "key-a") });
+    const turnAdmissionLease = tryAdmitTurn();
+    if (!turnAdmissionLease) throw new Error("test turn admission unavailable");
+    try {
+      const response = await post(config, { stream: true }, { turnAdmissionLease });
+      expect(response.status).toBe(200);
+      const reader = response.body!.getReader();
+      await reader.read();
+      // The drain can only reach a stream it has a controller for.
+      expect(getActiveTurnCount()).toBeGreaterThan(0);
+      abortAndReleaseAllTurns(new Error("test drain"));
+      await Promise.race([held, Bun.sleep(1_000)]);
+      expect(upstreamCancelled).toBe(true);
+      await reader.cancel("test finished").catch(() => {});
     } finally {
       turnAdmissionLease.release();
     }
