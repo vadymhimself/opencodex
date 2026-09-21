@@ -1,5 +1,6 @@
 import { registerComboForcedEffortCases } from "../helpers/combo-forced-effort-cases";
 import { comboProviderFactory } from "../helpers/combo-provider";
+import { tryAdmitTurn } from "../../src/server/lifecycle";
 import { registerComboContextOverflowCases } from "../helpers/combo-context-overflow-cases";
 import { registerComboContextHeadroomCases } from "../helpers/combo-context-headroom-cases";
 import { sessionLaneIdFromRequest } from "../../src/server/request-log-conversation";
@@ -2166,6 +2167,60 @@ describe("server combo failover 030 activation matrix", () => {
   });
 
   registerComboContextHeadroomCases({ serve, baseUrl, chatSuccess, provider, comboConfig, post });
+
+  test("a combo child never settles the parent turn's admission lease", async () => {
+    // The lease belongs to the PARENT turn. A child that binds it releases it when its own
+    // stream ends, and the next target then binds a settled lease and is aborted on arrival
+    // ("turn already settled") -- so failover silently dies on the second target.
+    let aHits = 0;
+    let bHits = 0;
+    const a = serve(() => {
+      aHits += 1;
+      // A 200 SSE with a zero-output retryable terminal: the preflight refuses it, so the
+      // combo advances while the child has already delivered (and tracked) a stream.
+      return new Response([
+        'data: {"type":"response.created","response":{"id":"resp_a","status":"in_progress"}}\n\n',
+        'data: {"type":"response.failed","response":{"id":"resp_a","status":"failed","error":{"type":"server_error","code":"upstream_server_error","message":"busy"}}}\n\n',
+      ].join(""), { headers: { "content-type": "text/event-stream" } });
+    });
+    const b = serve(() => {
+      bHits += 1;
+      return chatSuccess("second target served", "m2");
+    });
+    const config = comboConfig({
+      a: provider("openai-responses", baseUrl(a), "key-a"),
+      b: provider("openai-chat", baseUrl(b), "key-b"),
+    });
+    const turnAdmissionLease = tryAdmitTurn();
+    if (!turnAdmissionLease) throw new Error("test turn admission unavailable");
+    try {
+      const response = await post(config, {}, { turnAdmissionLease });
+      expect(response.status).toBe(200);
+      await response.text();
+      expect(aHits).toBe(1);
+      expect(bHits).toBe(1);
+    } finally {
+      turnAdmissionLease.release();
+    }
+  });
+
+  test("an accepted combo response binds the parent turn's lease before its first byte", async () => {
+    // The other half: children are suppressed, so the accepted response must re-attach the
+    // lease. Otherwise the slot is released before the stream starts -- maxActiveTurns
+    // under-counts live streams, and a drain has no controller to wait for or abort.
+    const upstream = serve(() => chatStream("streamed"));
+    const config = comboConfig({ a: provider("openai-chat", baseUrl(upstream), "key-a") });
+    const turnAdmissionLease = tryAdmitTurn();
+    if (!turnAdmissionLease) throw new Error("test turn admission unavailable");
+    try {
+      const response = await post(config, { stream: true }, { turnAdmissionLease });
+      expect(response.status).toBe(200);
+      expect(turnAdmissionLease.isTransferred()).toBe(true);
+      await response.text();
+    } finally {
+      turnAdmissionLease.release();
+    }
+  });
 
   test("429 Retry-After 120 keeps A cooling at 60 seconds and restores it at 120", async () => {
     const t0 = Date.parse("2026-07-18T00:00:00.000Z");

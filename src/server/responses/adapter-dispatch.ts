@@ -399,8 +399,9 @@ export async function prepareAdapterExchange(
         abortSignal: options.abortSignal,
         comboAttempt: options.comboAttempt,
         expectsSse: transportState.anthropicMessagesSource?.body.stream === true,
-        // A combo child's lease belongs to the parent turn, which settles it itself.
-        ...(options.comboAttempt ? {} : { turnAdmissionLease: options.turnAdmissionLease }),
+        // A combo child never receives the parent's lease (suppressed where the child's options
+        // are built, in core-combo.ts), so this forwards whatever this turn legitimately holds.
+        turnAdmissionLease: options.turnAdmissionLease,
       },
     );
   };
