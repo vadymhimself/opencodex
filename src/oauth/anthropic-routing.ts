@@ -44,8 +44,6 @@ export type AnthropicRateLimitHeaders = Pick<Headers, "get">;
 const PROVIDER = "anthropic";
 /** Backoff only when upstream supplies no usable deadline. */
 const DEFAULT_COOLDOWN_MS = 60_000;
-/** Ceiling for a reset-derived account cooldown; matches the combo layer's exhausted-window cap. */
-const QUOTA_CAP_COOLDOWN_MS = 10 * 60_000;
 const AFFINITY_IDLE_TTL_MS = 24 * 60 * 60_000;
 const MAX_AFFINITY_ENTRIES = 2_000;
 const MAX_AFFINITY_COMPONENT_BYTES = 512;
@@ -723,34 +721,29 @@ export function rotateAnthropicAccountOn429(
   // without that fallback such a refusal cools for the 60s default and the exhausted
   // account is back in the rotation a minute later.
   const parsedRetry = parseRetryAfterMs(retryAfterHeader, now);
-  // Computed UNCONDITIONALLY, not only when `Retry-After` is absent: a drained-window 429 can
-  // carry both, and a rejected-window header is the stronger evidence of the two. Deriving it
-  // only as a fallback discarded that evidence whenever upstream also sent `Retry-After`, which
-  // is the case the ceiling exists for.
-  const resetDerived = parseRateLimitResetMs(rateLimitHeaders, now);
-  // An UNBOUNDED account cooldown is how a pool loses an account for hours on one upstream
-  // header, and an account removed from the pool is what single-homes a combo onto its remaining
-  // target -- the "No available targets" outage, reached from the account layer. So both are
-  // clamped, but the ceiling depends on WHAT upstream refused:
-  //   - a rejected window is a quota refusal, so it takes the ten-minute ceiling the combo layer
-  //     gives an exhausted window, whichever header names the delay;
-  //   - everything else is request rate, which resolves in seconds, and keeps the fork's 60s.
-  // Clamping a quota refusal to 60s puts a spent account back in rotation a minute later, which
-  // is the defect this function's own comment above names -- each bounce is a doomed send, and
-  // an Anthropic cache is per-key, so it also hands the next session a cold prefix.
-  const quotaRefusal = resetDerived !== undefined;
-  const cooldownMs = quotaRefusal
-    ? Math.min(Math.max(parsedRetry ?? 0, resetDerived), QUOTA_CAP_COOLDOWN_MS)
-    : parsedRetry !== undefined
-      ? Math.min(parsedRetry, DEFAULT_COOLDOWN_MS)
-      : DEFAULT_COOLDOWN_MS;
+  // Both are STATED deadlines and both are honoured in full; only a GUESS is capped.
+  //
+  // `Retry-After` is upstream answering this refusal, and a rejected
+  // `anthropic-ratelimit-unified-<window>-status` plus its `-reset` names the instant that
+  // window reopens. Those windows are account-wide, so until that instant every send on this
+  // account is refused -- capping the cooldown creates no capacity, it only buys doomed sends. A
+  // 7-day window clamped to ten minutes is 432 guaranteed refusals to guard against nothing, and
+  // an Anthropic cache is per-key, so each bounce also hands the next session a cold prefix.
+  //
+  // `DEFAULT_COOLDOWN_MS` stays what it always was: the backoff for when upstream states
+  // nothing. That is the only value here this gateway invents, and the only one worth a ceiling.
+  //
+  // An earlier revision of mine clamped both and derived the reset only as a fallback. It broke
+  // seven upstream tests that say exactly this, and they were right.
+  const resetDerived = parsedRetry === undefined ? parseRateLimitResetMs(rateLimitHeaders, now) : undefined;
+  const cooldownMs = parsedRetry ?? resetDerived ?? DEFAULT_COOLDOWN_MS;
   upstreamHealth.set(failedAccountId, {
     cooldownUntil: now + cooldownMs,
     // Names what actually DECIDED the length, not merely which header arrived. A rejected
     // window means the dashboard should read this as quota rather than request-rate throttling,
     // even when `Retry-After` was also present -- a label describing a condition the code no
     // longer tests is how the next reader gets misled.
-    cooldownSource: quotaRefusal
+    cooldownSource: resetDerived !== undefined
       ? "reset-derived"
       : parsedRetry !== undefined ? "retry-after" : "default",
   });
