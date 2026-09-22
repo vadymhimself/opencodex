@@ -6,6 +6,8 @@
  * internal Request, so routing/OAuth/account-pool/failover/sidecars are inherited
  * unchanged. The Responses output (SSE or JSON) is converted back to Anthropic shape.
  */
+import { explainPoolQuotaRefusal } from "../providers/quota-explain";
+import { getAccountSet } from "../oauth/store";
 import {
   anthropicMessagesUrl,
   canReplayAnthropicSource,
@@ -598,10 +600,37 @@ async function anthropicNativePassthrough(
   }
   finalize(upstream.status, { closeReason: "non_stream" });
   const retryAfter = upstream.headers.get("retry-after");
-  return new Response(text, {
+  // A spent model-family window comes back as the same generic `rate_limit_error` as ordinary
+  // throttling, whose "try again later" is wrong advice for a window that will not roll for
+  // days. This gateway already knows which window is spent, so it says so rather than passing
+  // on advice it can see is useless. Silent when the cache cannot explain the refusal.
+  const quotaNote = upstream.status === 429
+    ? explainPoolQuotaRefusal("anthropic", (getAccountSet("anthropic")?.accounts ?? []).map(a => a.id), model)
+    : undefined;
+  return new Response(quotaNote ? annotateAnthropicErrorText(text, quotaNote) : text, {
     status: upstream.status,
     headers: { "Content-Type": contentType, ...(retryAfter ? { "Retry-After": retryAfter } : {}) },
   });
+}
+
+/**
+ * Append a clause to an upstream Anthropic error body, preserving everything else it said.
+ *
+ * The upstream message is the caller's primary evidence and is never replaced -- a wrong
+ * rewrite would be worse than a vague original. Anything that does not parse as an Anthropic
+ * error envelope is returned untouched.
+ */
+function annotateAnthropicErrorText(text: string, note: string): string {
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (!isRec(parsed) || !isRec(parsed.error) || typeof parsed.error.message !== "string") return text;
+    return JSON.stringify({
+      ...parsed,
+      error: { ...parsed.error, message: `${parsed.error.message} [${note}]` },
+    });
+  } catch {
+    return text;
+  }
 }
 
 const DEFAULT_BODY_STALL_SEC = 90;
@@ -1199,6 +1228,16 @@ async function handleClaudeMessagesWithBudget(
         if (text) message = `upstream error (${response.status}): ${text.slice(0, 400)}`;
       }
     } catch { /* keep fallback message */ }
+    // Upstream answers a spent model-family window with the same generic `rate_limit_error` it
+    // uses for ordinary throttling, whose "try again later" is wrong advice for a window that
+    // will not roll for days. This gateway already caches the per-window percentages, so it
+    // names the spent window rather than repeating advice it can see is useless. Appended, never
+    // substituted: the upstream text is the caller's primary evidence.
+    if (response.status === 429) {
+      const accountIds = (getAccountSet("anthropic")?.accounts ?? []).map(account => account.id);
+      const quotaNote = explainPoolQuotaRefusal("anthropic", accountIds, logCtx.requestedModel);
+      if (quotaNote) message = `${message} [${quotaNote}]`;
+    }
     const upstreamRetryAfter = response.headers.get("retry-after");
     const retryAfter = resolveClientRetryAfter({
       status: response.status,
