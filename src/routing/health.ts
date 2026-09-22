@@ -125,6 +125,10 @@ function attemptSamplesFor(
       attempt => attempt && typeof attempt === "object" && !Array.isArray(attempt),
     ) as PersistedUsageAttempt[];
     const attempts = physicalUsageAttempts(persistedAttempts);
+    // A row that recorded NO physical send is not evidence about this provider, and must stay
+    // distinguishable from one whose sends simply did not match the candidate -- the caller
+    // falls back to the row for the second case and must not for the first.
+    if (attempts.length === 0) return [];
     const finalAttempt = attempts.at(-1);
     const samples: HealthSample[] = [];
     for (const [attemptOrder, attempt] of attempts.entries()) {
@@ -147,7 +151,12 @@ function attemptSamplesFor(
         attemptOrder,
       });
     }
-    return samples;
+    // Attempts existed but none named this candidate. A send DID happen -- attempt rows carry an
+    // account-qualified provider (`anthropic-p126351`) that never equals the bare `anthropic`
+    // the query filtered on -- so the row itself is the evidence. Returning an empty array here
+    // silently discarded it: a provider failing every request produced zero failure samples,
+    // `consecutiveFailures` stayed 0, and scoring kept routing to a dead target.
+    return samples.length > 0 ? samples : undefined;
   } catch {
     return undefined;
   }
@@ -295,7 +304,14 @@ function computeHistoricalHealthEvidence(
 
     const samples: HealthSample[] = [];
     for (const row of rows) {
-      samples.push(...(attemptSamplesFor(row, input.provider, input.model) ?? [row]));
+      // Falls back when the attempt scan yields NOTHING, not only when it fails to parse. A row
+      // can carry attempts none of which match the candidate: attempt rows hold an
+      // account-qualified provider (`anthropic-p126351`) that never equals the bare `anthropic`
+      // the query filtered on. With `?? [row]` those rows pushed no sample at all, so a provider
+      // failing every request produced zero failure samples, `consecutiveFailures` stayed 0, and
+      // health scoring kept routing to a dead target. The row itself is always evidence.
+      const attemptSamples = attemptSamplesFor(row, input.provider, input.model);
+      samples.push(...(attemptSamples ?? [row]));
     }
     for (const row of attemptRows) {
       samples.push(...(attemptSamplesFor(row, input.provider, input.model) ?? []));

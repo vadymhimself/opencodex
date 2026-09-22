@@ -324,6 +324,25 @@ describe("health-aware scoring (RI-06)", () => {
     expect(evidence.successRate).toBeCloseTo(0.5, 4);
   });
 
+  test("attempts that name a different provider still count the row as evidence", () => {
+    // Attempt rows carry an ACCOUNT-QUALIFIED provider (`a-p126351`) that never equals the bare
+    // `a` the candidate query filtered on. Treating "no attempt matched" as "no evidence"
+    // discarded the row entirely, so a provider failing every request produced zero failure
+    // samples, consecutiveFailures stayed 0, and scoring kept routing to a dead target.
+    const entry = row("account-qualified", 503, 4000, {
+      attempts: [{
+        ordinal: 1, provider: "a-p126351", model: "m1", adapter: "openai-chat",
+        status: 503, durationMs: 4000, sendCount: 1, recoveryKinds: [], usageStatus: "unreported",
+      }],
+    } as never);
+    writeFileSync(join(testDir, "usage.jsonl"), `${JSON.stringify(entry)}\n`);
+
+    const evidence = healthEvidenceForCandidate({ provider: "a", model: "m1" });
+
+    expect(evidence.sampleCount).toBe(1);
+    expect(evidence.failures).toBe(1);
+  });
+
   test("explicit empty attempts do not fall back to the top-level outcome", () => {
     appendUsageEntry(row("no-physical-attempt", 503, 4000, { attempts: [] }));
 
