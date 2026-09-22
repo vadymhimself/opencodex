@@ -260,7 +260,21 @@ export function coolComboTarget(
   // not an inference -- it is the one explicit lever for "stop hammering this target", validated
   // up to ten minutes at the config surface -- so truncating it to 60s gives five to ten times
   // the doomed sends on exactly the control a burn-bitten operator reaches for.
-  const ceilingMs = exhausted || resetDerivedMs !== undefined || options?.cooldownMs !== undefined
+  //
+  // A reset instant alone does NOT earn the higher ceiling. A request-rate 429 can carry one
+  // alongside a long `Retry-After`, and granting it ten minutes blacked out a healthy target for
+  // ten minutes on a failure class that is explicitly not exhaustion -- the same outage this
+  // comment warns about, entered through the reset header instead of the delay header. The
+  // elevated ceiling needs a reason that survives being read twice: a confirmed quota cap, an
+  // operator's own lever, or a reset instant on a failure not classified as transient.
+  const transient = isTransientRequestRateLimit({
+    status: options?.status,
+    code: options?.code,
+    message: options?.message,
+  });
+  const ceilingMs = exhausted
+      || options?.cooldownMs !== undefined
+      || (resetDerivedMs !== undefined && !transient)
     ? QUOTA_CAP_COOLDOWN_MS
     : MAX_COOLDOWN_MS;
   // A server `Retry-After` is clamped by the SAME reason-dependent ceiling as everything else:
