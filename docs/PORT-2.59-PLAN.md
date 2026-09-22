@@ -516,6 +516,42 @@ The rule that came out of it, and the reason it must not be "unified" later:
   layer limiting it. The trigger to revisit is a CONFIG CHANGE, not a runtime signal -- no guard
   detector for it, since a permanently-zero baseline detects nothing.
 
+### Code-review findings: 8 of 10 fixed, 2 recorded
+
+Fixed, each with a planted-defect-checked regression:
+
+| # | defect | commit |
+|---|---|---|
+| 1 | `.map()` on a string `system` 500'd every documented-shape replay | `082073946` |
+| 3 | streaming replay logged `output_tokens` ≈ 1 for a 4,000-token turn | `834d79cfc` |
+| 5 | generic OAuth clamped a stated `Retry-After` to 60s | `8cf64f54a` |
+| 6 | a row whose attempts name another provider lost its health sample | `36db0193b` |
+| 8 | a refused attempt zeroed the whole request's cost | `ccca015d8` |
+| 10 | a reset header alone granted the ten-minute ceiling | `581304ff2` |
+
+Plus two of my own regressions the review caught: the Anthropic account cooldown
+ceiling (`4d9becd45`) and the transient-429 clamp (`a53df96bb`).
+
+**NOT fixed, deliberately:**
+
+- **Finding 9 -- `response.incomplete` with no reason is retryable.** Reported as a widening
+  versus upstream, and it is: upstream requires a known reason. But this matches `origin/main`
+  EXACTLY (fork `combo-stream-preflight.ts:58-60`), so it is deployed fork behaviour rather than
+  port damage. The concern is real -- a content-filter stop that omits the reason would be
+  retried on another target, costing a second billed send -- but changing behaviour that has run
+  in production on a hypothetical, with no instance in any ring, is the speculative change this
+  port has refused throughout. Needs one observed instance before it moves.
+- **Finding 4 -- `count_tokens` makes an unlogged upstream call.** Confirmed: the handler has no
+  `addFinalRequestLog` on any path, so the call is invisible in `usage.jsonl` and `/api/logs`,
+  commits a pool account, advances the combo cursor, and does not cool the account on a 429. It
+  arrived with an upstream feature commit, not the port. Deferred because the endpoint consumes
+  RATE LIMIT rather than tokens, so it is not the dollar spend the other findings are, and
+  threading a log context through ~400 lines of handler with a dozen return paths is a larger
+  change than anything else here. Worth doing; not worth doing at the end of this batch.
+- **Findings 2 and 7** (sidecar rounds overwriting each other's usage; `cachedInputTokens`
+  read/write ambiguity) are recorded unfixed for the same budget reason. Both under-report rather
+  than over-report.
+
 ### Outstanding, classified, NOT defects
 
 - **`opencode-go-session-header.test.ts` (28 failures)**: an EXPECTATION CHANGE, not a duplicate
