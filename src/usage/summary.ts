@@ -284,14 +284,22 @@ export function computeEntryCost(entry: PersistedUsageEntry): EntryCostInfo {
     const attemptEstimates = entry.attempts.map(attempt =>
       estimateAttemptCost({ ...attempt, ...usageModelPriceOptions(entry, attempt) }, undefined, tier)
     );
-    const isPriced = attemptEstimates.length > 0
-      && attemptEstimates.every(estimate => estimate !== null);
+    // Failing closed distinguishes "we cannot PRICE this attempt" from "this attempt spent
+    // NOTHING". An attempt that carries no usage at all -- a 429 refusal, a transport failure --
+    // has no tokens to price and is a known zero; poisoning the request on it zeroed the cost of
+    // every combo request whose first target was refused, so real money spent on the attempt that
+    // succeeded vanished from the daily total. An attempt that HAS usage we cannot price is a
+    // genuine unknown and still fails the whole request closed, which is the fork behaviour worth
+    // keeping: better no number than a confident wrong one.
+    const unpriceable = entry.attempts.some((attempt, index) =>
+      attemptEstimates[index] === null && attempt.usage !== undefined);
+    const isPriced = attemptEstimates.length > 0 && !unpriceable;
     return {
       tier,
       estimate: null,
       attemptEstimates,
       costTotal: isPriced
-        ? attemptEstimates.reduce((total, estimate) => total + estimate!.cost.total, 0)
+        ? attemptEstimates.reduce((total, estimate) => total + (estimate?.cost.total ?? 0), 0)
         : 0,
       isPriced,
     };

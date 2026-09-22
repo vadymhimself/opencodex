@@ -14,6 +14,7 @@ import {
   summarizeUsage,
 } from "../../src/usage/summary";
 import type { PersistedUsageEntry } from "../../src/usage/log";
+import { computeEntryCost } from "../../src/usage/summary";
 import { buildRouteDecisionTrace } from "../../src/routing/trace";
 import { isUnresolvedRequestedModel } from "../../src/usage/model-identity";
 
@@ -2510,4 +2511,35 @@ describe("UsageSummaryAccumulator modes", () => {
 
     expect(compact.estimatedBytes).toBe(firstSignatureBytes);
   });
+});
+
+test("a refused attempt does not zero the cost of the attempt that succeeded", () => {
+  // Combo failover: target 1 is refused (a physical send, no usage to price), target 2 serves the
+  // turn. Treating the refusal as UNPRICEABLE rather than as a known zero reported the whole
+  // request at $0, so real money spent on target 2 disappeared from the daily total.
+  const entry = {
+    requestId: "combo-failover-cost",
+    timestamp: Date.now(),
+    provider: "combo",
+    model: "combo/waterfall",
+    status: 200,
+    durationMs: 900,
+    usageStatus: "reported",
+    attempts: [
+      {
+        ordinal: 1, provider: "openai", model: "gpt-5.6", adapter: "openai-responses",
+        status: 429, durationMs: 40, sendCount: 1, recoveryKinds: [], usageStatus: "unreported",
+      },
+      {
+        ordinal: 2, provider: "anthropic", model: "claude-opus-4-5", adapter: "anthropic",
+        status: 200, durationMs: 800, sendCount: 1, recoveryKinds: [], usageStatus: "reported",
+        usage: { inputTokens: 50_000, outputTokens: 1_000, totalTokens: 51_000 },
+      },
+    ],
+  } as unknown as PersistedUsageEntry;
+
+  const cost = computeEntryCost(entry);
+
+  expect(cost.isPriced).toBe(true);
+  expect(cost.costTotal).toBeGreaterThan(0);
 });
