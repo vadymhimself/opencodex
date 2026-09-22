@@ -337,7 +337,18 @@ export function tapAnthropicSseForLog(
   let tapController: ReadableStreamDefaultController<Uint8Array> | undefined;
 
   const recordUsage = () => {
-    logCtx.usage = usageFromAnthropic(Object.keys(usageAcc).length > 0 ? usageAcc : undefined);
+    const usage = usageFromAnthropic(Object.keys(usageAcc).length > 0 ? usageAcc : undefined);
+    logCtx.usage = usage;
+    // The ATTEMPT is updated too, not just the request context. On a streaming canonical replay
+    // the combo preflight already pinned the attempt from `message_start` -- input tokens plus
+    // `output_tokens: 1` -- and returns as soon as the first content block commits, before
+    // `message_delta` carries the real output total. Since the row totals from its attempts and
+    // prefers an attempt that already has usage, writing only `logCtx.usage` here logged a
+    // 4,000-output-token turn as one. This tap sees the whole stream, so its accumulated total
+    // is the authoritative one.
+    if (usage && logCtx.activeAttempt && !recordKeyWireAttemptUsage(logCtx, usage)) {
+      logCtx.activeAttempt.usage = usage;
+    }
   };
   const settle = (status: number, meta: AnthropicTapFinalMeta) => {
     if (settled) return false;
