@@ -1,4 +1,5 @@
 import { readResponsesCoreSource } from "../helpers/responses-core-source";
+import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -96,10 +97,15 @@ beforeAll(async () => {
 
 const originalHome = process.env.OPENCODEX_HOME;
 let home: string;
+// Sidecar dispatch charges the shared spend ledger, and upstream now requires the writer lease
+// before any charge. Every case here reaches that path, so the lease is per-case file-wide.
+let releaseSpendHome: (() => void) | undefined;
 
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "ocx-generic-failover-"));
   process.env.OPENCODEX_HOME = home;
+  // After the home is in place: the lease binds to the directory it can see.
+  releaseSpendHome = acquireOwnedSpendHome();
   clearGenericFailoverHealth();
   sidecarObservedTokens = [];
   sidecarReportsFinalUsage = true;
@@ -107,6 +113,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  releaseSpendHome?.();
+  releaseSpendHome = undefined;
   clearGenericFailoverHealth();
   clearAccountQuotaCache("xai");
   if (originalHome === undefined) delete process.env.OPENCODEX_HOME;
