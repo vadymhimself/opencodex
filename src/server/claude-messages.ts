@@ -1033,6 +1033,13 @@ async function handleClaudeMessagesWithBudget(
   // bodies: it 400s on sampling params ("Unsupported parameter: max_output_tokens",
   // verified live 2026-07-11). Strip them for that route; routed providers keep them.
   const routeSource = anthropicMessagesSource;
+  const sourceComboId = resolveComboId(config, internalBody.model as string);
+  const sourceCombo = sourceComboId ? getCombo(config, sourceComboId) : undefined;
+  // Correlation protects canonical Anthropic replay only; other combos retain independent picks.
+  if (!routeSource || !sourceCombo?.targets.some(target =>
+    comboTargetAcceptsAnthropicSource(config, target, routeSource, internalBody, "anthropic", true))) {
+    comboRandomSeed = undefined;
+  }
   const comboRequestCompatible = routeSource
     ? (target: Readonly<{ provider: string; model: string }>) => comboTargetAcceptsAnthropicSource(
         config,
@@ -1669,9 +1676,11 @@ export async function handleClaudeCountTokens(
               translated.body,
               "anthropic",
             );
+          const hasCanonicalReplay = combo.targets.some(target =>
+            comboTargetAcceptsAnthropicSource(config, target, anthropicSource, translated.body, "anthropic", true));
           const pick = pickComboTarget(config, comboId, {
             eligible: sourceEligible,
-            ...(comboRandomSeed === undefined ? {} : { randomSeed: comboRandomSeed }),
+            ...(hasCanonicalReplay ? { randomSeed: comboRandomSeed } : {}),
           });
           if (!pick) {
             if (!combo.targets.some(sourceEligible)) {

@@ -253,6 +253,7 @@ export function comboTargetAcceptsAnthropicSource(
   source: AnthropicMessagesSource,
   body: unknown,
   inboundWire: InboundWire,
+  requireCanonicalReplay = false,
 ): boolean {
   const configuredProvider = config.providers[target.provider];
   if (!configuredProvider) return false;
@@ -281,7 +282,7 @@ export function comboTargetAcceptsAnthropicSource(
     return canonicalAnthropicTarget
       ? canReplayAnthropicSource(source.body, route.modelId, adapterProvider)
         && !(isModelTextOnly(adapterProvider, route.modelId) && comboRequestHasImageInput(body))
-      : source.requiresExactReplay !== true;
+      : !requireCanonicalReplay && source.requiresExactReplay !== true;
   } catch {
     return false;
   }
