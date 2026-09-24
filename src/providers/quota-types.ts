@@ -19,6 +19,17 @@ export interface ProviderQuotaWindow {
   label: string;
   percent: number;
   resetAt?: number;
+  /**
+   * Set only when the PRODUCER proved this window covers one model family, structurally rather
+   * than by reading its label: an Anthropic `seven_day_<family>` body key, or a limit with
+   * `kind: "weekly_scoped"` and a non-empty `scope.model.display_name`.
+   *
+   * Absent means provider-wide, which gates every model. That is upstream's behaviour and the
+   * fail-closed direction. Routing must key on THIS, never on the label text -- a producer such
+   * as Antigravity passes an upstream display name straight through, so a model group named
+   * "Opus" there would otherwise be mistaken for a per-model window and skipped.
+   */
+  scope?: "model";
 }
 
 export interface ProviderQuotaCreditsUsd {

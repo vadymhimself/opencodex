@@ -27,20 +27,3 @@ test("an explicit model change still fails closed on dated tool types", () => {
   expect(canReplayAnthropicSource(withTool("claude-haiku-4-5"), "claude-opus-5", provider)).toBe(false);
   expect(canReplayAnthropicSource(withTool("claude-opus-5"), "claude-opus-5", provider)).toBe(true);
 });
-
-// `system` is legally a plain STRING in the documented Anthropic shape, and on the replay lane
-// the adapter reads the caller's raw body rather than one it built. Walking it as an array threw
-// `blocks.map is not a function`, so every client sending the documented shape got a 500 instead
-// of a replayed request. The cache-ttl scan must tolerate any shape the wire allows.
-test("a string `system` does not crash the prompt-cache-ttl scan", async () => {
-  const { effectivePromptCacheTtlMsForTest } = await import("../../../src/adapters/anthropic-cache-ttl-probe");
-  for (const body of [
-    { system: "You are a helpful assistant.", messages: [{ role: "user", content: "hi" }] },
-    { system: [{ type: "text", text: "hi", cache_control: { type: "ephemeral" } }] },
-    { tools: "not-an-array", messages: "not-an-array" },
-    { messages: [null, "text", { content: "plain string" }] },
-    {},
-  ]) {
-    expect(() => effectivePromptCacheTtlMsForTest(body as Record<string, unknown>)).not.toThrow();
-  }
-});

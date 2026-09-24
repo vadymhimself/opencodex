@@ -169,7 +169,15 @@ describe("terminal guard", () => {
       parsed: parsed("请检查这个问题并修复代码"),
       firstEvents: (async function* () {
         yield { type: "text_delta", text: "我接下来会修改相关文件。" } as AdapterEvent;
-        yield { type: "done", usage: { inputTokens: 10, outputTokens: 2 } } as AdapterEvent;
+        yield {
+          type: "done",
+          usage: {
+            inputTokens: 10,
+            outputTokens: 2,
+            contextTotalTokens: 100,
+            anthropicServerToolUse: { web_search_requests: 1 },
+          },
+        } as AdapterEvent;
       })(),
       continuation: next => {
         continuations += 1;
@@ -177,7 +185,15 @@ describe("terminal guard", () => {
         return (async function* () {
           yield { type: "tool_call_start", id: "call_1", name: "exec_command" } as AdapterEvent;
           yield { type: "tool_call_end" } as AdapterEvent;
-          yield { type: "done", usage: { inputTokens: 20, outputTokens: 3 } } as AdapterEvent;
+          yield {
+            type: "done",
+            usage: {
+              inputTokens: 20,
+              outputTokens: 3,
+              contextTotalTokens: 140,
+              anthropicServerToolUse: { web_search_requests: 2, web_fetch_requests: 1 },
+            },
+          } as AdapterEvent;
         })();
       },
       adapterName: "anthropic",
@@ -186,7 +202,15 @@ describe("terminal guard", () => {
     expect(continuations).toBe(1);
     expect(actual.filter(event => event.type === "done")).toHaveLength(1);
     expect(actual.some(event => event.type === "assistant_boundary")).toBe(true);
-    expect(actual.at(-1)).toMatchObject({ usage: { inputTokens: 30, outputTokens: 5, totalTokens: 35 } });
+    expect(actual.at(-1)).toMatchObject({
+      usage: {
+        inputTokens: 30,
+        outputTokens: 5,
+        totalTokens: 35,
+        contextTotalTokens: 140,
+        anthropicServerToolUse: { web_search_requests: 3, web_fetch_requests: 1 },
+      },
+    });
   });
 
 

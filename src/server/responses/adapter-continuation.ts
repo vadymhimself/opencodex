@@ -32,6 +32,7 @@ import {
 import { redactSecretString } from "../../lib/redact";
 import { resolveWireProtocolOverride } from "../adapter-resolve";
 import { bindRouteReasoningReplayScope } from "./core-replay";
+import { rotateAnthropicProviderOnCredentialDenial } from "./anthropic-source-replay";
 import {
   ANTHROPIC_POOL_MAX_FAILOVERS_PER_REQUEST,
   rotateAnthropicAccountOn429,
@@ -270,6 +271,23 @@ export function createAdapterContinuations(
           yield { type: "error", message: `Provider continuation failed: ${redactSecretString(error instanceof Error ? error.message : String(error))}` };
         }
         return;
+      }
+
+      // A credential denial (403 oauth_org_not_allowed) rotates the Anthropic account here too:
+      // the continuation is a fresh send, so a denied credential is recoverable rather than
+      // terminal. `nextParsed` is the terminal-guard clone; both owners are rebound.
+      const deniedCredentialRecovery = await rotateAnthropicProviderOnCredentialDenial({
+        config, route, inboundWire, logCtx, transportState, parsed,
+        retryParsed: nextParsed,
+        response,
+        signal: upstream.signal,
+      });
+      if (deniedCredentialRecovery) {
+        try { void response.body?.cancel().catch(() => {}); } catch { /* already closed */ }
+        invalidateSameTargetRequest();
+        transportState.activeAdapter = deniedCredentialRecovery.adapter;
+        nextContinuationRecoveryKind = deniedCredentialRecovery.recoveryKind;
+        continue;
       }
 
       // Same-target 429 wait-and-retry (opt-in `retryOn429`) before key/account failover:

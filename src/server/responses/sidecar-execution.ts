@@ -33,6 +33,7 @@ import {
 } from "../../oauth/anthropic-routing";
 import { resolveWireProtocolOverride } from "../adapter-resolve";
 import { bindRouteReasoningReplayScope, adapterNeedsForcedContinuation } from "./core-replay";
+import { rotateAnthropicProviderOnCredentialDenial } from "./anthropic-source-replay";
 import { namespacedToolName } from "../../types";
 import { providerFetch } from "./fetch-helpers";
 import type { AttemptRecoveryKind } from "../../usage/log";
@@ -63,6 +64,7 @@ export async function executeResponsesSidecars(
     | "anthropicPoolAccountId"
     | "anthropicPoolFailovers"
     | "anthropicSessionKey"
+    | "replayOAuthCredentialSnapshot"
     | "commitResolvedOAuthSelection"
     | "resolveSelectionAdapter"
     | "oauthDispatch"
@@ -280,6 +282,15 @@ export async function executeResponsesSidecars(
     });
     return rotatedAdapter;
   };
+  // A 403 credential denial is recoverable for a sidecar turn the same way it is on the main
+  // dispatch path: rotate to the next eligible Anthropic account instead of ending the turn.
+  const rotateSidecarProviderOnCredentialError = (
+    response: Response,
+    signal: AbortSignal,
+  ): Promise<{ adapter: ProviderAdapter; recoveryKind: AttemptRecoveryKind } | null> =>
+    rotateAnthropicProviderOnCredentialDenial({
+      config, route, inboundWire, logCtx, transportState, parsed, response, signal,
+    });
   if ((imgPlan || vidPlan) && canRunWebSearch) {
     // Web search takes priority when both are active — the media bridge cannot run
     // alongside runWithWebSearch. Surface a runtime signal so the user knows their
@@ -373,6 +384,7 @@ export async function executeResponsesSidecars(
         }
         transportState.bindKeyUsageFromBridge(usage);
       },
+      onCredentialError: rotateSidecarProviderOnCredentialError,
       on429: rotateSidecarProviderOn429,
       retryOn429Policy: rateLimitRetryPolicyFor(route.provider),
       ...(options.onFirstOutput ? { onFirstOutput: options.onFirstOutput } : {}),
@@ -456,6 +468,7 @@ export async function executeResponsesSidecars(
       routedModelStallTimeoutMs: wsPlan.routedModelStallTimeoutMs,
       stallTimeoutSec: wsPlan.stallTimeoutSec,
       streamRoutedModelOutput: wsPlan.streamRoutedModelOutput,
+      onCredentialError: rotateSidecarProviderOnCredentialError,
       on429: rotateSidecarProviderOn429,
       retryOn429Policy: rateLimitRetryPolicyFor(route.provider),
       onCompletedResponse: response => {

@@ -16,6 +16,7 @@ import { parseDataUrl } from "./image";
 import { createAdapterPhysicalSend } from "./physical-send";
 import { SendBudgetExhaustedError } from "../lib/upstream-retry";
 import { CommandCodeToolTextFilter, type CommandCodeDeclaredTools } from "./command-code-tool-text";
+import { fetchWithHeaderTimeout } from "../server/responses/fetch-helpers";
 
 function declaredTools(tools: OcxTool[]): CommandCodeDeclaredTools {
   return new Map(tools.map(tool => [
@@ -504,20 +505,19 @@ function requestWithoutReasoningEffort(request: AdapterRequest): AdapterRequest 
 }
 
 async function fetchCommandCode(request: AdapterRequest, ctx: AdapterFetchContext | undefined, executor: typeof globalThis.fetch): Promise<Response> {
-  const timeout = new AbortController();
-  const timer = setTimeout(() => timeout.abort(new DOMException("Timeout elapsed", "TimeoutError")), ctx?.timeoutMs ?? 200_000);
-  const callerSignal = ctx?.abortSignal ?? new AbortController().signal;
-  try {
-    return await executor(request.url, {
+  return fetchWithHeaderTimeout(
+    request.url,
+    {
       method: request.method,
       headers: request.headers,
       body: request.body,
-      redirect: "manual",
-      signal: AbortSignal.any([callerSignal, timeout.signal]),
-    });
-  } finally {
-    clearTimeout(timer);
-  }
+    },
+    ctx?.abortSignal ?? new AbortController().signal,
+    ctx?.timeoutMs ?? 200_000,
+    false,
+    executor,
+    true,
+  );
 }
 
 /**

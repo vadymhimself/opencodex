@@ -46,6 +46,7 @@ import { isXaiResponsesDestination, resolveProviderTransport } from "../../provi
 import { resolveCopilotApiBaseUrl } from "../../oauth/github-copilot";
 import { resolveWireProtocolOverride } from "../adapter-resolve";
 import { bindRouteReasoningReplayScope } from "./core-replay";
+import { rotateAnthropicProviderOnCredentialDenial } from "./anthropic-source-replay";
 import {
   ANTHROPIC_POOL_MAX_FAILOVERS_PER_REQUEST,
   rotateAnthropicAccountOn429,
@@ -656,6 +657,23 @@ export async function prepareAdapterExchange(
         // stop. Re-enter the loop guard instead, which returns it unchanged.
         if (isNonReplayableResponse(upstreamResponse)) continue recovery;
      }
+
+      // An Anthropic OAuth credential denial (403 oauth_org_not_allowed) is not a quota verdict:
+      // the account is marked for reauth and the turn continues on the next eligible account.
+      const deniedCredentialRecovery = await rotateAnthropicProviderOnCredentialDenial({
+        config, route, inboundWire, logCtx, transportState, parsed,
+        response: upstreamResponse,
+        signal: upstream.signal,
+      });
+      if (deniedCredentialRecovery) {
+        try { void upstreamResponse.body?.cancel().catch(() => {}); } catch { /* already consumed/closed */ }
+        invalidateSameTargetRequest();
+        transportState.activeAdapter = deniedCredentialRecovery.adapter;
+        const result = await rebuildAndRefetch(deniedCredentialRecovery.recoveryKind);
+        if ("failed" in result) return result.failed;
+        upstreamResponse = result;
+        continue recovery;
+      }
 
       // Anthropic fast mode refused (no usage credits, organization not enabled, model outside
       // the lane, fast pool empty): resend once at standard speed, as Claude Code does. This

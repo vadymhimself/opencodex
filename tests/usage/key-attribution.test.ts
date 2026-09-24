@@ -39,10 +39,10 @@ describe("key attempt accounting", () => {
     );
     // The entry-level row is the fallback for a request written before attempts existed, and it
     // is reachable only when there are none.
-    expect(attributions).toContain("if (!entry.attempts?.length) {");
+    expect(attributions).toContain("if (entry.attempts === undefined) {");
     // Everything after that early return maps the attempts; there is no branch that emits the
     // entry row alongside them.
-    const fallback = attributions.indexOf("if (!entry.attempts?.length) {");
+    const fallback = attributions.indexOf("if (entry.attempts === undefined) {");
     const perAttempt = attributions.indexOf("return entry.attempts.map(attempt =>", fallback);
     expect(fallback).toBeGreaterThan(-1);
     expect(perAttempt).toBeGreaterThan(fallback);

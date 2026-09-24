@@ -120,6 +120,7 @@ export function codexWsUpstreamFetch(
   runtime: BunRuntimeGateInput = currentBunRuntimeIdentity(),
   onQuota?: CodexWsQuotaObserver,
   beforeDispatch?: (headers: Headers) => void,
+  onTransportDispatch?: (headers: Headers) => void,
   nativeControl?: NativeResponseControl,
   beforeContinuation?: () => Promise<void>,
 ): Promise<Response> {
@@ -190,6 +191,7 @@ export function codexWsUpstreamFetch(
     session, url, init, prepared, sseFallback, onQuota, beforeDispatch,
     nativeControl: control,
     beforeContinuation,
+    onTransportDispatch,
     bunVersion: typeof runtime === "string" ? runtime : runtime.version,
   });
 }

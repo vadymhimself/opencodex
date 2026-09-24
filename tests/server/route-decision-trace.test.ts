@@ -141,6 +141,33 @@ describe("route decision traces (RI-01)", () => {
     }
   });
 
+  test("combo route records request-level incompatibility in candidate evidence", () => {
+    const route = routeModel(baseConfig(), "combo/free", undefined, {
+      comboEligible: target => target.provider === "b",
+    });
+    expect(route.providerName).toBe("b");
+    expect(route.routeDecision!.candidates[0]).toMatchObject({
+      provider: "a",
+      eligible: false,
+      exclusions: [{ code: "request-incompatible" }],
+    });
+  });
+
+  test("combo route does not label operational ineligibility as request incompatibility", () => {
+    const options = {
+      comboEligible: (target: { provider: string }) => target.provider === "b",
+      comboRequestCompatible: () => true,
+    } as Parameters<typeof routeModel>[3] & {
+      comboRequestCompatible: (target: { provider: string }) => boolean;
+    };
+    const route = routeModel(baseConfig(), "combo/free", undefined, options);
+    const candidate = route.routeDecision!.candidates[0]!;
+
+    expect(route.providerName).toBe("b");
+    expect(candidate.eligible).toBe(false);
+    expect(candidate.exclusions.map(exclusion => exclusion.code)).not.toContain("request-incompatible");
+  });
+
   test("default-provider fallback records a default-provider trace", () => {
     const route = routeModel(baseConfig(), "totally-unknown-model");
     expect(route.providerName).toBe("a");

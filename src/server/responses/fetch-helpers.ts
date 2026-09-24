@@ -189,10 +189,12 @@ export interface ProviderFetchOptions {
   pacingSlotAcquired?: boolean;
   /** Captured selected-account observer, attached before the native WS send. */
   onCodexWsQuota?: CodexWsQuotaObserver;
-  /** Synchronous admission at actual credential dispatch, after pacing/backoff. */
+  /** Synchronous admission at credential use; WebSocket transport rechecks before sending its create frame. */
   beforeDispatch?: (headers: Headers) => void;
   /** Revalidate/rebuild a queued request at its physical send boundary, after pacing. */
   dispatchOverride?: (input: Parameters<typeof globalThis.fetch>[0], init: RequestInit, execute: typeof globalThis.fetch) => Promise<Response>;
+  /** Records one actual model-request dispatch after transport admission succeeds. Must not throw. */
+  onTransportDispatch?: (headers: Headers) => void;
 }
 
 export function providerFetch(
@@ -250,17 +252,22 @@ export function providerFetch(
       // refusing on this destination would reject a request whose real route is fine.
       if (options.dispatchOverride) egressFor(input);
       else providerEgressSendInit(egressBinding, base, input);
-      // The hook inspects the outgoing headers and refuses the send by throwing; it is not a
-      // mutator, and the copy it receives is deliberately not threaded onward. `Connection`
-      // is decided inside `dispatch`, which runs after this, so the fresh-connection policy
-      // wins regardless of what any caller or hook put in the header.
-      options.beforeDispatch?.(new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined)));
+      // The hooks inspect the outgoing headers; `beforeDispatch` refuses the send by throwing
+      // and neither is a mutator, so the copy they receive is deliberately not threaded onward.
+      // `Connection` is decided inside `dispatch`, which runs after this, so the fresh-connection
+      // policy wins regardless of what any caller or hook put in the header.
+      const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+      options.beforeDispatch?.(headers);
       // No proxy option is attached here: a `dispatchOverride` may rebuild this request against
       // a different destination, so the route is decided at the physical send instead.
       const dispatchInit = { ...withUpstreamHttpVersion(input, init, provider), timeout: 0 };
-      return options.dispatchOverride
+      const response = options.dispatchOverride
         ? options.dispatchOverride(input, dispatchInit, dispatch)
         : dispatch(input, dispatchInit);
+      // Admission passed and the send is under way: count it before awaiting the response, so a
+      // dispatch is recorded exactly once whether or not the upstream answers.
+      options.onTransportDispatch?.(headers);
+      return response;
     },
     { preconnect },
   ) as typeof globalThis.fetch;
@@ -280,8 +287,8 @@ export function providerFetch(
       // used, protocol pin included: a WS turn that falls back is serving the
       // request over HTTP, and dropping the provider's `upstreamHttpVersion`
       // there would silently negotiate a transport the operator ruled out.
-      return codexWsUpstreamFetch(input, init, httpFetch, runtime, options.onCodexWsQuota, options.beforeDispatch, options.nativeControl,
-        () => waitForPacing(init.signal ?? undefined));
+      return codexWsUpstreamFetch(input, init, httpFetch, runtime, options.onCodexWsQuota, options.beforeDispatch,
+        options.onTransportDispatch, options.nativeControl, () => waitForPacing(init.signal ?? undefined));
     }
     return httpFetch(input, init);
   };

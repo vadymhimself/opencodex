@@ -4,6 +4,16 @@ import type { RequestExecutionBudget } from "../lib/request-execution-budget";
 import type { AttemptRecoveryKind, AttemptRecoveryWithheld } from "../usage/log";
 import type { AdapterTierMetadata } from "../providers/fastwire";
 
+export interface AnthropicMessagesSource {
+  readonly body: Readonly<Record<string, unknown>>;
+  readonly headers: {
+    readonly anthropicVersion?: string;
+    readonly anthropicBeta?: string;
+  };
+  /** Source contains Anthropic-native tools that translated routes cannot represent. */
+  readonly requiresExactReplay?: true;
+}
+
 /** Metadata about the caller's incoming request, for auth-forwarding adapters. */
 export interface IncomingMeta {
   headers: Headers;
@@ -15,6 +25,8 @@ export interface IncomingMeta {
    * the same pacing queue and custom provider fetch seam.
    */
   providerFetch?: typeof globalThis.fetch;
+  /** Validated original Messages body, available only to exact canonical Anthropic replay. */
+  anthropicMessagesSource?: AnthropicMessagesSource;
   /**
    * Image-normalization ladder bias for upstream-413 tightened retries: every image
    * starts one tier lower (devlog/260714_image_normalization_pipeline/030). Consumed by
@@ -97,11 +109,13 @@ export interface ProviderAdapter {
     response: Response,
     budget: TranslatorBudget,
     tierMetadata?: AdapterTierMetadata,
+    request?: AdapterRequest,
   ): AsyncGenerator<AdapterEvent>;
   parseResponse?(
     response: Response,
     budget: TranslatorBudget,
     tierMetadata?: AdapterTierMetadata,
+    request?: AdapterRequest,
   ): Promise<AdapterEvent[]>;
   runTurn?(
     parsed: OcxParsedRequest,
@@ -118,6 +132,12 @@ export interface AdapterRequest {
     method: string;
     headers: Record<string, string>;
     body: string;
+    /** Effective Anthropic prompt-cache lifetime represented by the final wire body. */
+    promptCacheTtlMs?: number;
+    /** True only when body replays validated source on exact canonical Anthropic Messages. */
+    anthropicSourceReplay?: boolean;
+    /** Exact caller-declared tool names preserved on source replay. */
+    anthropicSourceToolNames?: ReadonlySet<string>;
     /** Final upstream wire names of custom tools lowered to functions while building this request. */
     convertedRoutedCustomToolNames?: ReadonlySet<string>;
     /** Native custom-tool wire names authorized for representation-only response repair. */

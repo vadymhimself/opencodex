@@ -475,6 +475,7 @@
   "coding-agent-tool-result-images.test.ts": "adapters",
   "cold-spawn-warmup.test.ts": "ci-workflows",
   "combo-authoritative-reset.test.ts": "codex-integration",
+  "combo-codex-exhaustion-cooldown.test.ts": "codex-integration",
   "combo-child-headers.test.ts": "routing",
   "combo-last-resort.test.ts": "codex-integration",
   "combo-management-api.test.ts": "routing",

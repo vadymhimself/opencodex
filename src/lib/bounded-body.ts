@@ -29,6 +29,8 @@ export interface BoundedBodyOptions {
 	inactivityTimeoutMs?: number;
 	/** Deadline for the first non-empty raw chunk. Defaults to inactivityTimeoutMs. */
 	firstByteTimeoutMs?: number;
+	/** Retain exact bytes only after a bounded, display-safe complete read. */
+	retainBytes?: boolean;
 }
 
 export interface BoundedBodyResult {
@@ -48,6 +50,8 @@ export interface BoundedBodyResult {
 	displaySafe: boolean;
 	/** Present when reportUtf8Validity was requested and the retained body reached EOF. */
 	utf8Valid?: boolean;
+	/** Exact complete bytes when retainBytes was requested and displaySafe is true. */
+	bytes?: Uint8Array<ArrayBuffer>;
 }
 
 export interface BoundedBytesOptions {
@@ -133,6 +137,7 @@ export async function readBoundedResponseBytes(
 	options: BoundedBytesOptions,
 ): Promise<BoundedBytesResult> {
 	const signal = options.signal;
+	bufferGrowthsForTests = 0;
 	const body = response.body;
 	if (signal?.aborted) {
 		if (body) cancelBodyWithoutWaiting(body, signal.reason);
@@ -198,6 +203,7 @@ export async function readBoundedResponseBytes(
 				);
 				grown.set(retained.subarray(0, retainedBytes));
 				retained = grown;
+				bufferGrowthsForTests += 1;
 			}
 			retained.set(value, retainedBytes);
 			retainedBytes += value.byteLength;
@@ -276,6 +282,7 @@ export async function readBoundedResponseBody(
 			inactivityTimedOut: false,
 			oversized: false,
 			displaySafe: true,
+			...(options.retainBytes ? { bytes: new Uint8Array(0) } : {}),
 		};
 	}
 
@@ -338,13 +345,13 @@ export async function readBoundedResponseBody(
 
 			const { value, done } = outcome as ReadableStreamReadResult<Uint8Array>;
 			if (done) {
+				const completeBytes = retained.subarray(0, retainedBytes);
 				if (options.reportUtf8Validity) {
-					const bytes = retained.subarray(0, retainedBytes);
 					// A fatal decode that returned already proved the bytes valid; still
 					// honour the reporting contract instead of dropping utf8Valid.
 					const decoded = options.fatalUtf8 === true
-						? { text: decodeUtf8([bytes], true), utf8Valid: true }
-						: decodeUtf8WithValidity(bytes);
+						? { text: decodeUtf8([completeBytes], true), utf8Valid: true }
+						: decodeUtf8WithValidity(completeBytes);
 					return {
 						text: decoded.text,
 						truncated: false,
@@ -354,16 +361,18 @@ export async function readBoundedResponseBody(
 						oversized: false,
 						displaySafe: true,
 						utf8Valid: decoded.utf8Valid,
+						...(options.retainBytes ? { bytes: completeBytes.slice() } : {}),
 					};
 				}
 				return {
-					text: decodeUtf8([retained.subarray(0, retainedBytes)], options.fatalUtf8 === true),
+					text: decodeUtf8([completeBytes], options.fatalUtf8 === true),
 					truncated: false,
 					timedOut: false,
 					totalTimedOut: false,
 					inactivityTimedOut: false,
 					oversized: false,
 					displaySafe: true,
+					...(options.retainBytes ? { bytes: completeBytes.slice() } : {}),
 				};
 			}
 

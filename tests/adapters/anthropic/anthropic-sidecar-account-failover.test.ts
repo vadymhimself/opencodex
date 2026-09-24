@@ -14,6 +14,7 @@ import { clearGenericFailoverHealth } from "../../../src/oauth/generic-account-f
 import { getAccountSet, saveCredential, setActiveAccount } from "../../../src/oauth/store";
 import { clearAccountQuotaCache, getCachedProviderAccountQuota, resetProviderQuotaReconcileStateForTests } from "../../../src/providers/quota";
 import type { OcxConfig, OcxParsedRequest, OcxProviderConfig } from "../../../src/types";
+import type { AttemptRecoveryKind } from "../../../src/usage/log";
 import { removeTreeWithRetry } from "../../helpers/remove-tree";
 import { acquireOwnedSpendHome } from "../../helpers/owned-spend-home";
 
@@ -22,7 +23,7 @@ let testHome = "";
 let releaseSpendHome: (() => void) | undefined;
 let handleResponses: typeof import("../../../src/server/responses")["handleResponses"];
 let observedKeys: string[] = [];
-let sidecarMode = false;
+let sidecarMode: false | "403" | "429" = false;
 
 function fixtureAdapter(provider: OcxProviderConfig): ProviderAdapter {
   return {
@@ -71,8 +72,29 @@ beforeAll(async () => {
       adapter: ProviderAdapter;
       incomingMeta: IncomingMeta;
       fetchForRequest: (request: AdapterRequest, parsed: OcxParsedRequest) => typeof fetch;
+      onCredentialError?: (response: Response, signal: AbortSignal) => Promise<{
+        adapter: ProviderAdapter;
+        recoveryKind: AttemptRecoveryKind;
+      } | null>;
       on429?: (retryAfter: string | null) => Promise<ProviderAdapter | null>;
     }) => {
+      if (sidecarMode === "403") {
+        // Credential-denial seam: the loop rotates on a 403 the provider fetch never sees,
+        // so the keys are observed here rather than through fetchForRequest.
+        const first = await args.adapter.buildRequest(args.parsed, args.incomingMeta);
+        observedKeys.push(new Headers(first.headers).get("authorization") ?? "");
+        const rotated = await args.onCredentialError?.(Response.json({
+          type: "error",
+          error: {
+            type: "oauth_org_not_allowed",
+            message: "Your organization has disabled Claude subscription access for Claude Code. Use an Anthropic API key instead, or ask your admin to enable access.",
+          },
+        }, { status: 403 }), new AbortController().signal);
+        if (!rotated) throw new Error("Anthropic sidecar did not rotate after 403");
+        const second = await rotated.adapter.buildRequest(args.parsed, args.incomingMeta);
+        observedKeys.push(new Headers(second.headers).get("authorization") ?? "");
+        return new Response("sidecar-ok", { status: 200 });
+      }
       // This is a dispatch seam test. The real loop is covered in anthropic-quota-dispatch.
       const first = await args.adapter.buildRequest(args.parsed, args.incomingMeta);
       const refused = await args.fetchForRequest(first, args.parsed)(first.url, {
@@ -110,6 +132,7 @@ afterEach(() => {
   // deleted fails the removal on Windows and leaves an unlinked live database on POSIX.
   releaseSpendHome?.();
   releaseSpendHome = undefined;
+  sidecarMode = false;
   clearAnthropicAccountPoolState();
   clearGenericFailoverHealth();
   clearAccountQuotaCache();
@@ -123,8 +146,55 @@ afterAll(() => {
   mock.restore();
 });
 
+test("Anthropic web-search sidecar rotates on 403 credential denial", async () => {
+  sidecarMode = "403";
+  for (let index = 0; index < 2; index += 1) {
+    await saveCredential("anthropic", {
+      access: `anthropic-access-${index}`,
+      refresh: `anthropic-refresh-${index}`,
+      expires: Date.now() + 3_600_000,
+      accountId: `anthropic-account-${index}`,
+    } as never, { addAccount: true });
+  }
+  const ids = getAccountSet("anthropic")!.accounts.map(account => account.id);
+  await setActiveAccount("anthropic", ids[0]!);
+
+  const config = {
+    port: 0,
+    defaultProvider: "anthropic",
+    anthropicAccountPool: { enabled: false, strategy: "round-robin" },
+    providers: {
+      anthropic: {
+        adapter: "test-anthropic-sidecar",
+        baseUrl: "https://anthropic-sidecar.test/v1",
+        authMode: "oauth",
+        models: ["model"],
+      },
+    },
+  } as unknown as OcxConfig;
+
+  const response = await handleResponses(new Request("http://localhost/v1/responses", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "anthropic/model",
+      input: "search",
+      stream: true,
+      tools: [{ type: "web_search" }],
+    }),
+  }), config, { model: "", provider: "" });
+
+  expect(response.status).toBe(200);
+  expect(await response.text()).toBe("sidecar-ok");
+  expect(observedKeys).toEqual([
+    "Bearer anthropic-access-0",
+    "Bearer anthropic-access-1",
+  ]);
+  expect(getAccountSet("anthropic")!.accounts.find(account => account.id === ids[0])?.needsReauth).toBe(true);
+});
+
 test("Anthropic sidecar dispatch seam records A429 and B200 when proactive pooling is disabled", async () => {
-  sidecarMode = true;
+  sidecarMode = "429";
   for (let index = 0; index < 2; index += 1) {
     await saveCredential("anthropic", {
       access: `anthropic-access-${index}`,

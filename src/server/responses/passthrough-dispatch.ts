@@ -128,6 +128,8 @@ import {
   rateLimitRetryPolicyFor,
   rateLimitRetryDelayMs,
   transientRetryPolicyFor,
+  hasKeyPoolFailover,
+  rotateProviderTransportOn429,
 } from "../../providers/key-failover";
 import type { AttemptRecoveryKind } from "../../usage/log";
 import { resolveWireProtocolOverride } from "../adapter-resolve";
@@ -1439,6 +1441,38 @@ export async function preparePassthroughExchange(
       } catch (err) {
         return transportFailureResponse(err);
       }
+    }
+
+    // Native Responses passthrough returns before the generic recovery loop, so key-pool
+    // rotation must happen here, after the same-key retries above exhaust their per-request
+    // budget. Without this arm a pooled key's 429 is terminal on this wire while the identical
+    // refusal rotates in both the adapter dispatch and continuation loops.
+    while (
+      upstreamResponse.status === 429
+      // Same guard as the arms above: a synthesized replay refusal is not a provider rate
+      // limit, and rotating on it would cool down a key that refused nothing.
+      && !isNonReplayableResponse(upstreamResponse)
+      && hasKeyPoolFailover(route.provider)
+    ) {
+      const rotated = rotateProviderTransportOn429(config, route.providerName, route.provider, {
+        retryAfter: upstreamResponse.headers.get("retry-after"),
+        now: Date.now(),
+        attemptedKey: route.provider.apiKey,
+        promptCacheKey: parsed.options.promptCacheKey,
+      });
+      // Every key is in cooldown: the 429 in hand is the answer, body intact.
+      if (!rotated) break;
+      try { void upstreamResponse.body?.cancel().catch(() => {}); } catch { /* already closed */ }
+      route.provider = rotated;
+      bindRouteReasoningReplayScope({
+        parsed, providerName: route.providerName, provider: route.provider,
+        adapterName: "openai-responses",
+      });
+      // rebuildAndRefetch reserves its own send, so an exhausted request budget ends the ladder
+      // instead of rotating through the pool unbounded.
+      const result = await rebuildAndRefetch("key-429");
+      if ("failed" in result) return result.failed;
+      upstreamResponse = result;
     }
 
     const captureAffinityResponse = (

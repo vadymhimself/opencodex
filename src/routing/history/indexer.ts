@@ -24,6 +24,7 @@ import {
   currentUsageLogRevision,
   encodePersistedRequestedModel,
   normalizeUsageEntryForTest,
+  physicalUsageAttempts,
   usageLogPath,
   type PersistedUsageEntry,
   type UsageLogRevision,
@@ -152,7 +153,9 @@ function sourceIdentityMatches(dbHandle: Database, revision: UsageLogRevision | 
 
 /** Extract the `requests` row columns from a canonical persisted entry. */
 function extractRow(entry: PersistedUsageEntry): Array<string | number | null> {
-  const attempts = entry.attempts;
+  const attempts = Array.isArray(entry.attempts)
+    ? physicalUsageAttempts(entry.attempts)
+    : undefined;
   return [
     entry.requestId,
     entry.timestamp,
@@ -209,7 +212,7 @@ function parsedEntryFromLine(line: string): PersistedUsageEntry | null {
       && typeof parsed.model === "string"
       && typeof parsed.status === "number"
       && typeof parsed.durationMs === "number") {
-      return parsed;
+      return normalizeUsageEntryForTest(parsed);
     }
   } catch {
     /* skip partial / hand-edited lines, same as every other reader */

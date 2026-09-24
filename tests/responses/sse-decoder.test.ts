@@ -64,8 +64,18 @@ describe("text/event-stream decoder", () => {
 
   test("joins multiline data and accepts CRLF framing", async () => {
     expect(await collect([
-      "event: custom\r\ndata: first\r\n",
+      "event: custom\r",
+      "\ndata: first\r\n",
       "data: second\r\n\r\n",
+    ])).toEqual([{ event: "custom", data: "first\nsecond" }]);
+  });
+
+  test("joins multiline data with chunk-split lone-CR framing", async () => {
+    expect(await collect([
+      "event: custom\r",
+      "data: first\r",
+      "data: second\r",
+      "\r",
     ])).toEqual([{ event: "custom", data: "first\nsecond" }]);
   });
 

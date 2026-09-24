@@ -143,6 +143,10 @@ export interface PersistedUsageAttempt {
   streamAborted?: boolean;
   /** TTFT relative to THIS attempt's start (WP4); unset for non-streaming/tool-only. */
   firstOutputMs?: number;
+  /** High-resolution epoch time of this attempt's first physical dispatch. */
+  firstSendAt?: number;
+  /** Effective Anthropic prompt-cache lifetime represented by this physical request. */
+  promptCacheTtlMs?: number;
   sendCount: number;
   recoveryKinds: AttemptRecoveryKind[];
   /**
@@ -150,6 +154,8 @@ export interface PersistedUsageAttempt {
    * old rows keep their exact shape.
    */
   recoveryWithheld?: AttemptRecoveryWithheld[];
+  /** Number of recovery sends, including repeated occurrences of the same kind. */
+  recoveryCount?: number;
   usageStatus: UsageStatus;
   /**
    * True when the proxy answered this turn locally and issued no upstream request. It travels on
@@ -291,6 +297,22 @@ export function normalizeRequestSpend(value: unknown): PersistedRequestSpend | u
   };
 }
 
+/** One row per real upstream attempt; historical rows may lack newer identity counters. */
+export function physicalUsageAttempts<
+  T extends { ordinal?: number; sendCount?: number; locallyAnswered?: boolean },
+>(attempts: readonly T[]): T[] {
+  if (!Array.isArray(attempts)) return [];
+  const seen = new Set<number>();
+  return attempts.filter(attempt => {
+    if (!attempt || typeof attempt !== "object" || Array.isArray(attempt)) return false;
+    if (attempt.locallyAnswered === true || attempt.sendCount === 0) return false;
+    if (!Number.isInteger(attempt.ordinal)) return true;
+    if (seen.has(attempt.ordinal!)) return false;
+    seen.add(attempt.ordinal!);
+    return true;
+  });
+}
+
 export interface PersistedUsageEntry {
   requestedAlias?: string;
   requestId: string;
@@ -350,6 +372,8 @@ export interface PersistedUsageEntry {
   spend?: PersistedRequestSpend;
   /** Provenance of this row's cache detail; absent rows are reconstructed, never assumed observed. */
   cacheProvenance?: CacheTelemetryProvenance;
+  /** True only when combo execution advanced to another configured target. */
+  comboTargetAdvanced?: true;
   // Failure diagnostics (devlog/_plan/260716_claudecode_hardening/030): persisted for
   // status>=400 or non-completed terminals so incidents survive the in-memory ring buffer.
   errorCode?: string;
@@ -550,8 +574,28 @@ export function usageStatusForFinalLog(usage: OcxUsage | undefined): UsageStatus
   return usage.estimated ? "estimated" : "reported";
 }
 
+const MAX_SERVER_TOOL_USAGE_ENTRIES = 64;
+const MAX_SERVER_TOOL_USAGE_KEY_LENGTH = 128;
+const UNSAFE_SERVER_TOOL_USAGE_KEYS = new Set(["__proto__", "prototype", "constructor"]);
+
+export function normalizeServerToolUsage(value: unknown): Record<string, number> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return undefined;
+  const entries: [string, number][] = [];
+  for (const [key, count] of Object.entries(value)) {
+    if (entries.length >= MAX_SERVER_TOOL_USAGE_ENTRIES) break;
+    if (!key || key.length > MAX_SERVER_TOOL_USAGE_KEY_LENGTH
+      || UNSAFE_SERVER_TOOL_USAGE_KEYS.has(key)
+      || !isNonNegativeFiniteNumber(count)) continue;
+    entries.push([key, count]);
+  }
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+}
+
 function normalizeUsageValue(usage: OcxUsage | undefined): OcxUsage | undefined {
   if (!usage) return undefined;
+  const anthropicServerToolUse = normalizeServerToolUsage(usage.anthropicServerToolUse);
   return {
     inputTokens: usage.inputTokens,
     outputTokens: usage.outputTokens,
@@ -567,6 +611,7 @@ function normalizeUsageValue(usage: OcxUsage | undefined): OcxUsage | undefined 
     ...(typeof usage.cacheReadInputTokens === "number" ? { cacheReadInputTokens: usage.cacheReadInputTokens } : {}),
     ...(typeof usage.cacheCreationInputTokens === "number" ? { cacheCreationInputTokens: usage.cacheCreationInputTokens } : {}),
     ...(typeof usage.reasoningOutputTokens === "number" ? { reasoningOutputTokens: usage.reasoningOutputTokens } : {}),
+    ...(anthropicServerToolUse ? { anthropicServerToolUse } : {}),
     ...(usage.estimated ? { estimated: true } : {}),
   };
 }
@@ -686,14 +731,10 @@ function normalizeUsageAttempt(raw: unknown): PersistedUsageAttempt | null {
     || !USAGE_STATUSES.has(attempt.usageStatus as UsageStatus)) {
     return null;
   }
-  if ("inputTokenEstimate" in attempt
-    && !isNonNegativeFiniteNumber(attempt.inputTokenEstimate)) return null;
-  if ("firstOutputMs" in attempt
-    && !isNonNegativeFiniteNumber(attempt.firstOutputMs)) return null;
-  if ("totalTokens" in attempt
-    && !isNonNegativeFiniteNumber(attempt.totalTokens)) return null;
+  // Identity decides whether the row is trustworthy; a malformed optional telemetry field only
+  // costs that field. Dropping the whole attempt would delete a physical send from every report
+  // that sums attempts, which is a larger lie than an absent `firstOutputMs`.
   const usage = "usage" in attempt ? normalizeAttemptUsage(attempt.usage) : undefined;
-  if ("usage" in attempt && usage === null) return null;
   const tierOutcome = "tierOutcome" in attempt
     ? normalizeAttemptTierOutcome(attempt.tierOutcome)
     : undefined;
@@ -734,10 +775,22 @@ function normalizeUsageAttempt(raw: unknown): PersistedUsageAttempt | null {
     ...(isNonNegativeFiniteNumber(attempt.firstOutputMs)
       ? { firstOutputMs: attempt.firstOutputMs }
       : {}),
+    ...(isNonNegativeFiniteNumber(attempt.firstSendAt)
+      ? { firstSendAt: attempt.firstSendAt }
+      : {}),
+    ...((attempt.promptCacheTtlMs === 300_000 || attempt.promptCacheTtlMs === 3_600_000)
+      ? { promptCacheTtlMs: attempt.promptCacheTtlMs }
+      : {}),
     sendCount: attempt.sendCount as number,
     recoveryKinds,
     ...(recoveryWithheld.length ? { recoveryWithheld } : {}),
+    ...(typeof attempt.recoveryCount === "number"
+      && Number.isInteger(attempt.recoveryCount)
+      && attempt.recoveryCount >= 0
+      ? { recoveryCount: attempt.recoveryCount }
+      : {}),
     usageStatus: attempt.usageStatus as UsageStatus,
+    ...(attempt.locallyAnswered === true ? { locallyAnswered: true } : {}),
     ...(isCodexUsageAccountLogLabel(attempt.accountLogLabel)
       ? { accountLogLabel: attempt.accountLogLabel }
       : {}),
@@ -1022,6 +1075,7 @@ function normalizeUsageEntry(entry: PersistedUsageEntry): PersistedUsageEntry {
     ...(affinity ? { affinity } : {}),
     ...(affinityReason ? { affinityReason } : {}),
     ...(conversationStateScrub ? { conversationStateScrub } : {}),
+    ...(entry.comboTargetAdvanced === true ? { comboTargetAdvanced: true } : {}),
     ...(entry.errorCode ? { errorCode: entry.errorCode } : {}),
     // Validated rather than copied on truthiness, like the inbound protocol and transport phase
     // above. Harmless while these were only rendered; not harmless once the terminal status is

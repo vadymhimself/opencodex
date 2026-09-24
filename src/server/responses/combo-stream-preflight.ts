@@ -1,5 +1,8 @@
+import { isAnthropicMessageResponse, usageFromAnthropic } from "../../adapters/anthropic";
 import type { ResponsesTerminalStatus } from "../../bridge";
 import { comboFailureDecision } from "../../combos";
+import { idleDeadline } from "../../lib/abort";
+import { readBoundedResponseBytes } from "../../lib/bounded-body";
 import { httpStatusFromTerminalError } from "../../lib/errors";
 import type { RequestFailureStage } from "../../lib/request-failure-model";
 import type { RequestLogContext } from "../request-log";
@@ -14,11 +17,23 @@ const COMBO_STREAM_PREFLIGHT_MAX_CHUNKS = Math.max(
   Math.ceil(COMBO_STREAM_PREFLIGHT_MAX_BYTES / 1024),
 );
 
+function cancelWithoutWaiting(cancel: () => Promise<void>): void {
+  try {
+    void cancel().catch(() => undefined);
+  } catch {
+    // Non-conforming streams may throw synchronously from cancel().
+  }
+}
+
 const PRE_OUTPUT_CONTROL_EVENTS = new Set([
   "response.created",
   "response.in_progress",
   "response.queued",
   "response.heartbeat",
+  "message_start",
+  "message_delta",
+  "content_block_stop",
+  "ping",
 ]);
 
 const TERMINAL_EVENTS = new Set([
@@ -26,6 +41,9 @@ const TERMINAL_EVENTS = new Set([
   "response.failed",
   "response.incomplete",
 ]);
+
+/** Messages-protocol terminals, which the Anthropic replay lane must not read as output. */
+const ANTHROPIC_TERMINAL_EVENTS = new Set(["message_stop", "error"]);
 
 const RETRYABLE_ZERO_OUTPUT_INCOMPLETE_REASONS = new Set([
   "adapter_eof",
@@ -97,7 +115,8 @@ function retryableZeroOutputTerminal(payload: unknown): boolean {
   if (event.type === "response.failed") return true;
   if (event.type !== "response.incomplete") return false;
   const reason = event.response?.incomplete_details?.reason;
-  return typeof reason === "string" && RETRYABLE_ZERO_OUTPUT_INCOMPLETE_REASONS.has(reason);
+  return reason === undefined
+    || (typeof reason === "string" && RETRYABLE_ZERO_OUTPUT_INCOMPLETE_REASONS.has(reason));
 }
 
 /**
@@ -155,12 +174,22 @@ function replayBufferedResponse(
   response: Response,
   reader: ReadableStreamDefaultReader<Uint8Array>,
   buffered: Uint8Array[],
+  closeAfterBuffered = false,
 ): Response {
   let index = 0;
   const body = new ReadableStream<Uint8Array>({
     async pull(controller) {
       if (index < buffered.length) {
         controller.enqueue(buffered[index++]!);
+        if (closeAfterBuffered && index === buffered.length) {
+          controller.close();
+          cancelWithoutWaiting(() => reader.cancel("combo stream protocol terminal reached"));
+        }
+        return;
+      }
+      if (closeAfterBuffered) {
+        controller.close();
+        reader.cancel("combo stream protocol terminal reached").catch(() => undefined);
         return;
       }
       try {
@@ -172,13 +201,47 @@ function replayBufferedResponse(
       }
     },
     cancel(reason) {
-      reader.cancel(reason).catch(() => undefined);
+      cancelWithoutWaiting(() => reader.cancel(reason));
     },
   });
   return new Response(body, {
     status: response.status,
     statusText: response.statusText,
     headers: response.headers,
+  });
+}
+
+function failedStreamResponse(
+  response: Response,
+  status: number,
+  error: Record<string, unknown>,
+  usage?: unknown,
+): Response {
+  const headers = new Headers(response.headers);
+  headers.set("content-type", "application/json");
+  headers.delete("content-length");
+  headers.delete("content-encoding");
+  return new Response(JSON.stringify({
+    error,
+    // The combo classifier needs only the error and optional usage. Do not carry
+    // response ids, provider metadata, or future terminal fields into the client
+    // error envelope merely because they shared the terminal snapshot.
+    response: {
+      error,
+      ...(usage && typeof usage === "object" && !Array.isArray(usage) ? { usage } : {}),
+    },
+  }), { status, headers });
+}
+
+function failedTransportResponse(
+  response: Response,
+  status: number,
+  message: string,
+): Response {
+  return failedStreamResponse(response, status, {
+    type: status === 504 ? "timeout_error" : "upstream_error",
+    code: status === 504 ? "upstream_timeout" : "upstream_stream_error",
+    message,
   });
 }
 
@@ -204,29 +267,22 @@ function failedTerminalResponse(
         ? terminalPayload.message
         : logCtx.upstreamError ?? "Provider stream failed before producing output",
     };
-  const headers = new Headers(response.headers);
-  headers.set("content-type", "application/json");
-  headers.delete("content-length");
-  headers.delete("content-encoding");
-  const usage = terminalResponse.usage;
-  return new Response(JSON.stringify({
-    error,
-    // The combo classifier needs only the error and optional usage. Do not carry
-    // response ids, provider metadata, or future terminal fields into the client
-    // error envelope merely because they shared the terminal snapshot.
-    response: {
-      error,
-      ...(usage && typeof usage === "object" && !Array.isArray(usage) ? { usage } : {}),
-    },
-  }), {
-    status: logCtx.terminalHttpStatus ?? bareErrorStatus(terminalPayload) ?? 502,
-    headers,
-  });
+  // Bare errors carry their own status; a `response.failed` terminal has none, so classify
+  // its error instead of defaulting every such terminal to 502.
+  const status = logCtx.terminalHttpStatus
+    ?? bareErrorStatus(terminalPayload)
+    ?? httpStatusFromTerminalError({
+      type: typeof error.type === "string" ? error.type : undefined,
+      code: error.code === null || typeof error.code === "string" ? error.code : undefined,
+      message: typeof error.message === "string" ? error.message : undefined,
+    });
+  logCtx.terminalHttpStatus = status;
+  return failedStreamResponse(response, status, error, terminalResponse.usage);
 }
 
 export type ComboStreamPreflightResult =
   | { kind: "accepted"; response: Response }
-  | { kind: "failed"; response: Response }
+  | { kind: "failed"; response: Response; passthroughResponse?: Response }
   /**
    * The body errored mid-stream and `replayReadErrors` asked for the prefix back rather than
    * a rethrow. `stage` is how far the inspection actually got; whether that permits a
@@ -235,6 +291,21 @@ export type ComboStreamPreflightResult =
    * the stage became observable.
    */
   | { kind: "read-error"; response: Response; error: unknown; stage: RequestFailureStage };
+
+export interface ComboStreamPreflightOptions {
+  stallMs?: number;
+  abortSignal?: AbortSignal;
+  expectedTransport?: "sse" | "json";
+  maxJsonBytes?: number;
+  deferValidationToCaller?: boolean;
+  /** Accept an SSE body whose content-type header is absent entirely (never a wrong type). */
+  allowMissingContentType?: boolean;
+  /** Hand a post-header read failure to the caller behind the buffered prefix instead of throwing. */
+  replayReadErrors?: boolean;
+}
+
+const DEFAULT_COMBO_STREAM_PREFLIGHT_STALL_MS = 90_000;
+const DEFAULT_COMBO_JSON_PREFLIGHT_MAX_BYTES = 64 * 1024 * 1024;
 
 /**
  * Buffer a Responses SSE only until the request becomes unsafe to replay or reaches a
@@ -246,32 +317,243 @@ export type ComboStreamPreflightResult =
 export async function preflightComboStreamResponse(
   response: Response,
   logCtx: RequestLogContext,
-  retryableTerminal: (payload: unknown) => boolean = retryableZeroOutputTerminal,
-  options?: { allowMissingContentType?: boolean; replayReadErrors?: boolean },
+  // Combo callers pass their own retryable-terminal predicate positionally; the Anthropic
+  // source-replay lane passes only options. Accept both rather than fork the entry point.
+  retryableTerminalOrOptions?: ((payload: unknown) => boolean) | ComboStreamPreflightOptions,
+  positionalOptions?: ComboStreamPreflightOptions,
 ): Promise<ComboStreamPreflightResult> {
+  const retryableTerminal = typeof retryableTerminalOrOptions === "function"
+    ? retryableTerminalOrOptions
+    : retryableZeroOutputTerminal;
+  const options = (typeof retryableTerminalOrOptions === "object" && retryableTerminalOrOptions !== null
+    ? retryableTerminalOrOptions
+    : positionalOptions) ?? {};
   const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+  const deferValidationToCaller = options.deferValidationToCaller === true;
+  // A caller that names the transport it expects, or arms a stall budget, wants this preflight
+  // to police the transport: a stall, an EOF before any terminal, or a read failure becomes an
+  // HTTP failure it can classify. Every other caller keeps the relay contract, where post-header
+  // transport failures stay the relay's to own and a read error propagates.
+  const ownsTransportFailures = options.expectedTransport !== undefined || options.stallMs !== undefined;
+  if (response.ok && options.expectedTransport === "sse"
+    && (!response.body || !contentType.includes("text/event-stream"))) {
+    if (deferValidationToCaller) return { kind: "accepted", response };
+    if (response.body) {
+      cancelWithoutWaiting(() => response.body!.cancel("combo source replay required SSE"));
+    }
+    return {
+      kind: "failed",
+      response: failedTransportResponse(response, 502, "Provider returned a non-SSE response for a streaming request"),
+    };
+  }
+  if (response.ok && options.expectedTransport === "json") {
+    if (!response.body || !contentType.includes("application/json")) {
+      if (deferValidationToCaller) return { kind: "accepted", response };
+      if (response.body) {
+        cancelWithoutWaiting(() => response.body!.cancel("combo source replay required JSON"));
+      }
+      return {
+        kind: "failed",
+        response: failedTransportResponse(response, 502, "Provider returned a non-JSON response for a non-streaming request"),
+      };
+    }
+    // Direct Anthropic source replay validates and retains exact JSON in its caller.
+    // Reading here first would impose a second, unrelated size limit and turn body
+    // read failures into generic Responses errors before the Claude endpoint sees them.
+    if (deferValidationToCaller) return { kind: "accepted", response };
+    let bytes: Uint8Array<ArrayBuffer>;
+    try {
+      const body = await readBoundedResponseBytes(response, {
+        signal: options.abortSignal,
+        maxBytes: options.maxJsonBytes && options.maxJsonBytes > 0
+          ? options.maxJsonBytes
+          : DEFAULT_COMBO_JSON_PREFLIGHT_MAX_BYTES,
+        inactivityTimeoutMs: options.stallMs ?? DEFAULT_COMBO_STREAM_PREFLIGHT_STALL_MS,
+      });
+      if (body.oversized) {
+        return {
+          kind: "failed",
+          response: failedTransportResponse(response, 502, "Provider JSON response was incomplete or too large"),
+        };
+      }
+      bytes = body.bytes;
+    } catch (error) {
+      if (options.abortSignal?.aborted) throw error;
+      const timedOut = error instanceof DOMException && error.name === "TimeoutError";
+      return {
+        kind: "failed",
+        response: failedTransportResponse(
+          response,
+          timedOut ? 504 : 502,
+          timedOut ? "Provider JSON response stalled before completion" : "Provider JSON response could not be read",
+        ),
+      };
+    }
+    let payload: unknown;
+    try {
+      payload = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+    } catch {
+      if (deferValidationToCaller) {
+        return {
+          kind: "accepted",
+          response: new Response(bytes, {
+            status: response.status,
+            statusText: response.statusText,
+            headers: response.headers,
+          }),
+        };
+      }
+      return {
+        kind: "failed",
+        response: failedTransportResponse(response, 502, "Provider returned malformed JSON for a non-streaming request"),
+      };
+    }
+    if (payload && typeof payload === "object" && !Array.isArray(payload)
+      && (payload as { type?: unknown }).type === "error") {
+      const failed = failedTerminalResponse(response, payload as Record<string, unknown>, logCtx);
+      return {
+        kind: "failed",
+        response: failed,
+        passthroughResponse: new Response(bytes, {
+          status: failed.status,
+          ...(failed.status === response.status ? { statusText: response.statusText } : {}),
+          headers: response.headers,
+        }),
+      };
+    }
+    if (!isAnthropicMessageResponse(payload)) {
+      if (deferValidationToCaller) {
+        return {
+          kind: "accepted",
+          response: new Response(bytes, {
+            status: response.status,
+            statusText: response.statusText,
+            headers: response.headers,
+          }),
+        };
+      }
+      return {
+        kind: "failed",
+        response: failedTransportResponse(response, 502, "Provider returned an invalid Anthropic message response"),
+      };
+    }
+    return {
+      kind: "accepted",
+      response: new Response(bytes, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+      }),
+    };
+  }
   const isEventStream = contentType.includes("text/event-stream")
-    || (!contentType && options?.allowMissingContentType === true);
+    || (!contentType && options.allowMissingContentType === true);
   if (!response.ok || !response.body || !isEventStream) {
     return { kind: "accepted", response };
   }
 
   const reader = response.body.getReader();
+  const strictSource = options.expectedTransport === "sse";
+  const strictValidation = strictSource && !deferValidationToCaller;
   const buffered: Uint8Array[] = [];
   let bufferedBytes = 0;
   let outputCommitted = false;
   let responseCreated = false;
   let terminalStatus: ResponsesTerminalStatus | undefined;
-  let retryableTerminalPayload: Record<string, unknown> | undefined;
+  let failedPayload: Record<string, unknown> | undefined;
+  let anthropicUsage: Record<string, unknown> | undefined;
+  let protocolError: string | undefined;
+  let preflightOverflow = false;
+  let overflowFrame: Uint8Array | undefined;
+  let stalled = false;
+  let aborted = false;
+  let readerTransferred = false;
+  const signal = options.abortSignal;
+  const idle = idleDeadline(options.stallMs ?? DEFAULT_COMBO_STREAM_PREFLIGHT_STALL_MS, () => {
+    stalled = true;
+    cancelWithoutWaiting(() => reader.cancel(new DOMException("combo stream preflight stalled", "TimeoutError")));
+  });
+  const onAbort = () => {
+    aborted = true;
+    cancelWithoutWaiting(() => reader.cancel(signal?.reason));
+  };
+  if (signal?.aborted) onAbort();
+  else signal?.addEventListener("abort", onAbort, { once: true });
+  const retainAnthropicUsage = (usage: unknown): void => {
+    if (!usage || typeof usage !== "object" || Array.isArray(usage)) return;
+    const supported = Object.fromEntries(Object.entries(usage).filter(([key, value]) => (
+      typeof value === "number"
+      || (key === "server_tool_use" && value !== null && typeof value === "object" && !Array.isArray(value))
+    )));
+    anthropicUsage = { ...(anthropicUsage ?? {}), ...supported };
+    logCtx.usage = usageFromAnthropic(anthropicUsage);
+    if (logCtx.activeAttempt) logCtx.activeAttempt.usage = logCtx.usage;
+  };
   const inspector = createSseInspector({
     logCtx,
     // A payload the inspector could not parse still reached this proxy, and it may be output.
     // Committing on it is what keeps an unreadable frame from reading as an empty prelude.
     onOpaquePayload: () => { outputCommitted = true; },
+    // Anthropic source replay speaks the Messages protocol, so it needs its own terminal
+    // classifier. The combo lane keeps the standard Responses one, where a bare `error` is
+    // deliberately NOT a protocol terminal.
+    ...(strictSource
+      ? {
+          classifyTerminal: (payload: unknown) => {
+            if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+            const type = (payload as { type?: unknown }).type;
+            if (type === "message_stop") return "completed" as const;
+            if (type === "error") return "failed" as const;
+            return null;
+          },
+          stopAtTerminal: true,
+        }
+      : {}),
+    strictJsonRecords: strictValidation,
+    onValidatedFrame: strictValidation
+      ? frame => {
+          if (bufferedBytes + frame.byteLength > COMBO_STREAM_PREFLIGHT_MAX_BYTES
+            || buffered.length >= COMBO_STREAM_PREFLIGHT_MAX_CHUNKS) {
+            preflightOverflow = true;
+            overflowFrame = frame;
+            return false;
+          }
+          buffered.push(frame);
+          bufferedBytes += frame.byteLength;
+        }
+      : undefined,
+    onInspectionLimit: strictValidation ? undefined : () => { outputCommitted = true; },
+    onProtocolError: strictValidation
+      ? message => { protocolError = message; }
+      : undefined,
     onParsedPayload: payload => {
-      if (terminalStatus !== undefined || outputCommitted || retryableTerminalPayload) return;
+      if (strictSource) {
+        // Replay lane: usage accrues across the whole Messages stream, so this must keep
+        // observing after output commits.
+        const messagesType = payload && typeof payload === "object" && !Array.isArray(payload)
+          ? (payload as { type?: unknown }).type
+          : undefined;
+        if (!(typeof messagesType === "string" && ANTHROPIC_TERMINAL_EVENTS.has(messagesType))
+          && comboStreamPayloadCommitsOutput(payload)) {
+          outputCommitted = true;
+        }
+        if (!payload || typeof payload !== "object" || Array.isArray(payload)) return;
+        const event = payload as Record<string, unknown>;
+        const type = event.type;
+        if (type === "message_start") {
+          const message = event.message;
+          if (message && typeof message === "object" && !Array.isArray(message)) {
+            retainAnthropicUsage((message as Record<string, unknown>).usage);
+          }
+        } else if (type === "message_delta") {
+          retainAnthropicUsage(event.usage);
+        }
+        if (type === "error" || retryableTerminal(payload)) failedPayload = event;
+        return;
+      }
       if (payload !== null && typeof payload === "object" && !Array.isArray(payload)
         && (payload as { type?: unknown }).type === "response.created") responseCreated = true;
+      if (terminalStatus !== undefined || outputCommitted || failedPayload) return;
       const retryable = retryableTerminal(payload);
       const matchedBareError = retryable && payload !== null && typeof payload === "object"
         && !Array.isArray(payload) && (payload as { type?: unknown }).type === "error";
@@ -279,59 +561,192 @@ export async function preflightComboStreamResponse(
       // committed; unknown and retryable upstream failures may advance the combo.
       if (comboStreamPayloadCommitsOutput(payload) && !matchedBareError) outputCommitted = true;
       if (!payload || typeof payload !== "object" || Array.isArray(payload)) return;
-      if (retryable) retryableTerminalPayload = payload as Record<string, unknown>;
+      if (retryable) failedPayload = payload as Record<string, unknown>;
     },
     onTerminal: status => { terminalStatus = status; },
   });
 
+  idle.reset();
   try {
     for (;;) {
       let next: Awaited<ReturnType<typeof reader.read>>;
       try {
         next = await reader.read();
       } catch (error) {
-        if (!options?.replayReadErrors) throw error;
+        if (aborted) throw signal?.reason ?? new DOMException("request aborted", "AbortError");
+        if (stalled) {
+          if (deferValidationToCaller && strictSource) {
+            readerTransferred = true;
+            return {
+              kind: "accepted",
+              response: replayBufferedResponse(response, reader, buffered, true),
+            };
+          }
+          return {
+            kind: "failed",
+            response: failedTransportResponse(response, 504, "Provider stream stalled before producing output"),
+          };
+        }
+        if (ownsTransportFailures) {
+          if (deferValidationToCaller && strictSource) {
+            readerTransferred = true;
+            return {
+              kind: "accepted",
+              response: replayBufferedResponse(response, reader, buffered, true),
+            };
+          }
+          return {
+            kind: "failed",
+            response: failedTransportResponse(response, 502, "Provider stream read failed before producing output"),
+          };
+        }
+        if (!options.replayReadErrors) {
+          // The caller receives the errored reader through the thrown failure; cancelling it in
+          // the finally below would erase the transport failure the relay still has to see.
+          readerTransferred = true;
+          throw error;
+        }
         // The native relay still owns post-header transport failures. Preserve
         // the bounded prefix and the errored reader; cancelling it here would
         // erase the failure before either client relay or inspection sees it.
+        readerTransferred = true;
         const replay = replayBufferedResponse(response, reader, buffered);
         const stage = observedResponsesStage({ outputCommitted, terminalStatus, responseCreated });
         return { kind: "read-error", response: replay, error, stage };
       }
+      if (aborted) throw signal?.reason ?? new DOMException("request aborted", "AbortError");
+      if (stalled) {
+        if (deferValidationToCaller && strictSource) {
+          readerTransferred = true;
+          return {
+            kind: "accepted",
+            response: replayBufferedResponse(response, reader, buffered, true),
+          };
+        }
+        return {
+          kind: "failed",
+          response: failedTransportResponse(response, 504, "Provider stream stalled before producing output"),
+        };
+      }
+      if (!next.done && next.value.byteLength > 0) idle.reset();
       if (next.done) {
         inspector.finish();
       } else {
-        if (bufferedBytes + next.value.byteLength > COMBO_STREAM_PREFLIGHT_MAX_BYTES) {
-          // Keep the cap about memory the preflight allocates. The upstream chunk already exists;
-          // copying it before committing would transiently exceed the boundary for no
-          // replay benefit. Preserve it unsliced behind the already-bounded prefix.
+        const terminalOffset = inspector.feed(next.value);
+        if (strictValidation && preflightOverflow) {
+          if (overflowFrame) buffered.push(overflowFrame);
+          if (terminalOffset !== undefined && terminalOffset < next.value.byteLength) {
+            buffered.push(next.value.subarray(terminalOffset));
+          }
+          readerTransferred = true;
           return {
             kind: "accepted",
-            response: replayBufferedResponse(response, reader, [...buffered, next.value]),
+            response: replayBufferedResponse(response, reader, buffered),
           };
         }
-        const retained = next.value.slice();
-        buffered.push(retained);
-        bufferedBytes += retained.byteLength;
-        inspector.feed(retained);
+        if (!strictValidation) {
+          const throughTerminal = terminalOffset === undefined
+            ? next.value
+            : next.value.subarray(0, terminalOffset);
+          if (bufferedBytes + throughTerminal.byteLength > COMBO_STREAM_PREFLIGHT_MAX_BYTES) {
+            readerTransferred = true;
+            return {
+              kind: "accepted",
+              response: replayBufferedResponse(
+                response,
+                reader,
+                [...buffered, throughTerminal],
+                terminalOffset !== undefined,
+              ),
+            };
+          }
+          const retained = throughTerminal.slice();
+          buffered.push(retained);
+          bufferedBytes += retained.byteLength;
+        }
+      }
+
+      if (protocolError) {
+        if (outputCommitted) {
+          const payload = JSON.stringify({
+            type: "error",
+            error: {
+              type: "api_error",
+              message: `anthropic passthrough protocol error: ${protocolError}`,
+            },
+          });
+          buffered.push(new TextEncoder().encode(`event: error\ndata: ${payload}\n\n`));
+          readerTransferred = true;
+          return {
+            kind: "accepted",
+            response: replayBufferedResponse(response, reader, buffered, true),
+          };
+        }
+        return {
+          kind: "failed",
+          response: failedTransportResponse(
+            response,
+            502,
+            `Provider stream protocol error: ${protocolError}`,
+          ),
+        };
       }
 
       // A bare error event is not a protocol terminal (terminalStatus stays undefined),
       // so its retryable classification doubles as the terminal evidence.
       if ((terminalStatus === "failed" || terminalStatus === "incomplete"
-        || retryableTerminalPayload?.type === "error")
-        && !outputCommitted && retryableTerminalPayload) {
-        await reader.cancel("retrying zero-output combo stream terminal").catch(() => undefined);
-        return { kind: "failed", response: failedTerminalResponse(response, retryableTerminalPayload, logCtx) };
+        || failedPayload?.type === "error")
+        && !outputCommitted && (strictSource || failedPayload)) {
+        return {
+          kind: "failed",
+          response: failedTerminalResponse(response, failedPayload ?? {}, logCtx),
+          // The replay lane must be able to hand the client the provider's own bytes.
+          ...(strictSource
+            ? {
+                passthroughResponse: new Response(
+                  new Blob(buffered.map(chunk => Uint8Array.from(chunk).buffer)),
+                  {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers,
+                  },
+                ),
+              }
+            : {}),
+        };
+      }
+      if (ownsTransportFailures && next.done && terminalStatus === undefined && !outputCommitted) {
+        if (deferValidationToCaller && strictSource) {
+          readerTransferred = true;
+          return {
+            kind: "accepted",
+            response: replayBufferedResponse(response, reader, buffered),
+          };
+        }
+        return {
+          kind: "failed",
+          response: failedTransportResponse(response, 502, "Provider stream ended before a terminal event"),
+        };
       }
       if (next.done || terminalStatus !== undefined || outputCommitted
-        || bufferedBytes >= COMBO_STREAM_PREFLIGHT_MAX_BYTES
-        || buffered.length >= COMBO_STREAM_PREFLIGHT_MAX_CHUNKS) {
-        return { kind: "accepted", response: replayBufferedResponse(response, reader, buffered) };
+        || (!strictValidation && (
+          bufferedBytes >= COMBO_STREAM_PREFLIGHT_MAX_BYTES
+          || buffered.length >= COMBO_STREAM_PREFLIGHT_MAX_CHUNKS
+        ))) {
+        readerTransferred = true;
+        return {
+          kind: "accepted",
+          response: replayBufferedResponse(response, reader, buffered, strictSource && terminalStatus !== undefined),
+        };
       }
     }
   } finally {
+    idle.cancel();
+    signal?.removeEventListener("abort", onAbort);
     inspector.dispose();
+    if (!readerTransferred) {
+      cancelWithoutWaiting(() => reader.cancel("combo stream preflight finished"));
+    }
   }
 }
 

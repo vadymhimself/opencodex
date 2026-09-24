@@ -4399,11 +4399,15 @@ describe("OpenAI Responses forward-mode unsupported param stripping", () => {
     stream: true,
     store: false,
     max_output_tokens: 32000,
+    temperature: 0.7,
+    top_p: 0.9,
+    stop: ["DONE"],
     metadata: { user_id: "u-1" },
+    user: "u-1",
     reasoning: { effort: "low" },
   };
 
-  test("forward mode strips max_output_tokens and metadata", () => {
+  test("canonical forward mode strips unsupported sampling, metadata, and user fields", () => {
     const adapter = createResponsesPassthroughAdapter(provider);
     const request = adapter.buildRequest({
       modelId: "gpt-5.6-sol",
@@ -4415,14 +4419,49 @@ describe("OpenAI Responses forward-mode unsupported param stripping", () => {
     const body = JSON.parse(request.body) as Record<string, unknown>;
 
     expect(body).not.toHaveProperty("max_output_tokens");
+    expect(body).not.toHaveProperty("temperature");
+    expect(body).not.toHaveProperty("top_p");
+    expect(body).not.toHaveProperty("stop");
     expect(body).not.toHaveProperty("metadata");
+    expect(body).not.toHaveProperty("user");
     expect(body.reasoning).toEqual({ effort: "low" });
     expect(body.model).toBe("gpt-5.6-sol");
   });
 
-  test("forward mode is a no-op when neither field is present", () => {
+  test("noncanonical forward mode preserves public fields except metadata", () => {
+    const adapter = createResponsesPassthroughAdapter({
+      adapter: "openai-responses",
+      baseUrl: "https://relay.example/backend-api/codex",
+      authMode: "forward",
+    });
+    const request = adapter.buildRequest({
+      modelId: "gpt-5.6-sol",
+      context: { messages: [] },
+      stream: true,
+      options: {},
+      _rawBody: { ...rawBody },
+    }, meta);
+    const body = JSON.parse(request.body) as Record<string, unknown>;
+
+    expect(body.max_output_tokens).toBe(32000);
+    expect(body.temperature).toBe(0.7);
+    expect(body.top_p).toBe(0.9);
+    expect(body.stop).toEqual(["DONE"]);
+    expect(body).not.toHaveProperty("metadata");
+    expect(body.user).toBe("u-1");
+  });
+
+  test("forward mode is a no-op when none of these fields is present", () => {
     const adapter = createResponsesPassthroughAdapter(provider);
-    const { max_output_tokens: _m, metadata: _d, ...codexBody } = rawBody;
+    const {
+      max_output_tokens: _maxOutputTokens,
+      temperature: _temperature,
+      top_p: _topP,
+      stop: _stop,
+      metadata: _metadata,
+      user: _user,
+      ...codexBody
+    } = rawBody;
     const request = adapter.buildRequest({
       modelId: "gpt-5.6-sol",
       context: { messages: [] },
@@ -4436,7 +4475,7 @@ describe("OpenAI Responses forward-mode unsupported param stripping", () => {
     expect(body.store).toBe(false);
   });
 
-  test("key-auth mode preserves max_output_tokens and metadata", () => {
+  test("key-auth mode preserves all public fields", () => {
     const adapter = createResponsesPassthroughAdapter({
       adapter: "openai-responses",
       baseUrl: "https://api.openai.example/v1",
@@ -4453,7 +4492,11 @@ describe("OpenAI Responses forward-mode unsupported param stripping", () => {
     const body = JSON.parse(request.body) as Record<string, unknown>;
 
     expect(body.max_output_tokens).toBe(32000);
+    expect(body.temperature).toBe(0.7);
+    expect(body.top_p).toBe(0.9);
+    expect(body.stop).toEqual(["DONE"]);
     expect(body.metadata).toEqual({ user_id: "u-1" });
+    expect(body.user).toBe("u-1");
   });
 });
 

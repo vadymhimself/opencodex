@@ -23,6 +23,8 @@ interface ExchangeOptions {
   sseFallback: typeof globalThis.fetch;
   onQuota?: CodexWsQuotaObserver;
   beforeDispatch?: (headers: Headers) => void;
+  /** Records one actual model-request dispatch after transport admission succeeds. Must not throw. */
+  onTransportDispatch?: (headers: Headers) => void;
   /** Bun version string the caller gated on; stamped onto the stage record. */
   bunVersion?: string;
 }
@@ -92,7 +94,8 @@ function wrappedRejectionResponse(payload: Record<string, unknown>, prelude: Hea
 
 /** The sole SSE exchange state machine for both one-shot and retained sockets. */
 export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
-  const { session, url, init, prepared, sseFallback, onQuota, beforeDispatch, bunVersion, nativeControl, beforeContinuation } = options;
+  const { session, url, init, prepared, sseFallback, onQuota, beforeDispatch, bunVersion, nativeControl, beforeContinuation,
+    onTransportDispatch } = options;
   const { frameText, headers } = prepared;
   const signal = init.signal ?? undefined;
   return new Promise<Response>((resolve, reject) => {
@@ -426,6 +429,14 @@ export function codexWsExchange(options: ExchangeOptions): Promise<Response> {
         cleanup();
         session.dispose();
         resolve(sseFallback(url, init));
+        return;
+      }
+      // Counted only once the frame left: `sent` is armed before the send so a synchronous
+      // upstream error still converts, but a dispatch that threw never happened.
+      try {
+        onTransportDispatch?.(new Headers(headers));
+      } catch (error) {
+        failStream(error);
         return;
       }
       if (!metadata) commitResponse();

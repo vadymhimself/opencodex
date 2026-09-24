@@ -4,10 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ProviderAdapter } from "../../src/adapters/base";
 import { clearGenericFailoverHealth } from "../../src/oauth/generic-account-failover";
+import {
+  resetProviderRequestPacingForTest,
+  setProviderRequestPacingLimitsForTest,
+} from "../../src/providers/request-pacing";
 import { getAccountSet, getCredential, saveCredential, setActiveAccount } from "../../src/oauth/store";
 import type { AdapterEvent, OcxConfig, OcxProviderConfig } from "../../src/types";
 import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
+import type { RequestLogContext } from "../../src/server/request-log";
 
 const actualResolver = await import("../../src/server/adapter-resolve");
 const actualResolveAdapter = actualResolver.resolveAdapter;
@@ -200,10 +205,17 @@ describe("#2568 adapter-event OAuth failover", () => {
         [{ type: "text_delta", text: "alternate answer" }, { type: "done" }],
       ];
 
-      const response = await handleResponses(request(stream), config(), { model: "", provider: "" });
+      const logCtx: RequestLogContext = { model: "", provider: "" };
+      const response = await handleResponses(request(stream), config(), logCtx);
       const body = await response.text();
 
       expect(attemptKeys).toEqual(["cursor-access-1", "cursor-access-0"]);
+      expect(logCtx.attempts).toMatchObject([
+        { status: 429, sendCount: 1 },
+        { sendCount: 1, recoveryKinds: ["oauth-account-429"] },
+      ]);
+      expect(logCtx.attempts?.[1]?.accountLogLabel)
+        .not.toBe(logCtx.attempts?.[0]?.accountLogLabel);
       expect(body).toContain("alternate answer");
       expect(body).not.toContain("Cursor rate limit exceeded");
       expect(getCredential("cursor")?.access).toBe("cursor-access-0");
@@ -244,6 +256,33 @@ describe("#2568 adapter-event OAuth failover", () => {
     await setActiveAccount("cursor", accounts[0]!.id);
     await (await handleResponses(request(false), config(false), { model: "", provider: "" })).text();
     expect(attemptCredentialIdentities[1]).not.toBe(attemptCredentialIdentities[3]);
+  });
+
+  test("a rotated credential rejected by pacing creates no phantom attempt", async () => {
+    await seedAccounts(2);
+    physicalSends = 1;
+    attempts = [
+      [{ type: "error", message: "Cursor rate limit exceeded: resource_exhausted" }],
+      [{ type: "text_delta", text: "must not dispatch" }, { type: "done" }],
+    ];
+    const runtimeConfig = config();
+    runtimeConfig.providers.cursor!.requestPacing = { enabled: true, minIntervalMs: 60_000 };
+    runtimeConfig.providers.cursor!.fetch = async () => {
+      setProviderRequestPacingLimitsForTest({ maxQueueDepth: 0 });
+      return new Response();
+    };
+    const logCtx: RequestLogContext = { model: "", provider: "" };
+
+    try {
+      const response = await handleResponses(request(true), runtimeConfig, logCtx);
+      await response.text();
+    } finally {
+      resetProviderRequestPacingForTest();
+    }
+
+    expect(attemptKeys).toEqual(["cursor-access-1"]);
+    expect(logCtx.attempts).toHaveLength(1);
+    expect(logCtx.attempts?.[0]).toMatchObject({ sendCount: 1 });
   });
 
   test("a single account is a strict no-op", async () => {

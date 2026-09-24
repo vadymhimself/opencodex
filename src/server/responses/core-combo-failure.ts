@@ -1,7 +1,9 @@
 import { parseRetryAfterMs } from "../../combos";
 import type { ConsumedComboFailure, HandleResponsesOptions } from "./core-options";
 import type { OcxUsage } from "../../types";
-import { readBoundedResponseBody } from "../../lib/bounded-body";
+import { readBoundedResponseBody, readBoundedResponseBytes } from "../../lib/bounded-body";
+import { isAnthropicSourceReplayResponse, markAnthropicSourceReplayResponse } from "../relay";
+import { MAX_UPSTREAM_JSON_BODY_BYTES } from "./core-lifetime";
 import { codexQuotaFailureMessage, codexQuotaOutcomeMeta } from "./core-codex-account";
 import {
   isRateLimitOrQuotaFailureMessage,
@@ -35,6 +37,8 @@ export async function consumeComboFailure(
   // rebuilt as a new one that would otherwise lose it.
   const nonReplayable = isNonReplayableResponse(response);
   const fallback = `Provider error ${response.status}`;
+  const preserveSourceResponse = isAnthropicSourceReplayResponse(response);
+  let passthroughResponse: Response | undefined;
   let classificationText = fallback;
   let usage: OcxUsage | undefined;
   let upstreamCode: string | undefined;
@@ -47,7 +51,22 @@ export async function consumeComboFailure(
   let quotaConfirmedByBody = false;
   const serverError = response.status >= 500 && response.status < 600;
   try {
-    const body = await readBoundedResponseBody(response, { signal, reportUtf8Validity: serverError });
+    // A replayed source keeps Anthropic's exact bytes, so retain them and re-wrap rather than
+    // handing the caller back what the bounded reader normalized.
+    const body = await readBoundedResponseBody(response, {
+      signal,
+      reportUtf8Validity: serverError,
+      ...(preserveSourceResponse
+        ? { retainBytes: true, maxBytes: MAX_UPSTREAM_JSON_BODY_BYTES, inactivityTimeoutMs: 90_000 }
+        : {}),
+    });
+    if (body.bytes) {
+      passthroughResponse = markAnthropicSourceReplayResponse(new Response(body.bytes, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+      }));
+    }
     // A 5xx body counts as quota or classification evidence only when it decoded as valid
     // UTF-8, matching shouldRetryCodexPoolAccountQuota. A malformed byte keeps the status-only
     // fallback, with one exception: a cyber-policy refusal must still stop the combo, so the
@@ -116,6 +135,7 @@ export async function consumeComboFailure(
     response: failureResponse,
     ...(nonReplayable ? { nonReplayable: true } : {}),
     classificationText,
+    ...(passthroughResponse ? { passthroughResponse } : {}),
     ...(normalizedUpstreamCode !== undefined ? { upstreamCode: normalizedUpstreamCode } : {}),
     ...(!cyberFailure && cooldownRetryAfter !== undefined ? { retryAfter: cooldownRetryAfter } : {}),
     // The EFFECTIVE classification decides, not the raw status. An upstream that wraps a quota

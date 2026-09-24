@@ -447,6 +447,7 @@ describe("web-search timeout runtime contracts", () => {
       async parseResponse() { return [{ type: "done" }]; },
     };
 
+    const started = performance.now();
     try {
       const response = await runWithWebSearch(deps(firstAdapter, {
         connectTimeoutMs,
@@ -456,6 +457,9 @@ describe("web-search timeout runtime contracts", () => {
         },
       }));
 
+      // A never-settling cancel must not hold the rotation: the whole turn stays well inside
+      // the per-test budget.
+      expect(performance.now() - started).toBeLessThan(500);
       expect(cancelCalls).toBe(1);
       expect(cancelSettled).toBe(false);
       expect(rotations).toBe(1);

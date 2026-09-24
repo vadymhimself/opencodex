@@ -318,12 +318,36 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(value) ?? "null";
 }
 
+const ANTHROPIC_COUNT_INPUT_FIELDS = [
+  "cache_control",
+  "context_management",
+  "mcp_servers",
+  "messages",
+  "model",
+  "output_config",
+  "system",
+  "thinking",
+  "tool_choice",
+  "tools",
+] as const;
+
+/** Stable key shared by count_tokens and its matching Messages request. */
+export function anthropicRequestCorrelationKey(raw: unknown): string | undefined {
+  if (!isRec(raw)) return undefined;
+  const normalized: Rec = {};
+  for (const field of ANTHROPIC_COUNT_INPUT_FIELDS) {
+    if (Object.hasOwn(raw, field)) normalized[field] = raw[field];
+  }
+  return createHash("sha256").update(canonicalJson(normalized)).digest("hex");
+}
+
 /** Provenance of the generated prompt_cache_key (never serialized into the wire body). */
 export type ClaudeCacheKeySource = "metadata" | "system" | null;
 
 export interface ClaudeInboundTranslation {
   body: Rec;
   cacheKeySource: ClaudeCacheKeySource;
+  requiresExactAnthropicReplay: boolean;
 }
 
 /**
@@ -427,8 +451,8 @@ function translateAnthropicRequest(
     }
   }
 
-  const tools = toolsToResponses(raw.tools);
-  if (tools) body.tools = tools;
+  const translatedTools = toolsToResponses(raw.tools);
+  if (translatedTools.tools) body.tools = translatedTools.tools;
   toolChoiceToResponses(raw.tool_choice, body);
 
   if (typeof raw.max_tokens === "number") body.max_output_tokens = raw.max_tokens;
@@ -501,5 +525,10 @@ function translateAnthropicRequest(
     body.reasoning = reasoning;
   }
 
-  return { body, cacheKeySource };
+  return {
+    body,
+    cacheKeySource,
+    requiresExactAnthropicReplay:
+      translatedTools.requiresExactAnthropicReplay || Object.hasOwn(raw, "mcp_servers"),
+  };
 }

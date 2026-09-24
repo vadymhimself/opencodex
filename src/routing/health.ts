@@ -17,6 +17,7 @@
  */
 
 import type { OcxConfig } from "../types";
+import { physicalUsageAttempts, type PersistedUsageAttempt } from "../usage/log";
 import { openRequestHistoryIndexSync, requestHistoryDb } from "./history/indexer";
 import { OPENAI_CODEX_PROVIDER_ID } from "../providers/openai-tiers";
 import {
@@ -89,8 +90,11 @@ interface HealthSample {
   status: number;
   closeReason: string | null;
   terminalStatus: string | null;
+  streamAborted?: boolean;
   durationMs: number;
   timestamp: number;
+  rowOrder?: number;
+  attemptOrder?: number;
 }
 
 interface HealthRow extends HealthSample {
@@ -105,31 +109,47 @@ interface HealthRow extends HealthSample {
  * as a non-final attempt must still contribute its own health samples.
  */
 function attemptSamplesFor(
-  row: Pick<HealthRow, "timestamp" | "attemptCount" | "rowJson">,
+  row: Pick<HealthRow, "timestamp" | "rowOrder" | "rowJson">,
   provider: string,
   model: string,
-): HealthSample[] {
-  if (!row.rowJson || (row.attemptCount ?? 1) <= 1) return [];
+): HealthSample[] | undefined {
+  if (!row.rowJson) return undefined;
   try {
-    const parsed = JSON.parse(row.rowJson) as { attempts?: unknown };
-    if (!Array.isArray(parsed.attempts)) return [];
+    const parsed = JSON.parse(row.rowJson) as {
+      attempts?: unknown;
+      closeReason?: unknown;
+      terminalStatus?: unknown;
+    };
+    if (!Array.isArray(parsed.attempts)) return undefined;
+    const persistedAttempts = parsed.attempts.filter(
+      attempt => attempt && typeof attempt === "object" && !Array.isArray(attempt),
+    ) as PersistedUsageAttempt[];
+    const attempts = physicalUsageAttempts(persistedAttempts);
+    const finalAttempt = attempts.at(-1);
     const samples: HealthSample[] = [];
-    for (const attempt of parsed.attempts) {
-      if (!attempt || typeof attempt !== "object" || Array.isArray(attempt)) continue;
-      const record = attempt as Record<string, unknown>;
+    for (const [attemptOrder, attempt] of attempts.entries()) {
+      const record = attempt as unknown as Record<string, unknown>;
       if (record.provider !== provider || record.model !== model) continue;
       if (typeof record.status !== "number" || typeof record.durationMs !== "number") continue;
+      const isFinal = attempt === finalAttempt;
       samples.push({
         status: record.status,
-        closeReason: null,
-        terminalStatus: null,
+        closeReason: isFinal && typeof parsed.closeReason === "string"
+          ? parsed.closeReason
+          : null,
+        terminalStatus: isFinal && typeof parsed.terminalStatus === "string"
+          ? parsed.terminalStatus
+          : null,
+        ...(record.streamAborted === true ? { streamAborted: true } : {}),
         durationMs: record.durationMs,
         timestamp: row.timestamp,
+        rowOrder: row.rowOrder,
+        attemptOrder,
       });
     }
     return samples;
   } catch {
-    return [];
+    return undefined;
   }
 }
 
@@ -205,6 +225,7 @@ export function policyCandidateHealthEvidence(
 
 function classifySample(sample: HealthSample): "success" | "failure" | "neutral" {
   if (sample.closeReason === "client_cancel" || sample.status === 499) return "neutral";
+  if (sample.streamAborted) return "failure";
   // Invalid requests and policy refusals must not poison target health.
   if (sample.status >= 400 && sample.status < 500 && sample.status !== 429) return "neutral";
   if (sample.terminalStatus === "incomplete") return "failure";
@@ -243,10 +264,10 @@ function computeHistoricalHealthEvidence(
     }
     const rows = handle.query(
       `SELECT status, close_reason AS closeReason, terminal_status AS terminalStatus,
-              duration_ms AS durationMs, timestamp,
+              duration_ms AS durationMs, timestamp, rowid AS rowOrder,
               attempt_count AS attemptCount, row_json AS rowJson
        FROM requests WHERE ${where.join(" AND ")}
-       ORDER BY timestamp DESC LIMIT ?`,
+       ORDER BY timestamp DESC, rowid DESC LIMIT ?`,
     ).all(...values, HEALTH_MAX_SAMPLES) as HealthRow[];
     // Rows whose top-level target differs from this candidate may still carry
     // candidate attempts (combo/failover): expand those too. The serialized
@@ -254,12 +275,13 @@ function computeHistoricalHealthEvidence(
     // rows that cannot contribute samples for this candidate.
     const escapeLike = (value: string): string => value.replace(/[\\%_]/g, match => `\\${match}`);
     const attemptRows = handle.query(
-      `SELECT timestamp, attempt_count AS attemptCount, row_json AS rowJson
-       FROM requests WHERE timestamp >= ? AND attempt_count > 1
+      `SELECT timestamp, rowid AS rowOrder,
+              attempt_count AS attemptCount, row_json AS rowJson
+       FROM requests WHERE timestamp >= ? AND attempt_count > 0
          AND row_json LIKE ? ESCAPE '\\'
          AND row_json LIKE ? ESCAPE '\\'
          AND NOT (provider = ? AND model = ?)
-       ORDER BY timestamp DESC LIMIT ?`,
+       ORDER BY timestamp DESC, rowid DESC LIMIT ?`,
     ).all(
       now - HEALTH_WINDOW_MS,
       `%\"provider\":\"${escapeLike(input.provider)}\"%`,
@@ -268,20 +290,23 @@ function computeHistoricalHealthEvidence(
       input.model,
       HEALTH_MAX_SAMPLES,
     ) as Array<
-      Pick<HealthRow, "timestamp" | "attemptCount" | "rowJson">
+      Pick<HealthRow, "timestamp" | "rowOrder" | "rowJson">
     >;
 
     const samples: HealthSample[] = [];
     for (const row of rows) {
-      const attemptSamples = attemptSamplesFor(row, input.provider, input.model);
-      samples.push(...(attemptSamples.length > 0 ? attemptSamples : [row]));
+      samples.push(...(attemptSamplesFor(row, input.provider, input.model) ?? [row]));
     }
     for (const row of attemptRows) {
-      samples.push(...attemptSamplesFor(row, input.provider, input.model));
+      samples.push(...(attemptSamplesFor(row, input.provider, input.model) ?? []));
     }
-    // Newest first for the consecutive-failure walk; attempt samples inherit
-    // their row's timestamp.
-    samples.sort((a, b) => b.timestamp - a.timestamp);
+    // Newest physical send first for the consecutive-failure walk. SQLite
+    // insertion order breaks equal-timestamp row ties; attempt order breaks
+    // ties between retries stored under one logical request.
+    samples.sort((a, b) =>
+      b.timestamp - a.timestamp
+      || (b.rowOrder ?? 0) - (a.rowOrder ?? 0)
+      || (b.attemptOrder ?? 0) - (a.attemptOrder ?? 0));
 
     let successes = 0;
     let failures = 0;
@@ -301,7 +326,7 @@ function computeHistoricalHealthEvidence(
         failures += 1;
         weightedTotal += weight;
       }
-      if (sample.terminalStatus === "incomplete") incompleteStreams += 1;
+      if (sample.terminalStatus === "incomplete" || sample.streamAborted) incompleteStreams += 1;
       latencies.push(sample.durationMs);
     }
     // Consecutive failures: walk newest -> oldest until a success.

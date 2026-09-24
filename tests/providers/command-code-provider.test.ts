@@ -800,6 +800,48 @@ describe("Command Code provider", () => {
     expect(JSON.parse(bareBuilt.body).params.tools).toEqual(tools);
   });
 
+  test("starts the response-header timeout after provider pacing", async () => {
+    let pacingCalls = 0;
+    let physicalSends = 0;
+    const waitForPacing = (signal?: AbortSignal) => new Promise<void>((resolve, reject) => {
+      pacingCalls += 1;
+      const onAbort = () => {
+        clearTimeout(timer);
+        reject(signal?.reason);
+      };
+      const timer = setTimeout(() => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve();
+      }, 40);
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
+    const unpacedFetch = Object.assign(
+      async () => {
+        physicalSends += 1;
+        return new Response("{}", { status: 200 });
+      },
+      { preconnect: () => {} },
+    ) as typeof globalThis.fetch;
+    const executor = Object.assign(
+      async (input: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) => {
+        await waitForPacing(init?.signal);
+        return unpacedFetch(input, init);
+      },
+      { preconnect: () => {}, waitForPacing, unpacedFetch },
+    ) as typeof globalThis.fetch;
+    const adapter = createCommandCodeAdapter(provider);
+    const request = await adapter.buildRequest(parsed());
+
+    const response = await adapter.fetchResponse!(request, {
+      executor,
+      timeoutMs: 10,
+    });
+
+    expect(response.status).toBe(200);
+    expect(pacingCalls).toBe(1);
+    expect(physicalSends).toBe(1);
+  });
+
   test.each(["fallback", "supplied", "prepaid"] as const)("refreshes stale effort metadata separately from inference executor (%s)", async mode => {
     const supplied = mode !== "fallback";
     const requests: Array<{ url: string; body?: string }> = [];

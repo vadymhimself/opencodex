@@ -91,6 +91,24 @@ describe("empty-completion guard retry", () => {
     ]);
   });
 
+  test("native Anthropic server output is content and is never retried", async () => {
+    let continuations = 0;
+    const block = {
+      type: "anthropic_server_block" as const,
+      block: { type: "web_fetch_tool_result", tool_use_id: "srvtoolu_1", content: [] },
+    };
+    const events = await collect(guardEmptyCompletionEventStream({
+      firstEvents: eventsOf(block, { type: "done", stopReason: "pause_turn" }),
+      continuation: () => {
+        continuations += 1;
+        return eventsOf();
+      },
+    }));
+
+    expect(continuations).toBe(0);
+    expect(events).toEqual([block, { type: "done", stopReason: "pause_turn" }]);
+  });
+
   test("a reasoning-only terminal turn is retried once and the identical-turn retry succeeds", async () => {
     let continuations = 0;
     const events = await collect(guardEmptyCompletionEventStream({
@@ -110,11 +128,12 @@ describe("empty-completion guard retry", () => {
     }));
 
     expect(continuations).toBe(1);
-    // The first attempt's buffered reasoning is released in order, then the
-    // retry's reasoning, then the content, then the merged-usage terminal.
+    // First attempt reasoning is released in order, then an explicit attempt
+    // boundary, retry reasoning, content, and merged-usage terminal.
     expect(withoutHeartbeats(events)).toEqual([
       { type: "thinking_delta", thinking: "first attempt" },
       { type: "reasoning_raw_delta", text: "raw" },
+      { type: "assistant_boundary" },
       { type: "thinking_delta", thinking: "second attempt" },
       { type: "text_delta", text: "finally an answer" },
       { type: "done", usage: { inputTokens: 30, outputTokens: 5, totalTokens: 35 } },
@@ -320,7 +339,7 @@ describe("empty-completion guard retry", () => {
 
     expect(continuations).toBe(1);
     expect(events.map(event => event.type)).toEqual([
-      "heartbeat", "heartbeat", "thinking_delta", "text_delta", "done",
+      "heartbeat", "heartbeat", "thinking_delta", "assistant_boundary", "text_delta", "done",
     ]);
   });
 
@@ -340,6 +359,7 @@ describe("empty-completion guard retry", () => {
     expect(continuations).toBe(1);
     expect(withoutHeartbeats(events)).toEqual([
       { type: "thinking_delta", thinking: "..." },
+      { type: "assistant_boundary" },
       { type: "text_delta", text: "recovered" },
       { type: "done" },
     ]);

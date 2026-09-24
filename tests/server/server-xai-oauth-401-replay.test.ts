@@ -11,6 +11,7 @@ import { startServer } from "../../src/server";
 import type { OcxConfig } from "../../src/types";
 import { installIsolatedCodexHome, type IsolatedCodexHome } from "../helpers/isolated-codex-home";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
+import { clearGenericFailoverHealth } from "../../src/oauth/generic-account-failover";
 
 const TOKEN_ENDPOINT = "https://auth.x.ai/oauth/token";
 const OAUTH_RESPONSES_ENDPOINT = `${XAI_GROK_CLI_BASE_URL}/responses`;
@@ -30,9 +31,11 @@ beforeEach(() => {
   isolatedCodexHome = installIsolatedCodexHome("ocx-xai-401-codex-");
   testDir = mkdtempSync(join(tmpdir(), "ocx-xai-401-"));
   process.env.OPENCODEX_HOME = testDir;
+  clearGenericFailoverHealth();
 });
 
 afterEach(() => {
+  clearGenericFailoverHealth();
   globalThis.fetch = originalFetch;
   if (previousHome === undefined) delete process.env.OPENCODEX_HOME;
   else process.env.OPENCODEX_HOME = previousHome;
@@ -49,6 +52,18 @@ async function seedOAuth(expires = Date.now() + 3_600_000): Promise<void> {
     accountId: "xai-test-account",
     source: "oauth",
   });
+}
+
+async function seedOAuthAccounts(): Promise<void> {
+  for (let index = 0; index < 2; index += 1) {
+    await saveCredential("xai", {
+      access: `account-access-${index}`,
+      refresh: `account-refresh-${index}`,
+      expires: Date.now() + 3_600_000,
+      accountId: `xai-account-${index}`,
+      source: "oauth",
+    }, { addAccount: true });
+  }
 }
 
 function xaiConfig(authMode: "oauth" | "key" = "oauth"): OcxConfig {
@@ -97,8 +112,9 @@ async function post(server: ReturnType<typeof startServer>): Promise<Response> {
 function installOAuthFetch(
   chatStatuses: number[],
   options: { tokenErrorDescription?: string } = {},
-): { chatAuth: string[]; counts: { refresh: number } } {
+): { chatAuth: string[]; refreshTokens: string[]; counts: { refresh: number } } {
   const chatAuth: string[] = [];
+  const refreshTokens: string[] = [];
   const counts = { refresh: 0 };
   globalThis.fetch = (async (input, init) => {
     const url = input instanceof Request ? input.url : String(input);
@@ -110,6 +126,7 @@ function installOAuthFetch(
     }
     if (url === TOKEN_ENDPOINT) {
       counts.refresh += 1;
+      refreshTokens.push(new URLSearchParams(String(init?.body)).get("refresh_token") ?? "");
       if (options.tokenErrorDescription !== undefined) {
         return new Response(JSON.stringify({
           error: "temporarily_unavailable",
@@ -138,11 +155,17 @@ function installOAuthFetch(
           headers: { "content-type": "application/json" },
         });
       }
+      if (status !== 200) {
+        return new Response(JSON.stringify({ error: { message: "rate limited" } }), {
+          status,
+          headers: { "content-type": "application/json", "retry-after": "30" },
+        });
+      }
       return new Response(successBody("ok after refresh"), { headers: { "content-type": "application/json" } });
     }
     return originalFetch(input, init);
   }) as typeof fetch;
-  return { chatAuth, counts };
+  return { chatAuth, refreshTokens, counts };
 }
 
 describe("xAI OAuth Responses opt-in upstream 401 replay", () => {
@@ -218,6 +241,43 @@ describe("xAI OAuth Responses opt-in upstream 401 replay", () => {
       expect(persisted).not.toContain("rejected-access");
       expect(persisted).not.toContain("fresh-access");
       expect(persisted).not.toContain("xai-test-account");
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  test("native Responses 429 rotates to the alternate OAuth account", async () => {
+    await seedOAuthAccounts();
+    saveConfig(xaiConfig());
+    const observed = installOAuthFetch([429, 200]);
+    const server = startServer(0);
+    try {
+      const response = await post(server);
+      expect(response.status).toBe(200);
+      expect(observed.chatAuth).toEqual([
+        "Bearer account-access-1",
+        "Bearer account-access-0",
+      ]);
+      expect(observed.counts.refresh).toBe(0);
+    } finally {
+      await server.stop(true);
+    }
+  });
+
+  test("401 after native 429 rotation refreshes the account that received the replay", async () => {
+    await seedOAuthAccounts();
+    saveConfig(xaiConfig());
+    const observed = installOAuthFetch([429, 401, 200]);
+    const server = startServer(0);
+    try {
+      const response = await post(server);
+      expect(response.status).toBe(200);
+      expect(observed.chatAuth).toEqual([
+        "Bearer account-access-1",
+        "Bearer account-access-0",
+        "Bearer fresh-access",
+      ]);
+      expect(observed.refreshTokens).toEqual(["account-refresh-0"]);
     } finally {
       await server.stop(true);
     }

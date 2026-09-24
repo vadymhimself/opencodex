@@ -821,6 +821,11 @@ export async function executeComboResponses(
       // Waiting or recovery may have observed cancellation after the check above.
       if (options.abortSignal?.aborted) return clientCancelledResponse();
       adoptFailedChildLog(childLog);
+    } else {
+      // One logical request that moved to another target. Without this flag the analytics
+      // row is written but `comboFailoverRequests` counts zero forever, so a combo that
+      // failed over all day reports as if it never did.
+      logCtx.comboTargetAdvanced = true;
     }
   }
   if (

@@ -564,6 +564,7 @@ export function estimateAttemptCost(
   serviceTier?: ServiceTierInput,
   userOverlays: readonly ExpectedPriceOverlay[] = activeUserCostOverlays(),
 ): AttemptCostEstimate | null {
+  if (attempt.usageStatus !== "reported" && attempt.usageStatus !== "estimated") return null;
   if (!attempt.usage) return null;
   const tokens = normalizeCostTokens(attempt.usage);
   if (!tokens) return null;
@@ -652,6 +653,7 @@ export function estimateRequestCost(
   overlays: readonly ExpectedPriceOverlay[] = EXPECTED_PRICE_OVERLAYS,
   userOverlays: readonly ExpectedPriceOverlay[] = activeUserCostOverlays(),
 ): CostEstimate | null {
+  if (input.usageStatus !== "reported" && input.usageStatus !== "estimated") return null;
   if (!input.usage) return null;
   const tokens = normalizeCostTokens(input.usage);
   if (!tokens) return null;

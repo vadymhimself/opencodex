@@ -20,6 +20,12 @@ import type { UpstreamHostAdmissionLease } from "../../codex/upstream-host-healt
 export interface ConsumedComboFailure {
   response: Response;
   classificationText: string;
+  /**
+   * The upstream body re-wrapped verbatim, set only when the failed attempt was a canonical
+   * Anthropic source replay. A combo that gives up must hand the caller Anthropic's own error
+   * bytes rather than a re-encoded summary.
+   */
+  passthroughResponse?: Response;
   /** Structured upstream `error.code` when present in the failure body. */
   upstreamCode?: string;
   /** Valid numeric/date value used only for cooldown calculation. */

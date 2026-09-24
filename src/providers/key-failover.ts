@@ -29,7 +29,9 @@ interface KeyCooldown {
 }
 
 const DEFAULT_COOLDOWN_MS = 60_000;
-const MAX_COOLDOWN_MS = 10 * 60_000; // cap at 10 min for api-key rotation
+const MAX_COOLDOWN_MS = 60_000; // cap at 60s for api-key rotation
+// A 401 is not a rate limit: a revoked key stays rejected until replaced.
+const AUTH_REJECT_HOLD_MS = 10 * 60_000;
 
 /**
  * Cap for a cooldown the upstream itself dated, as opposed to one we inferred.
@@ -743,7 +745,7 @@ function rotateKeyAfterFailure(
     // until an operator replaces it, and upstreams send no Retry-After for it. Hold it for the
     // full cap instead of the 429 default so a dead key is not re-tried once a minute.
     const cooldownMs = failureStatus === 401
-      ? MAX_COOLDOWN_MS
+      ? AUTH_REJECT_HOLD_MS
       // A reset instant the upstream dated outranks both the header and the
       // default: it is the only one of the three that knows when the quota
       // actually returns (#4024).

@@ -230,11 +230,14 @@ export function coolComboTarget(
   const cooldownMs = serverDelayMs
     ?? parseResetCooldownMs(options?.resetAt, now)
     ?? options?.cooldownMs
-    ?? (isTransientRequestRateLimit({
-      status: options?.status,
-      code: options?.code,
-      message: options?.message,
-    }) ? COMBO_REQUEST_RATE_COOLDOWN_MS : DEFAULT_COOLDOWN_MS);
+    // A depleted account window rolls in hours, so the 60s default re-sends to a dead account
+    // every minute: 72h of production ledger showed 942 such doomed sends on one Codex window.
+    ?? (isAccountWindowExhausted(options?.message ?? "", options?.code) ? MAX_COOLDOWN_MS
+      : isTransientRequestRateLimit({
+        status: options?.status,
+        code: options?.code,
+        message: options?.message,
+      }) ? COMBO_REQUEST_RATE_COOLDOWN_MS : DEFAULT_COOLDOWN_MS);
   targetCooldowns.set(cooldownMapKey(comboId, target), {
     // Local fallbacks are capped at ten minutes; explicit server delays at one day.
     cooldownUntil: now + (serverDelayMs ?? Math.min(Math.max(cooldownMs, 1), MAX_COOLDOWN_MS)),
@@ -303,6 +306,19 @@ export type ComboFailureCooldownScope = "none" | "target" | "provider";
 
 function normalizedFailureCode(code?: string | null): string {
   return code?.trim().toLowerCase().replaceAll("-", "_") ?? "";
+}
+
+/**
+ * A depleted account window, used ONLY to choose the cooldown duration. Status is deliberately
+ * not consulted: the ChatGPT Codex backend reports a spent plan window as HTTP 502
+ * `upstream_server_error`, never the documented 429, so {@link isProviderScopedQuotaCap} cannot
+ * see it and the target kept the generic 60s cooldown. It stays out of the scope and hop
+ * decisions on purpose — the evidence is a model window, not the whole provider.
+ */
+const ACCOUNT_EXHAUSTION_CODES = new Set(["usage_limit_exceeded", "usage_limit_reached"]);
+function isAccountWindowExhausted(message: string, code?: string | null): boolean {
+  return ACCOUNT_EXHAUSTION_CODES.has(normalizedFailureCode(code))
+    || /usage limit (?:has been )?reached/.test(message.toLowerCase());
 }
 
 function isProviderScopedQuotaCap(

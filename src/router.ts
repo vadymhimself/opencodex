@@ -71,6 +71,12 @@ export class NoEligiblePolicyCandidateError extends Error {
   }
 }
 
+interface RouteModelOptions {
+  comboEligible?: (target: ComboPick["target"]) => boolean;
+  comboRequestCompatible?: (target: ComboPick["target"]) => boolean;
+  comboRandomSeed?: string;
+}
+
 export interface RouteResult {
   providerName: string;
   provider: OcxProviderConfig;
@@ -528,6 +534,8 @@ export function comboRouteDecisionTrace(
   comboId: string,
   pick: ComboPick,
   requestedModel: string,
+  eligible?: (target: ComboPick["target"]) => boolean,
+  requestCompatible: (target: ComboPick["target"]) => boolean = eligible ?? (() => true),
 ): RouteDecisionTraceV1 {
   const combo = getCombo(config, comboId);
   return buildRouteDecisionTrace({
@@ -542,7 +550,9 @@ export function comboRouteDecisionTrace(
         ? { tieBreak: combo.strategy }
         : {}),
     },
-    candidates: combo ? comboRouteCandidates(config, pick, combo) : undefined,
+    candidates: combo
+      ? comboRouteCandidates(config, pick, combo, eligible, requestCompatible)
+      : undefined,
   });
 }
 
@@ -591,6 +601,8 @@ function comboRouteCandidates(
   config: OcxConfig,
   pick: NonNullable<RouteResult["combo"]>,
   combo: NormalizedComboConfig,
+  eligible?: (target: ComboPick["target"]) => boolean,
+  requestCompatible: (target: ComboPick["target"]) => boolean = eligible ?? (() => true),
 ): TraceCandidateInput[] {
   const now = Date.now();
   return combo.targets.map((target, index) => {
@@ -599,6 +611,8 @@ function comboRouteCandidates(
     const configured = provider !== undefined;
     const enabled = configured && provider.disabled !== true;
     const inCooldown = isComboTargetInCooldown(pick.comboId, target, now);
+    const operationallyEligible = eligible?.(target) ?? true;
+    const compatible = requestCompatible(target);
     const isSelected = index === pick.targetIndex;
     // The pick's `attempted` list includes the winner itself; only non-selected
     // targets can be "already-attempted" (fallback picks exclude earlier tries).
@@ -607,6 +621,7 @@ function comboRouteCandidates(
     if (!configured) exclusions.push({ code: "unconfigured" });
     if (configured && !enabled) exclusions.push({ code: "disabled" });
     if (inCooldown) exclusions.push({ code: "cooldown" });
+    if (!compatible) exclusions.push({ code: "request-incompatible" });
     if (isSelected && inCooldown) exclusions.push({ code: "selected-despite-cooldown" });
     if (!isSelected && alreadyAttempted && exclusions.length === 0) {
       exclusions.push({ code: "already-attempted" });
@@ -615,7 +630,11 @@ function comboRouteCandidates(
     return {
       provider: target.provider,
       model: target.model,
-      eligible: enabled && !inCooldown && !alreadyAttempted,
+      eligible: enabled
+        && !inCooldown
+        && !alreadyAttempted
+        && operationallyEligible
+        && compatible,
       exclusions,
     };
   });
@@ -627,6 +646,7 @@ function routeModelInternal(
   bypassCombos: boolean,
   policyEvidence?: PolicyRequestEvidence,
   allowCompactionNativeFallback = false,
+  options: RouteModelOptions = {},
 ): RouteResult {
   const slash = modelId.indexOf("/");
   // Policy namespace is system-reserved: an explicit `policy/<id>` or a
@@ -694,7 +714,10 @@ function routeModelInternal(
   }
 
   if (!bypassCombos && !preservesPhysicalComboProvider(config)) {
-    const combo = tryPickComboModel(config, modelId);
+    const combo = tryPickComboModel(config, modelId, {
+      ...(options.comboEligible === undefined ? {} : { eligible: options.comboEligible }),
+      ...(options.comboRandomSeed === undefined ? {} : { randomSeed: options.comboRandomSeed }),
+    });
     if (combo) {
       const concrete = `${combo.target.provider}/${combo.target.model}`;
       // The selected target is already a concrete provider/model reference. Resolve it without
@@ -860,7 +883,12 @@ function routeModelInternal(
   throw new Error(`No provider configured for model: ${modelId}`);
 }
 
-function routeWithDecisionTrace(config: OcxConfig, modelId: string, route: RouteResult): RouteResult {
+function routeWithDecisionTrace(
+  config: OcxConfig,
+  modelId: string,
+  route: RouteResult,
+  options: RouteModelOptions = {},
+): RouteResult {
   // Policy routes carry a full evaluation trace already; never rebuild it.
   if (route.routeDecision) return route;
   const accountRef = route.codexAccountNamespace;
@@ -879,7 +907,13 @@ function routeWithDecisionTrace(config: OcxConfig, modelId: string, route: Route
         : {}),
     },
     candidates: route.routeKind === "combo" && route.combo && combo
-      ? comboRouteCandidates(config, route.combo, combo)
+      ? comboRouteCandidates(
+        config,
+        route.combo,
+        combo,
+        options.comboEligible,
+        options.comboRequestCompatible,
+      )
       : undefined,
   });
   return route;
@@ -889,9 +923,17 @@ export function routeModel(
   config: OcxConfig,
   modelId: string,
   policyEvidence?: PolicyRequestEvidence,
+  options: RouteModelOptions = {},
 ): RouteResult {
-  const route = routeModelInternal(config, modelId, false, policyEvidence);
-  return routeWithDecisionTrace(config, modelId, route);
+  const route = routeModelInternal(
+    config,
+    modelId,
+    false,
+    policyEvidence,
+    false,
+    options,
+  );
+  return routeWithDecisionTrace(config, modelId, route, options);
 }
 
 /**

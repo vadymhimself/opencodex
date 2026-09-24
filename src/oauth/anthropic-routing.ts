@@ -16,7 +16,7 @@
  * path) so the account is excluded from eligibility.
  */
 import { createHash } from "node:crypto";
-import { captureOAuthAccountSelection, commitOAuthAccountSelection, credentialGeneration, getAccountSet, getAccountCredential, getAccountCredentialWithStatus } from "./store";
+import { captureOAuthAccountSelection, commitOAuthAccountSelection, credentialGeneration, getAccountSet, getAccountCredential, getAccountCredentialWithStatus, markAccountNeedsReauthIfGeneration } from "./store";
 import type { OAuthAccessSnapshot } from "./index";
 import { getCachedProviderAccountQuota } from "../providers/quota";
 import { fallbackCodexAccountLogLabel } from "../codex/account-label";
@@ -895,4 +895,52 @@ export function anthropicSessionKeyFromParts(input: {
   const cacheKey = input.promptCacheKey?.trim() ?? "";
   if (!cacheKey) return null;
   return cacheKey.length <= 128 ? cacheKey : createHash("sha256").update(cacheKey).digest("hex");
+}
+
+/**
+ * A 401/403 is a verdict about the CREDENTIAL, not the account's quota: mark the rejected
+ * generation as needing reauth and move the session to another account. When the generation was
+ * already replaced underneath us the same account is retried with its refreshed credential
+ * instead of being abandoned.
+ */
+export async function rotateAnthropicAccountOnCredentialDenial(
+  config: OcxConfig,
+  rejected: Pick<OAuthAccessSnapshot, "accountId" | "generation">,
+  sessionKey?: string | null,
+  now = Date.now(),
+): Promise<string | null> {
+  await markAccountNeedsReauthIfGeneration(
+    PROVIDER,
+    rejected.accountId,
+    rejected.generation,
+  );
+  clearAnthropicSessionAffinityForAccount(rejected.accountId);
+  notePoolRotationFailure(POOL_KEY_ANTHROPIC, rejected.accountId);
+  quorumCache = null;
+
+  const current = getAccountCredential(PROVIDER, rejected.accountId);
+  const currentGenerationReplaced = current !== null
+    && credentialGeneration(current) !== rejected.generation
+    && getEligibleAnthropicAccounts(now).includes(rejected.accountId);
+  const next = currentGenerationReplaced
+    ? rejected.accountId
+    : isAnthropicAccountPoolEnabled(config)
+      ? pickAlternateAnthropicAccount(config, rejected.accountId, now)
+      : pickLowestUsage(config, rejected.accountId, now);
+  if (!next) {
+    console.warn("[anthropic-pool] no eligible Anthropic OAuth account after credential denial; returning 403");
+    return null;
+  }
+
+  const affinityKey = normalizeAffinityComponent(sessionKey);
+  if (affinityKey && normalizeAffinityComponent(next)) {
+    sessionAffinity.set(affinityKey, { accountId: next, lastUsedAt: now });
+    pruneExpiredAffinity(now);
+  }
+  console.warn(
+    currentGenerationReplaced
+      ? `[anthropic-pool] credential denial on stale ${formatAnthropicAccountOrdinal(rejected.accountId)} credential; retrying its refreshed credential`
+      : `[anthropic-pool] credential denial on ${formatAnthropicAccountOrdinal(rejected.accountId)}; failing over to ${formatAnthropicAccountOrdinal(next)}`,
+  );
+  return next;
 }

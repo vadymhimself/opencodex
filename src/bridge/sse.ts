@@ -736,24 +736,37 @@ export function bridgeToResponsesSSE(
         returnIterator();
       };
       let handlingTranslatorOverflow = false;
-      terminateForTranslatorOverflow = _error => {
+      terminateForTranslatorOverflow = error => {
         if (handlingTranslatorOverflow || terminated || clientCancelled || closed) return;
         handlingTranslatorOverflow = true;
         abortCurrentToolCallForTranslatorOverflow();
         currentWebSearch = null;
         releasePendingWebSources();
-        const failure = adapterFailureFromEvent({
-          type: "error",
-          status: 502,
-          errorType: "upstream_error",
-          code: "translation_buffer_limit",
-          message: "upstream translation buffer exceeded the safe limit",
-        }).error;
+        // Reuse the adapter's own overflow event when it raised one: it carries the usage the
+        // turn already consumed. Synthesizing a fresh error instead reported an overflow turn as
+        // costing nothing, which is exactly the traffic worth seeing in a usage report.
+        const overflowCandidate = error as { type?: unknown; code?: unknown } | null | undefined;
+        const overflowEvent: Extract<AdapterEvent, { type: "error" }> =
+          !!overflowCandidate
+          && typeof overflowCandidate === "object"
+          && overflowCandidate.type === "error"
+          && overflowCandidate.code === "translation_buffer_limit"
+            ? error as Extract<AdapterEvent, { type: "error" }>
+            : {
+                type: "error",
+                status: 502,
+                errorType: "upstream_error",
+                code: "translation_buffer_limit",
+                message: "upstream translation buffer exceeded the safe limit",
+              };
+        const failure = adapterFailureFromEvent(overflowEvent).error;
+        if (overflowEvent.usage) options?.onUsage?.(overflowEvent.usage);
         const failedFrame = sseEvent("response.failed", {
           type: "response.failed",
           sequence_number: seq++,
           response: {
             ...responseSnapshot("failed", finishedItems),
+            ...(overflowEvent.usage ? { usage: responsesUsage(overflowEvent.usage) } : {}),
             error: failure,
             last_error: failure,
           },
