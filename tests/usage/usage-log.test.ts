@@ -191,6 +191,8 @@ describe("usage log", () => {
     const short = "provider/model";
     expect(encodePersistedRequestedModel(short)).toBe(short);
     expect(encodePersistedRequestedModel(encodedA)).toBe(encodedA);
+  });
+
   test("preserves only literal-true combo target advances", () => {
     const entry: PersistedUsageEntry = {
       requestId: "ocx-combo-target-advance",

@@ -358,6 +358,8 @@ describe("request-history index (RI-02)", () => {
     appendUsageEntry(entry("sel-literal", 3000, "a", "m1", { requestedModel: persistedA }));
     const aliased = await queryRequestHistory({ requestedModel: persistedA }, undefined, 10);
     expect(aliased.rows.map(row => row.requestId).sort()).toEqual(["sel-a", "sel-literal"]);
+  });
+
   test("fallback and attempt count use only distinct physical attempts", async () => {
     const attempt = (ordinal: number, overrides: Partial<PersistedUsageAttempt> = {}): PersistedUsageAttempt => ({
       ordinal,

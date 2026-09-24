@@ -1948,7 +1948,7 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
             events.push({ type: "redacted_thinking", data: block.data });
           } else if (block.type === "tool_use") {
             const id = usableToolUseId(block.id);
-            events.push({ type: "tool_call_start", id, name: fromWireToolName(block.name ?? "", request) });
+            events.push({ type: "tool_call_start", id, name: fromWireToolName(typeof block.name === "string" ? block.name : "", request) });
             events.push({ type: "tool_call_delta", arguments: toolUseArguments(block.input, provider.anthropicEofTolerance === true) });
             events.push({ type: "tool_call_end" });
           } else if (request?.anthropicSourceReplay === true) {

@@ -468,7 +468,11 @@ function usageModelKey(providerKey: string, model: string): string {
 }
 
 export function usageAttributions(entry: PersistedUsageEntry): UsageAttribution[] {
-  if (!entry.attempts?.length) {
+  // `=== undefined`, not `!length`: callers hand this `normalizePhysicalEntry`'s output, where an
+  // EMPTY list means every attempt was locally answered or never sent and the row's own totals
+  // have already been stripped. Falling back to the row there invents a priced request out of
+  // stale parent usage the turn never spent. Absent attempts is the different, older case.
+  if (entry.attempts === undefined) {
     return [{
       requestId: entry.requestId,
       provider: entry.provider,
