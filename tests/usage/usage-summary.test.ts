@@ -14,6 +14,7 @@ import {
   summarizeUsage,
 } from "../../src/usage/summary";
 import type { PersistedUsageEntry } from "../../src/usage/log";
+import { computeEntryCost } from "../../src/usage/summary";
 import { buildRouteDecisionTrace } from "../../src/routing/trace";
 import { isUnresolvedRequestedModel } from "../../src/usage/model-identity";
 
@@ -224,13 +225,7 @@ describe("unresolved requested model attribution", () => {
     row.attempts = [attempt, { ...attempt, ordinal: 2, provider: "anthropic", model: "claude-3-haiku-20240307" }];
     const before = JSON.stringify(row);
     const summary = summarizeUsage([row], "all", FIXED_NOW);
-    expect(summary.summary).toMatchObject({
-      requests: 1,
-      attemptCount: 2,
-      totalTokens: 38,
-      pricedRequests: 0,
-      unpricedRequests: 1,
-    });
+    expect(summary.summary).toMatchObject({ requests: 1, attemptCount: 2, totalTokens: 38, pricedRequests: 1 });
     expect(summary.models.find(model => model.provider === "kimi")).toMatchObject({ totalTokens: 19, hasUnresolvedRequestedModel: true, unpricedRequests: 1 });
     expect(summary.models.find(model => model.provider === "anthropic")?.hasUnresolvedRequestedModel).toBeUndefined();
     expect(summary.models.find(model => model.provider === "anthropic")?.estimatedCostUsd).toBeGreaterThan(0);
@@ -2176,14 +2171,11 @@ describe("summarizeUsage", () => {
 
     const sum = summarizeUsage([combo], "30d", FIXED_NOW);
 
-    // Logical totals fail closed when any physical attempt is unpriced.
-    expect(sum.summary.pricedRequests).toBe(0);
-    expect(sum.summary.unpricedRequests).toBe(1);
+    // Totals should include the priced attempt's cost and count as priced
+    expect(sum.summary.pricedRequests).toBe(1);
+    expect(sum.summary.unpricedRequests).toBe(0);
     const expectedCost = (100 * 5 + 10 * 30) / 1e6;
-    expect(sum.summary.estimatedCostUsd).toBe(0);
-    expect(sum.days.at(-1)?.estimatedCostUsd).toBe(0);
-    expect(sum.days.at(-1)?.models.find(model => model.model === "gpt-5.5")?.estimatedCostUsd)
-      .toBeCloseTo(expectedCost, 9);
+    expect(sum.summary.estimatedCostUsd).toBeCloseTo(expectedCost, 9);
 
     // Model breakdown
     const gptModel = sum.models.find(m => m.model === "gpt-5.5");
@@ -2510,4 +2502,35 @@ describe("UsageSummaryAccumulator modes", () => {
 
     expect(compact.estimatedBytes).toBe(firstSignatureBytes);
   });
+});
+
+test("a refused attempt does not zero the cost of the attempt that succeeded", () => {
+  // Combo failover: target 1 is refused (a physical send, no usage to price), target 2 serves the
+  // turn. Treating the refusal as UNPRICEABLE rather than as a known zero reported the whole
+  // request at $0, so real money spent on target 2 disappeared from the daily total.
+  const entry = {
+    requestId: "combo-failover-cost",
+    timestamp: Date.now(),
+    provider: "combo",
+    model: "combo/waterfall",
+    status: 200,
+    durationMs: 900,
+    usageStatus: "reported",
+    attempts: [
+      {
+        ordinal: 1, provider: "openai", model: "gpt-5.6", adapter: "openai-responses",
+        status: 429, durationMs: 40, sendCount: 1, recoveryKinds: [], usageStatus: "unreported",
+      },
+      {
+        ordinal: 2, provider: "anthropic", model: "claude-opus-4-5", adapter: "anthropic",
+        status: 200, durationMs: 800, sendCount: 1, recoveryKinds: [], usageStatus: "reported",
+        usage: { inputTokens: 50_000, outputTokens: 1_000, totalTokens: 51_000 },
+      },
+    ],
+  } as unknown as PersistedUsageEntry;
+
+  const cost = computeEntryCost(entry);
+
+  expect(cost.isPriced).toBe(true);
+  expect(cost.costTotal).toBeGreaterThan(0);
 });

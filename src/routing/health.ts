@@ -125,6 +125,7 @@ function attemptSamplesFor(
       attempt => attempt && typeof attempt === "object" && !Array.isArray(attempt),
     ) as PersistedUsageAttempt[];
     const attempts = physicalUsageAttempts(persistedAttempts);
+    if (attempts.length === 0) return [];
     const finalAttempt = attempts.at(-1);
     const samples: HealthSample[] = [];
     for (const [attemptOrder, attempt] of attempts.entries()) {
@@ -147,7 +148,8 @@ function attemptSamplesFor(
         attemptOrder,
       });
     }
-    return samples;
+    // Physical sends with account-qualified names still leave the parent row as evidence.
+    return samples.length > 0 ? samples : undefined;
   } catch {
     return undefined;
   }

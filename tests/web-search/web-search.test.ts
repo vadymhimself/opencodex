@@ -121,11 +121,8 @@ describe("issue #1001 — forced-answer passes must produce usable output", () =
     expect(frames.some(frame => frame.event === "response.completed")).toBe(false);
   });
 
-  test.todo("a rejected forced-answer terminal remains in request usage", async () => {
-    // RED ON THE FORK BRANCH TOO, verified against port/lane-onto-2.59: the loop makes a
-    // THIRD adapter pass after the forced answer is rejected, so `onIterationUsage` fires
-    // twice with the same terminal. The intent is right and the implementation never
-    // matched it; recorded rather than deleted so the gap stays visible.
+  test("a rejected forced-answer terminal remains in request usage", async () => {
+    // Empty forced answers get one repair pass; both physical terminals retain their usage.
     const iterations: unknown[] = [];
     const aggregate: unknown[] = [];
     const frames = await drive(
@@ -137,8 +134,8 @@ describe("issue #1001 — forced-answer passes must produce usable output", () =
     );
 
     expect(frames.some(frame => frame.event === "response.failed")).toBe(true);
-    expect(iterations).toEqual([{ inputTokens: 3, outputTokens: 2 }]);
-    expect(aggregate).toEqual([{ inputTokens: 3, outputTokens: 2 }]);
+    expect(iterations).toEqual([{ inputTokens: 3, outputTokens: 2 }, { inputTokens: 3, outputTokens: 2 }]);
+    expect(aggregate).toEqual([{ inputTokens: 6, outputTokens: 4, totalTokens: 10 }]);
   });
 
   test("commentary-only output does not satisfy the forced pass", async () => {
@@ -2913,3 +2910,25 @@ describe("connection-reset recovery parity on the web-search legs", () => {
     expect(attempts.every(attempt => attempt.redirect === "manual")).toBe(true);
   });
 });
+
+  test("pacing queue overload remains typed for outer 429 handling", async () => {
+    const overload = new RequestPacingQueueOverloadError("routed", "queue_full", 2);
+    const adapter: ProviderAdapter = {
+      name: "mock-overload",
+      buildRequest: () => ({ url: "https://routed.test/v1", method: "POST", headers: {}, body: "{}" }),
+      fetchResponse: dispatchAdapterRequest,
+      async *parseStream() { yield { type: "done" }; },
+      async parseResponse() { throw new Error("parseResponse must be unreachable"); },
+    };
+
+    await expect(runWithWebSearch({
+      parsed: parseRequest({ model: "routed/model", input: "hi", stream: true, tools: [{ type: "web_search" }] }),
+      adapter,
+      forwardProvider,
+      hostedTool: { type: "web_search" },
+      selectedForwardHeaders: new Headers({ authorization: "Bearer token" }),
+      settings: { model: "gpt-5.4-mini", reasoning: "low", timeoutMs: 30_000 },
+      maxSearches: 1,
+      waitForRequestSlot: async () => { throw overload; },
+    })).rejects.toBe(overload);
+  });

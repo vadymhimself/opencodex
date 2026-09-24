@@ -284,17 +284,15 @@ export function computeEntryCost(entry: PersistedUsageEntry): EntryCostInfo {
     const attemptEstimates = entry.attempts.map(attempt =>
       estimateAttemptCost({ ...attempt, ...usageModelPriceOptions(entry, attempt) }, undefined, tier)
     );
-    const isPriced = attemptEstimates.length > 0
-      && attemptEstimates.every(estimate => estimate !== null);
-    return {
-      tier,
-      estimate: null,
-      attemptEstimates,
-      costTotal: isPriced
-        ? attemptEstimates.reduce((total, estimate) => total + estimate!.cost.total, 0)
-        : 0,
-      isPriced,
-    };
+    let costTotal = 0;
+    let isPriced = false;
+    for (const est of attemptEstimates) {
+      if (est) {
+        costTotal += est.cost.total;
+        isPriced = true;
+      }
+    }
+    return { tier, estimate: null, attemptEstimates, costTotal, isPriced };
   }
   const estimate = estimateRequestCost({
     ...usageModelPriceOptions(entry, entry),
