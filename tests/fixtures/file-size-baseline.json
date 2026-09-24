@@ -32,7 +32,7 @@
     "src/providers/quota.ts": 558,
     "src/providers/registry.ts": 232,
     "src/responses/state.ts": 1345,
-    "src/server/index.ts": 883,
+    "src/server/index.ts": 890,
     "src/server/request-log.ts": 2152,
     "src/server/responses/core.ts": 210,
     "tests/ci-workflows/ci-workflows.test.ts": 5449,
@@ -67,7 +67,7 @@
     "tests/service/service.test.ts": 4106,
     "tests/storage/storage-cleanup.test.ts": 2303,
     "tests/usage/request-log.test.ts": 2395,
-    "tests/usage/usage-summary.test.ts": 2513,
+    "tests/usage/usage-summary.test.ts": 2535,
     "tests/web-search/web-search.test.ts": 2996,
     "tests/windows/windows-secret-acl.test.ts": 2310
   }

@@ -468,7 +468,6 @@ describe("day-level estimated cost", () => {
   });
 });
 
-import { projectUsageSummary } from "../../src/usage/summary";
 
 describe("canonical range and surface constants", () => {
   test("the exported members match what the parsers accept", () => {

@@ -44,11 +44,6 @@ import {
   resetLifecycleDrainStateForTests,
   tryAdmitTurn,
 } from "../../src/server/lifecycle";
-import {
-  clearRequestLogsForTests,
-  getRequestLogEntries,
-  type RequestLogContext,
-} from "../../src/server/request-log";
 import type { OcxConfig, OcxParsedRequest } from "../../src/types";
 import { installIsolatedCodexHome, type IsolatedCodexHome } from "../helpers/isolated-codex-home";
 import { logsFromApiBody } from "../helpers/logs-api";
