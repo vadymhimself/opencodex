@@ -7,7 +7,7 @@ import { saveConfig } from "../../src/config";
 import { clearKeyCooldowns } from "../../src/providers/key-failover";
 import { clearGenericFailoverHealth } from "../../src/oauth/generic-account-failover";
 import { getValidAccessSnapshotForAccount } from "../../src/oauth";
-import { getAccountSet, saveCredential } from "../../src/oauth/store";
+import { getAccountSet, saveCredential, setActiveAccount } from "../../src/oauth/store";
 import { reasoningReplayKeyCredentialIdentity, reasoningReplayOAuthCredentialIdentity } from "../../src/responses/reasoning-replay-cache";
 import type { RequestLogContext } from "../../src/server/request-log";
 import {
@@ -374,25 +374,27 @@ describe("terminal continuation provider-owner rotation", () => {
     expect(phases).toEqual([]);
   });
 
-  test("generic OAuth rotation fences state when the next request returns to the active account", async () => {
+  test.each([
+    ["nous", false], ["nous", true], ["anthropic", false], ["anthropic", true],
+  ] as const)("%s OAuth rotation fences state on initial send=%s and return to A", async (providerName, initialSend) => {
     for (let index = 0; index < 2; index += 1) {
-      await saveCredential("nous", {
+      await saveCredential(providerName, {
         access: `cursor-access-${index}`,
         refresh: `cursor-refresh-${index}`,
         expires: Date.now() + 3_600_000,
         accountId: `cursor-account-${index}`,
       }, { addAccount: true });
     }
-    const accountIds = getAccountSet("nous")?.accounts.map(account => account.id) ?? [];
-    const snapshotA = await getValidAccessSnapshotForAccount("nous", accountIds[1]!);
-    const snapshotB = await getValidAccessSnapshotForAccount("nous", accountIds[0]!);
+    const accountIds = getAccountSet(providerName)?.accounts.map(account => account.id) ?? [];
+    const snapshotA = await getValidAccessSnapshotForAccount(providerName, accountIds[1]!);
+    const snapshotB = await getValidAccessSnapshotForAccount(providerName, accountIds[0]!);
     const ownerA = reasoningReplayOAuthCredentialIdentity(snapshotA);
     const ownerB = reasoningReplayOAuthCredentialIdentity(snapshotB);
     const config: OcxConfig = {
       port: 0,
-      defaultProvider: "nous",
+      defaultProvider: providerName,
       providers: {
-        nous: {
+        [providerName]: {
           adapter: "test-terminal-owned",
           baseUrl: "https://owned-terminal.test/v1",
           authMode: "oauth",
@@ -402,7 +404,7 @@ describe("terminal continuation provider-owner rotation", () => {
     } as OcxConfig;
     saveConfig(config);
 
-    const phases = ["seed", "plan", "rate-limit", "rotated", "follow-active"];
+    const phases = ["seed", ...(!initialSend ? ["plan"] : []), "rate-limit", "rotated", "follow-active"];
     const seenAuthorization: string[] = [];
     globalThis.fetch = (async (_input, init) => {
       seenAuthorization.push(new Headers(init?.headers).get("authorization") ?? "");
@@ -431,7 +433,7 @@ describe("terminal continuation provider-owner rotation", () => {
     );
 
     const seed = await post({
-      model: "nous/model",
+      model: `${providerName}/model`,
       input: "seed",
       stream: false,
       store: true,
@@ -445,9 +447,9 @@ describe("terminal continuation provider-owner rotation", () => {
 
     const rotatedLogCtx: RequestLogContext = { model: "", provider: "" };
     const rotated = await post({
-      model: "nous/model",
+      model: `${providerName}/model`,
       previous_response_id: seedJson.id,
-      input: "Please modify the file now",
+      input: initialSend ? "hello" : "Please modify the file now",
       stream: false,
       store: true,
       tools: [{
@@ -466,12 +468,14 @@ describe("terminal continuation provider-owner rotation", () => {
       kiro: { conversationId: "private-b" },
     });
     expect(rotatedLogCtx.attempts).toMatchObject([
-      { status: 429, sendCount: 2 },
-      { sendCount: 1, recoveryKinds: ["oauth-account-429"] },
+      { status: 429, sendCount: initialSend ? 1 : 2 },
+      { sendCount: 1, recoveryKinds: [providerName === "anthropic" ? "anthropic-oauth-429" : "oauth-account-429"] },
     ]);
 
+    // Rotation commits B as active. Explicitly return to A to test the cross-account fence.
+    expect(await setActiveAccount(providerName, accountIds[1]!)).toBe(true);
     const follow = await post({
-      model: "nous/model",
+      model: `${providerName}/model`,
       previous_response_id: rotatedJson.id,
       input: "follow up",
       stream: false,
@@ -487,14 +491,14 @@ describe("terminal continuation provider-owner rotation", () => {
     expect(seenAuthorization).toEqual([
       "Bearer cursor-access-1",
       "Bearer cursor-access-1",
-      "Bearer cursor-access-1",
+      ...(!initialSend ? ["Bearer cursor-access-1"] : []),
       "Bearer cursor-access-0",
       "Bearer cursor-access-1",
     ]);
     expect(builds).toEqual([
       { key: "cursor-access-1" },
       { key: "cursor-access-1", continuation: "private-a" },
-      { key: "cursor-access-1", continuation: "private-a" },
+      ...(!initialSend ? [{ key: "cursor-access-1", continuation: "private-a" }] : []),
       { key: "cursor-access-0" },
       { key: "cursor-access-1" },
     ]);
