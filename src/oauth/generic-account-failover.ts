@@ -41,7 +41,6 @@ import type { OcxConfig, OcxProviderConfig } from "../types";
 export const GENERIC_OAUTH_MAX_FAILOVERS_PER_REQUEST = 3;
 
 const DEFAULT_COOLDOWN_MS = 60_000;
-const MAX_COOLDOWN_MS = 60_000;
 
 /**
  * How long a presence answer may be reused before the store is consulted again.
@@ -354,7 +353,13 @@ export function rotateGenericOAuthAccountOn429(
   // the default minute: retrying it every 60s until the window rolls over is pure waste.
   // A Retry-After from upstream still wins — it is the server's own instruction.
   const exhausted = parsed === undefined ? exhaustedCooldownMs(providerName, failedAccountId, now) : null;
-  const cooldownMs = exhausted ?? Math.min(parsed ?? DEFAULT_COOLDOWN_MS, MAX_COOLDOWN_MS);
+  // `Retry-After` is honoured in full; only the DEFAULT is capped. `MAX_COOLDOWN_MS` dropped from
+  // 15 minutes to 60s in this port, and clamping a stated deadline with it meant a drained
+  // account answering `Retry-After: 3600` returned to the pool a minute later and was re-sent to
+  // sixty times an hour for the whole window -- pure waste, and the exact behaviour the comment
+  // above says this branch exists to prevent. It also contradicted the sibling layers: the combo
+  // gate and the Anthropic pool both honour a stated deadline and cap only a guess.
+  const cooldownMs = exhausted ?? parsed ?? DEFAULT_COOLDOWN_MS;
   const family = classifyModelFamilyForQuota(providerName, requestedModelId);
   health.set(healthKey(providerName, failedAccountId, family), {
     cooldownUntil: now + cooldownMs,

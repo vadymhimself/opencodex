@@ -18,6 +18,7 @@ import {
   getRequestLogEntries,
   hydrateRequestLogsFromDisk,
   noteAttemptSend,
+  noteProviderAttemptSend,
   recordAdapterReasoning,
   recordFirstOutput,
   requestLogEntryFromPersistedUsage,
@@ -29,7 +30,7 @@ import {
 } from "../../src/server/request-log";
 import { handleResponses } from "../../src/server/responses";
 import { bridgeToResponsesSSE } from "../../src/bridge";
-import type { AdapterEvent, OcxConfig, OcxUsage } from "../../src/types";
+import type { AdapterEvent, OcxConfig, OcxProviderConfig, OcxUsage } from "../../src/types";
 import {
   appendUsageEntry,
   normalizeUsageEntryForTest,
@@ -569,6 +570,36 @@ describe("request log metadata", () => {
 
     expect(attempt.firstSendAt).toBe(123.25);
     expect(attempt.sendCount).toBe(2);
+  });
+
+  test("an attempt surviving two rotations keeps the request's input estimate", () => {
+    // Companion to key-attribution's two-rotation test, which pins the same property at the ROW.
+    // This one pins it on the ATTEMPT: the estimate has to survive as the row's finalization
+    // input, not merely reach the total. Clearing `usageLogInputTokens` in the split survives
+    // ONE rotation -- that call captured the argument before the clear -- and loses it from the
+    // second, where the caller reads a field the first split already deleted. The sidecar and
+    // runTurn sites only READ it, so nothing re-seeds it between rotations there.
+    const provider = { adapter: "cursor", baseUrl: "https://cursor.test", authMode: "oauth" } as OcxProviderConfig;
+    const attempt = beginRequestAttempt(1, "cursor (a)", "sonnet", "cursor");
+    const logCtx: RequestLogContext = {
+      model: "sonnet",
+      provider: "cursor (a)",
+      activeAttempt: attempt,
+      attempts: [attempt],
+      usageLogInputTokens: 1234,
+      activeAttemptStartedAt: Date.now(),
+    };
+    noteAttemptSend(attempt, logCtx.usageLogInputTokens);
+
+    for (const account of ["cursor (b)", "cursor (c)"]) {
+      logCtx.provider = account;
+      noteProviderAttemptSend(logCtx, "cursor", provider, logCtx.usageLogInputTokens, "oauth-account-429");
+    }
+
+    expect(logCtx.attempts?.map(row => row.provider)).toEqual(["cursor (a)", "cursor (b)", "cursor (c)"]);
+    const surviving = finishRequestAttempt(logCtx.activeAttempt!, 200, 5);
+    expect(surviving.inputTokenEstimate).toBe(1234);
+    expect(surviving).toMatchObject({ usageStatus: "estimated", totalTokens: 1234 });
   });
 
   test("keeps the latest context checkpoint while adding server tool counters", () => {

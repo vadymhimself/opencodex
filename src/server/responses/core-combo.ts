@@ -65,12 +65,8 @@ import type { ResponsesTerminalStatus } from "../../bridge";
 import { beginRequestAttempt, sealRequestAttemptIdentity, finishRequestAttempt } from "../request-log";
 import { rememberComboForLane } from "./combo-session-recall";
 import { runTurnAdapterSseResponses } from "./core-lifetime";
-import {
-  isNativePassthroughSseResponse,
-  isEagerRelaySseResponse,
-  markNativePassthroughSseResponse,
-  markEagerRelaySseResponse,
-} from "../relay";
+import { isAnthropicSourceReplayResponse } from "../relay";
+import { comboTargetAcceptsAnthropicSource, preserveResponseMarkers } from "./anthropic-source-replay";
 import { preflightComboStreamResponse } from "./combo-stream-preflight";
 import { streamingContextOverflowResponse, jsonContextOverflowResponse } from "./context-overflow";
 import { mandatoryResponsesReasoningReplayUnavailable } from "./core-replay";
@@ -297,8 +293,28 @@ export async function executeComboResponses(
   let comboPayloadReadable = false;
   const payloadEligible = (target: (typeof combo.targets)[number]): boolean =>
     comboPayloadReadable || !unreadableEncryptedAgentTask || canDecryptUnreadableAgentTask(target);
+  // A combo must not pick a target that cannot replay the caller's exact bytes. Cached per
+  // target: eligibility is a property of the route and the source, and every pick site below
+  // asks about the same handful of targets.
+  const sourceReplayEligibility = new Map<string, boolean>();
+  const sourceReplayEligible = (target: (typeof combo.targets)[number]): boolean => {
+    const source = options.anthropicMessagesSource;
+    if (!source) return true;
+    const key = targetKey(target);
+    const cached = sourceReplayEligibility.get(key);
+    if (cached !== undefined) return cached;
+    const eligible = comboTargetAcceptsAnthropicSource(
+      config,
+      target,
+      source,
+      body,
+      options.inboundWire ?? "responses",
+    );
+    sourceReplayEligibility.set(key, eligible);
+    return eligible;
+  };
   const targetEligible = (target: (typeof combo.targets)[number]): boolean =>
-    payloadEligible(target) && reasoningReplayEligible(target);
+    payloadEligible(target) && reasoningReplayEligible(target) && sourceReplayEligible(target);
   const onlyReplayIncompatibleTargetsRemain = (excluded: Iterable<string> = []): boolean => {
     const excludedKeys = new Set(excluded);
     const remaining = combo.targets.filter(target => {
@@ -378,7 +394,7 @@ export async function executeComboResponses(
   });
 
   if (unreadableEncryptedAgentTask && !pick) {
-    pick = await pickWithWait({ now: initialNow });
+    pick = await pickWithWait({ eligible: sourceReplayEligible, now: initialNow });
     if (!pick) {
       discardEncryptedAgentTaskRecovery(
         req,
@@ -398,6 +414,16 @@ export async function executeComboResponses(
   }
 
   if (!pick) {
+    const source = options.anthropicMessagesSource;
+    if (source && !combo.targets.some(sourceReplayEligible)) {
+      return formatErrorResponse(
+        400,
+        "invalid_request_error",
+        source.requiresExactReplay
+          ? "Anthropic-native request features require exact canonical Anthropic Messages replay for this request."
+          : "Canonical Anthropic Messages routing requires exact replay of the caller request.",
+      );
+    }
     if (onlyReplayIncompatibleTargetsRemain()) return targetIncompatibleResponse();
     return options.abortSignal?.aborted
       ? clientCancelledResponse()
@@ -441,6 +467,9 @@ export async function executeComboResponses(
   let lastFailureClassifiesOverflow = false;
   while (pick) {
     if (options.abortSignal?.aborted) return clientCancelledResponse();
+    // Per attempt: the preflight's retained source bytes, which a failing canonical replay owes
+    // the caller instead of this proxy's rewritten error envelope.
+    let preflightPassthroughResponse: Response | undefined;
     const firstComboTarget = comboTargetsDispatched === 0;
     // The first target seeds the ledger's target identity and charges nothing; every later one
     // is a real transition, refused once the declared hops, the alternate-target ledger or the
@@ -598,11 +627,17 @@ export async function executeComboResponses(
     }
 
     if (response.ok && !runTurnAdapterSseResponses.has(response)) {
-      const nativePassthrough = isNativePassthroughSseResponse(response);
-      const eagerRelay = isEagerRelaySseResponse(response);
+      const sourceResponse = response;
       let preflight;
       try {
-        preflight = await preflightComboStreamResponse(response, childLog);
+        preflight = await preflightComboStreamResponse(response, childLog, {
+          abortSignal: options.abortSignal,
+          // A canonical replay child owes the caller its exact bytes on the transport the
+          // source asked for, so the preflight validates that transport instead of guessing.
+          expectedTransport: isAnthropicSourceReplayResponse(response)
+            ? options.anthropicMessagesSource?.body.stream === true ? "sse" : "json"
+            : undefined,
+        });
       } catch (error) {
         callbackGate.discard();
         if (options.abortSignal?.aborted) {
@@ -616,10 +651,14 @@ export async function executeComboResponses(
         callbackGate.discard();
         terminalRecorder?.("failed", preflight.response.status);
         response = preflight.response;
+        if (preflight.passthroughResponse) {
+          preflightPassthroughResponse = preserveResponseMarkers(
+            sourceResponse,
+            preflight.passthroughResponse,
+          );
+        }
       } else {
-        response = preflight.response;
-        if (nativePassthrough) markNativePassthroughSseResponse(response);
-        if (eagerRelay) markEagerRelaySseResponse(response);
+        response = preserveResponseMarkers(sourceResponse, preflight.response);
       }
     }
 
@@ -666,6 +705,9 @@ export async function executeComboResponses(
       finishRequestAttempt(attempt, 502, Date.now() - started, childLog.usage);
       throw error;
     }
+    if (preflightPassthroughResponse) {
+      failure.passthroughResponse = preflightPassthroughResponse;
+    }
     if (options.abortSignal?.aborted) {
       retainCancelledAttempt();
       return clientCancelledResponse();
@@ -683,7 +725,7 @@ export async function executeComboResponses(
       failure.usage,
     );
     attemptRetained = true;
-    lastFailure = failure.response;
+    lastFailure = failure.passthroughResponse ?? failure.response;
     lastFailedChildLog = childLog;
     // A replacement that answers 200 is unmarked, and its zero-output failure only exists once
     // preflight has rebuilt the stream as a fresh Response. A spent grant never hops: a status the

@@ -6,6 +6,8 @@
  * internal Request, so routing/OAuth/account-pool/failover/sidecars are inherited
  * unchanged. The Responses output (SSE or JSON) is converted back to Anthropic shape.
  */
+import { explainPoolQuotaRefusal } from "../providers/quota-explain";
+import { getAccountSet } from "../oauth/store";
 import {
   anthropicMessagesUrl,
   canReplayAnthropicSource,
@@ -90,7 +92,7 @@ import {
 } from "../oauth/anthropic-routing";
 import type { OcxConfig } from "../types";
 import { readJsonRequestBody, resolveInboundBodyLimitBytes } from "./request-decompress";
-import { addFinalRequestLog, httpStatusForRequestLogTerminal, httpStatusFromTerminalError, recordFirstOutput, type RequestLogContext, type RequestLogEntry } from "./request-log";
+import { addFinalRequestLog, httpStatusForRequestLogTerminal, httpStatusFromTerminalError, recordFirstOutput, recordKeyWireAttemptUsage, type RequestLogContext, type RequestLogEntry } from "./request-log";
 import {
   conversationIdFromClaudeMetadata,
   getOrAllocateRequestSessionLane,
@@ -357,7 +359,18 @@ export function tapAnthropicSseForLog(
   let tapController: ReadableStreamDefaultController<Uint8Array> | undefined;
 
   const recordUsage = () => {
-    logCtx.usage = usageFromAnthropic(Object.keys(usageAcc).length > 0 ? usageAcc : undefined);
+    const usage = usageFromAnthropic(Object.keys(usageAcc).length > 0 ? usageAcc : undefined);
+    logCtx.usage = usage;
+    // The ATTEMPT is updated too, not just the request context. On a streaming canonical replay
+    // the combo preflight already pinned the attempt from `message_start` -- input tokens plus
+    // `output_tokens: 1` -- and returns as soon as the first content block commits, before
+    // `message_delta` carries the real output total. Since the row totals from its attempts and
+    // prefers an attempt that already has usage, writing only `logCtx.usage` here logged a
+    // 4,000-output-token turn as one. This tap sees the whole stream, so its accumulated total
+    // is the authoritative one.
+    if (usage && logCtx.activeAttempt && !recordKeyWireAttemptUsage(logCtx, usage)) {
+      logCtx.activeAttempt.usage = usage;
+    }
   };
   const settle = (status: number, meta: AnthropicTapFinalMeta) => {
     if (settled) return false;
@@ -659,10 +672,37 @@ async function anthropicNativePassthrough(
   }
   finalize(upstream.status, { closeReason: "non_stream" });
   const retryAfter = upstream.headers.get("retry-after");
-  return new Response(text, {
+  // A spent model-family window comes back as the same generic `rate_limit_error` as ordinary
+  // throttling, whose "try again later" is wrong advice for a window that will not roll for
+  // days. This gateway already knows which window is spent, so it says so rather than passing
+  // on advice it can see is useless. Silent when the cache cannot explain the refusal.
+  const quotaNote = upstream.status === 429
+    ? explainPoolQuotaRefusal("anthropic", (getAccountSet("anthropic")?.accounts ?? []).map(a => a.id), model)
+    : undefined;
+  return new Response(quotaNote ? annotateAnthropicErrorText(text, quotaNote) : text, {
     status: upstream.status,
     headers: { "Content-Type": contentType, ...(retryAfter ? { "Retry-After": retryAfter } : {}) },
   });
+}
+
+/**
+ * Append a clause to an upstream Anthropic error body, preserving everything else it said.
+ *
+ * The upstream message is the caller's primary evidence and is never replaced -- a wrong
+ * rewrite would be worse than a vague original. Anything that does not parse as an Anthropic
+ * error envelope is returned untouched.
+ */
+function annotateAnthropicErrorText(text: string, note: string): string {
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (!isRec(parsed) || !isRec(parsed.error) || typeof parsed.error.message !== "string") return text;
+    return JSON.stringify({
+      ...parsed,
+      error: { ...parsed.error, message: `${parsed.error.message} [${note}]` },
+    });
+  } catch {
+    return text;
+  }
 }
 
 const DEFAULT_BODY_STALL_SEC = 90;
@@ -919,6 +959,12 @@ async function handleClaudeMessagesWithBudget(
         };
       }
     }
+    // The source snapshot is the CALLER's bytes, so it is taken before the effort rewrite below
+    // (which the comment above already promised). Snapshotting after it recorded our own
+    // rewrite as the caller's request: the rewrite adds `output_config.effort` and deletes
+    // `thinking`, and that pairing is exactly what `canReplayAnthropicSource` refuses, so a
+    // canonical Anthropic target was filtered out of its own combo as `request-incompatible`.
+    if (isRec(anthropicBody)) originalAnthropicBody = structuredClone(anthropicBody);
     if (isRec(anthropicBody) && effortOverride) {
       anthropicBody.output_config = {
         ...(isRec(anthropicBody.output_config) ? anthropicBody.output_config : {}),
@@ -926,10 +972,9 @@ async function handleClaudeMessagesWithBudget(
       };
       delete anthropicBody.thinking;
     }
-    if (isRec(anthropicBody)) {
-      originalAnthropicBody = structuredClone(anthropicBody);
-      comboRandomSeed = anthropicRequestCorrelationKey(anthropicBody);
-    }
+    // Deliberately AFTER the rewrite: count and generation must derive the same correlation key
+    // from the same canonicalized fields, and both reach this line with the rewrite applied.
+    if (isRec(anthropicBody)) comboRandomSeed = anthropicRequestCorrelationKey(anthropicBody);
     const translation = anthropicToResponsesTranslation(anthropicBody, cc, translatorBudget);
     internalBody = translation.body;
     if (originalAnthropicBody) {
@@ -1242,7 +1287,17 @@ async function handleClaudeMessagesWithBudget(
       finalizeSource(502, { terminalStatus: "failed", closeReason: "terminal" });
       return anthropicErrorResponse(502, "canonical Anthropic returned an invalid JSON response", "api_error");
     }
-    logCtx.usage = usageFromAnthropic(isRec(payload.usage) ? payload.usage : undefined);
+    // Non-streaming replay only. A key-auth attempt owns its own wire usage snapshot
+    // (`keyUsageOwners`), and settle refuses to attribute request-level usage to such an
+    // attempt -- so writing `logCtx.usage` alone leaves the attempt, and the row totalled from
+    // it, reporting nothing for a turn that really spent tokens. The SSE lane needs none of
+    // this: its inspector attributes frame by frame as it parses, and repeating this there
+    // would count the same tokens twice.
+    const replayUsage = usageFromAnthropic(isRec(payload.usage) ? payload.usage : undefined);
+    if (!recordKeyWireAttemptUsage(logCtx, replayUsage)) {
+      logCtx.usage = replayUsage;
+      if (logCtx.activeAttempt) logCtx.activeAttempt.usage = replayUsage;
+    }
     finalizeSource(response.status, { closeReason: "terminal" });
     return new Response(new Uint8Array(bytes), {
       status: response.status,
@@ -1268,6 +1323,16 @@ async function handleClaudeMessagesWithBudget(
         if (text) message = `upstream error (${response.status}): ${text.slice(0, 400)}`;
       }
     } catch { /* keep fallback message */ }
+    // Upstream answers a spent model-family window with the same generic `rate_limit_error` it
+    // uses for ordinary throttling, whose "try again later" is wrong advice for a window that
+    // will not roll for days. This gateway already caches the per-window percentages, so it
+    // names the spent window rather than repeating advice it can see is useless. Appended, never
+    // substituted: the upstream text is the caller's primary evidence.
+    if (response.status === 429) {
+      const accountIds = (getAccountSet("anthropic")?.accounts ?? []).map(account => account.id);
+      const quotaNote = explainPoolQuotaRefusal("anthropic", accountIds, logCtx.requestedModel);
+      if (quotaNote) message = `${message} [${quotaNote}]`;
+    }
     const upstreamRetryAfter = response.headers.get("retry-after");
     const retryAfter = replayRefusal
       ? undefined

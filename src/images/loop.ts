@@ -284,6 +284,20 @@ class LoopError extends Error {
  * Dependencies for one image-bridge iteration: parsed request, active adapter, incoming
  * metadata, and the optional image/video bridge plans.
  */
+/**
+ * A 429 rotation may cross accounts, not just keys, and the attempt row is where that shows up.
+ * A rotator that knows which kind it performed returns it; a bare adapter keeps the key default.
+ */
+type RotatedTarget = ProviderAdapter | { adapter: ProviderAdapter; recoveryKind: AttemptRecoveryKind };
+
+function rotatedAdapterOf(rotated: RotatedTarget): ProviderAdapter {
+  return "recoveryKind" in rotated ? rotated.adapter : rotated;
+}
+
+function rotatedRecoveryOf(rotated: RotatedTarget): AttemptRecoveryKind {
+  return "recoveryKind" in rotated ? rotated.recoveryKind : "key-429";
+}
+
 export interface ImageBridgeDeps {
   parsed: OcxParsedRequest;
   adapter: ProviderAdapter;
@@ -334,7 +348,7 @@ export interface ImageBridgeDeps {
     retryAfterHeader: string | null,
     responseHeaders?: Headers,
     retryParsed?: OcxParsedRequest,
-  ) => ProviderAdapter | null | Promise<ProviderAdapter | null>;
+  ) => RotatedTarget | null | Promise<RotatedTarget | null>;
   /** Optional fail-closed credential recovery. The callback must inspect a clone and return null for unrecognized responses. */
   onCredentialError?: (response: Response, signal: AbortSignal) =>
     | { adapter: ProviderAdapter; recoveryKind: AttemptRecoveryKind }
@@ -697,9 +711,9 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
         const rotated = await deps.on429(prepared.response.headers.get("retry-after"), prepared.response.headers, iterParsed);
         if (!rotated) break;
         try { void prepared.response.body?.cancel().catch(() => {}); } catch { /* already closed */ }
-        adapter = rotated;
+        adapter = rotatedAdapterOf(rotated);
         yield { type: "heartbeat" };
-        prepared = await fetchOnce(adapter, "key-429");
+        prepared = await fetchOnce(adapter, rotatedRecoveryOf(rotated));
       }
 
       // Final headers have arrived. Clear only the deadline timer before ANY body read.

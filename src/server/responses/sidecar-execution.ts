@@ -70,6 +70,7 @@ export async function executeResponsesSidecars(
     | "oauthDispatch"
     | "noteRoutedAttemptSend"
     | "bindKeyUsageFromBridge"
+    | "exactAnthropicSourceReplay"
   >,
   sidecarState: Pick<ResponsesSidecarAuth, "routedCompaction" | "openAiSidecar">,
   responseEffects: Pick<
@@ -147,19 +148,28 @@ export async function executeResponsesSidecars(
   //   - non-runTurn: web-search wins over image when both eligible (documented priority)
   //   - runTurn: image bridge may run (it supports runTurn); web-search is skipped so runTurn
   //     can proceed for web-search-only turns
-  const wsPlan = !routedCompaction
+  // A turn that will be replayed to canonical Anthropic byte-for-byte plans no sidecar at all.
+  // Every one of these rewrites the request — web search injects its tool and system contract,
+  // the media bridges inject `image_gen`/`video_gen` — and Anthropic serves its own server tools
+  // on the source wire, so planning one both breaks the exactness and duplicates a capability
+  // the target already has.
+  const canPlanSidecars = !routedCompaction && !transportState.exactAnthropicSourceReplay;
+  const wsPlan = canPlanSidecars
     ? planWebSearch(config, parsed, false, route.provider, route.modelId, openAiSidecar, {
       admission: options.admission, codexAuthPolicy: options.codexAuthPolicy, providerName: route.providerName,
     })
     : undefined;
-  const imgPlan = !routedCompaction ? await planImageBridge(config, parsed, route.provider) : undefined;
-  const vidPlan = !routedCompaction ? await planVideoBridge(config, parsed, route.provider) : undefined;
+  const imgPlan = canPlanSidecars ? await planImageBridge(config, parsed, route.provider) : undefined;
+  const vidPlan = canPlanSidecars ? await planVideoBridge(config, parsed, route.provider) : undefined;
   const canRunWebSearch = !!wsPlan && !transportState.adapter.runTurn;
   const rotateSidecarProviderOn429 = async (
     retryAfter: string | null,
     responseHeaders?: Headers,
     retryParsed?: OcxParsedRequest,
-  ): Promise<ProviderAdapter | null> => {
+  ): Promise<{ adapter: ProviderAdapter; recoveryKind: AttemptRecoveryKind } | null> => {
+    // Which pool answered decides how the attempt row reads: an account rotation is not a key
+    // rotation, and logging one as the other hides which credential a 429 actually moved off.
+    let recoveryKind: AttemptRecoveryKind = "oauth-account-429";
     const rotated = rotateProviderTransportOn429(config, route.providerName, route.provider, {
       retryAfter,
       now: Date.now(),
@@ -168,6 +178,7 @@ export async function executeResponsesSidecars(
     });
     if (rotated) {
       route.provider = rotated;
+      recoveryKind = "key-429";
     } else if (
       // A POSITIVE gate, not an early return. An early `return null` here made every later arm
       // unreachable: Anthropic never has a genericFailoverAccountId (isGenericFailoverProvider
@@ -280,7 +291,7 @@ export async function executeResponsesSidecars(
       provider: route.provider,
       adapterName: rotatedAdapter.name,
     });
-    return rotatedAdapter;
+    return { adapter: rotatedAdapter, recoveryKind };
   };
   // A 403 credential denial is recoverable for a sidecar turn the same way it is on the main
   // dispatch path: rotate to the next eligible Anthropic account instead of ending the turn.
@@ -375,6 +386,11 @@ export async function executeResponsesSidecars(
         recordAdapterTier(logCtx, request);
       },
       ...(vidPlan?.timeoutMs ? { videoTimeoutMs: vidPlan.timeoutMs } : {}),
+      // Each hidden round is billed to the account that served it, so its usage lands on the
+      // attempt open at that moment rather than on whichever attempt survives to the terminal.
+      onIterationUsage: usage => {
+        if (usage && logCtx.activeAttempt) logCtx.activeAttempt.usage = usage;
+      },
       onUsage: usage => {
         // Cursor may assign _cursorConversationId inside the image loop's first runTurn;
         // backfill so Logs can filter/total that opening request (parity with the normal
@@ -382,7 +398,7 @@ export async function executeResponsesSidecars(
         if (!logCtx.conversationId && parsed._cursorConversationId) {
           logCtx.conversationId = normalizeLogConversationId(parsed._cursorConversationId);
         }
-        transportState.bindKeyUsageFromBridge(usage);
+        transportState.bindKeyUsageFromBridge(usage, { requestAggregate: true });
       },
       onCredentialError: rotateSidecarProviderOnCredentialError,
       on429: rotateSidecarProviderOn429,
@@ -460,8 +476,11 @@ export async function executeResponsesSidecars(
       },
       onAttemptSend: (recovery?: AttemptRecoveryKind) =>
         transportState.noteRoutedAttemptSend(logCtx.usageLogInputTokens, recovery),
+      onIterationUsage: usage => {
+        if (usage && logCtx.activeAttempt) logCtx.activeAttempt.usage = usage;
+      },
       onUsage: usage => {
-        transportState.bindKeyUsageFromBridge(usage);
+        transportState.bindKeyUsageFromBridge(usage, { requestAggregate: true });
       },
       recordSidecarOutcome: wsPlan.forwardSidecar?.recordOutcome,
       connectTimeoutMs: config.connectTimeoutMs ?? 200_000,

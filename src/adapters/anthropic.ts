@@ -257,15 +257,22 @@ function enforceCacheControlLimit(body: Record<string, unknown>, limit = MAX_CAC
 
 export function effectivePromptCacheTtlMs(body: Record<string, unknown>): number | undefined {
   const controls: unknown[] = [body.cache_control];
-  const collect = (blocks: Array<Record<string, unknown>> | undefined) => {
-    if (blocks) controls.push(...blocks.map(block => block.cache_control));
+  // The cast is not a guarantee. On the canonical replay lane this reads the CALLER's raw body,
+  // where `system` is legally a plain string (the documented Anthropic shape) and `tools` may be
+  // absent or malformed -- `"You are...".map` throws, and the whole request 500s instead of
+  // being replayed. Only an actual array is walked.
+  const collect = (blocks: unknown) => {
+    if (!Array.isArray(blocks)) return;
+    for (const block of blocks) {
+      if (block && typeof block === "object") controls.push((block as Record<string, unknown>).cache_control);
+    }
   };
-  collect(body.tools as Array<Record<string, unknown>> | undefined);
-  collect(body.system as Array<Record<string, unknown>> | undefined);
-  const messages = body.messages as Array<Record<string, unknown>> | undefined;
-  if (messages) {
-    for (const message of messages) {
-      if (Array.isArray(message.content)) {
+  collect(body.tools);
+  collect(body.system);
+  const messages = body.messages;
+  if (Array.isArray(messages)) {
+    for (const message of messages as Array<Record<string, unknown>>) {
+      if (message && typeof message === "object" && Array.isArray(message.content)) {
         collect(message.content as Array<Record<string, unknown>>);
       }
     }

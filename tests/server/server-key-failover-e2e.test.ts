@@ -1029,6 +1029,72 @@ describe("server 429 key failover (end-to-end)", () => {
    * Responses core self-heals a wholesale assignment. That contract is pinned as a unit in
    * tests/adapters/key-failover.test.ts, where it has a red control that actually fails.
    */
+  /**
+   * The native Responses passthrough grew its key-pool 429 arm separately from the two adapter
+   * loops, so the thing worth pinning is not that rotation happens -- it is that the walk is
+   * BOUNDED. Both stops are cost stops: a pool larger than the request's send budget must not
+   * turn one client turn into one upstream send per key, and a fully cooled pool must end the
+   * ladder with the refusal already in hand rather than re-sending to learn it again.
+   */
+  test("passthrough key-pool 429 rotation stops at the send budget and at a fully cooled pool", async () => {
+    const seen: string[] = [];
+    upstream = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(req) {
+      seen.push(req.headers.get("authorization") ?? "");
+      return new Response(JSON.stringify({ error: { message: "pool is rate limited" } }), {
+        status: 429,
+        headers: { "retry-after": "31", "content-type": "application/json" },
+      });
+    } });
+    const pool = ["k1", "k2", "k3", "k4", "k5", "k6"];
+    const writeConfig = () => saveConfig({ port: 0, hostname: "127.0.0.1", defaultProvider: "pooled", providers: { pooled: {
+      adapter: "openai-responses", baseUrl: `http://127.0.0.1:${upstream!.port}/v1`, allowPrivateNetwork: true,
+      authMode: "key", apiKey: "synthetic-k1",
+      apiKeyPool: pool.map(id => ({ id, key: `synthetic-${id}` })),
+    } } } as OcxConfig);
+    writeConfig();
+    const ask = (server: ReturnType<typeof startServer>) => fetch(new URL("/v1/responses", server.url), {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "pooled/test", input: "hi", stream: false }),
+    });
+    const budgetServer = startServer(0);
+    try {
+      const budgeted = await ask(budgetServer);
+      // The refusal the client gets is the upstream's own, not a synthetic exhaustion error.
+      expect(budgeted.status).toBe(429);
+      expect(budgeted.headers.get("retry-after")).toBe("31");
+      expect(await budgeted.text()).toContain("pool is rate limited");
+      // Six eligible keys, but the request's send budget is what ends the walk. This number is
+      // the assertion: if it ever equals the pool size, the ladder is unbounded again.
+      expect(seen.length).toBeLessThan(pool.length);
+      expect(seen).toEqual(["Bearer synthetic-k1", "Bearer synthetic-k2", "Bearer synthetic-k3"]);
+      // Every send used a distinct key -- a rotation that re-sent on a cooled key would burn
+      // the budget without ever reaching a warm credential.
+      expect(new Set(seen).size).toBe(seen.length);
+
+    } finally {
+      await budgetServer.stop(true);
+    }
+
+    // Second stop: every key already cooling. rotateProviderTransportOn429 has no candidate, so
+    // the loop breaks on the first refusal instead of re-sending the turn to discover that.
+    seen.length = 0;
+    const live = loadConfig();
+    for (const id of pool) rotateKeyOn429(live, "pooled", null, Date.now(), `synthetic-${id}`);
+    // A fresh server reads the committed key from disk, so the cooled pool is the only state
+    // that differs from the first phase.
+    writeConfig();
+    const cooledServer = startServer(0);
+    try {
+      const cooled = await ask(cooledServer);
+      expect(cooled.status).toBe(429);
+      expect(cooled.headers.get("retry-after")).toBe("31");
+      expect(await cooled.text()).toContain("pool is rate limited");
+      expect(seen).toEqual(["Bearer synthetic-k1"]);
+    } finally {
+      await cooledServer.stop(true);
+    }
+  });
+
   test("the Responses core pick reaches the warm key through /v1/responses", async () => {
     const seen: string[] = [];
     upstream = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(req) {

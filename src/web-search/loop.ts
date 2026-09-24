@@ -267,6 +267,20 @@ class LoopError extends Error {
  * Dependencies for one web-search loop iteration: parsed request, active adapter,
  * incoming metadata, and the configured search executor.
  */
+/**
+ * A 429 rotation may cross accounts, not just keys, and the attempt row is where that shows up.
+ * A rotator that knows which kind it performed returns it; a bare adapter keeps the key default.
+ */
+type RotatedTarget = ProviderAdapter | { adapter: ProviderAdapter; recoveryKind: AttemptRecoveryKind };
+
+function rotatedAdapterOf(rotated: RotatedTarget): ProviderAdapter {
+  return "recoveryKind" in rotated ? rotated.adapter : rotated;
+}
+
+function rotatedRecoveryOf(rotated: RotatedTarget): AttemptRecoveryKind {
+  return "recoveryKind" in rotated ? rotated.recoveryKind : "key-429";
+}
+
 export interface WebSearchLoopDeps {
   parsed: OcxParsedRequest;
   adapter: ProviderAdapter;
@@ -346,7 +360,7 @@ export interface WebSearchLoopDeps {
     retryAfterHeader: string | null,
     responseHeaders?: Headers,
     retryParsed?: OcxParsedRequest,
-  ) => ProviderAdapter | null | Promise<ProviderAdapter | null>;
+  ) => RotatedTarget | null | Promise<RotatedTarget | null>;
   /** Optional fail-closed credential recovery. The callback must inspect a clone and return null for unrecognized responses. */
   onCredentialError?: (response: Response, signal: AbortSignal) =>
     | { adapter: ProviderAdapter; recoveryKind: AttemptRecoveryKind }
@@ -607,10 +621,10 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
         // Never let a broken body's cancel promise outlive the cumulative header deadline. Observe
         // it, but proceed immediately to the rotated fetch under the SAME deadline signal.
         try { void prepared.response.body?.cancel().catch(() => {}); } catch { /* already closed */ }
-        adapter = rotated;
+        adapter = rotatedAdapterOf(rotated);
         // Stall-watchdog seam between bounded retry fetches (audit 011 B3).
         yield { type: "heartbeat" };
-        prepared = await fetchOnce(adapter, "key-429");
+        prepared = await fetchOnce(adapter, rotatedRecoveryOf(rotated));
       }
 
       // Final headers have arrived. Clear only the deadline timer before ANY body read.

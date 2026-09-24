@@ -284,6 +284,45 @@ This is how Claude Code surfaces messages the user sends mid-turn — within the
     expect(effortForThinkingBudget(30000)).toBe("high");
   });
 
+  test("an optional property drops the strict claim instead of becoming required", () => {
+    const base = { model: "m", max_tokens: 10, messages: [{ role: "user", content: "hi" }] };
+    const formatOf = (body: unknown) =>
+      (body as { text?: { format?: Record<string, unknown> } }).text?.format;
+    const schemaWith = (required: string[]) => ({
+      type: "object",
+      properties: { verdict: { type: "string" }, impossible: { type: "boolean" } },
+      required,
+    });
+
+    // The reported failure: a goal check whose `impossible` flag is optional. OpenAI strict mode
+    // rejects it outright ("'required' ... an array including every key in properties"), and on a
+    // combo whose canonical Anthropic target is unavailable there is no second target to serve it.
+    const optional = formatOf(anthropicToResponsesBody({
+      ...base,
+      output_config: { format: { type: "json_schema", schema: schemaWith(["verdict"]) } },
+    }));
+    expect(optional?.strict).toBe(false);
+    // The caller said optional, so it stays optional -- satisfying strict by adding the key to
+    // `required` would change the contract the caller asked for.
+    expect((optional?.schema as { required?: string[] }).required).toEqual(["verdict"]);
+
+    // A schema that genuinely qualifies keeps the stronger guarantee.
+    expect(formatOf(anthropicToResponsesBody({
+      ...base,
+      output_config: { format: { type: "json_schema", schema: schemaWith(["verdict", "impossible"]) } },
+    }))?.strict).toBe(true);
+
+    // Nested objects count: an optional field one level down is just as fatal.
+    expect(formatOf(anthropicToResponsesBody({
+      ...base,
+      output_config: { format: { type: "json_schema", schema: {
+        type: "object",
+        properties: { outer: schemaWith(["verdict"]) },
+        required: ["outer"],
+      } } },
+    }))?.strict).toBe(false);
+  });
+
   test("adaptive /effort wire: output_config.effort maps to reasoning.effort (devlog 080)", () => {
     const base = { model: "m", max_tokens: 10, messages: [{ role: "user", content: "hi" }] };
     const reasoningOf = (body: unknown) => (body as { reasoning?: Record<string, unknown> }).reasoning;
@@ -336,8 +375,10 @@ This is how Claude Code surfaces messages the user sends mid-turn — within the
       output_config: { format: { type: "json_schema", schema } },
     });
 
-    expect(body.text).toEqual({ format: { type: "json_schema", name: "response", schema } });
-    expect(parseRequest(body).options.textFormat).toEqual({ type: "json_schema", name: "response", schema });
+    // `strict: true` because every property here is required -- the schema genuinely satisfies
+    // OpenAI strict mode, so the stronger guarantee is claimed.
+    expect(body.text).toEqual({ format: { type: "json_schema", name: "response", schema, strict: true } });
+    expect(parseRequest(body).options.textFormat).toEqual({ type: "json_schema", name: "response", schema, strict: true });
   });
 
   test("structured output rejects unsupported schemas and preserves root references", () => {
@@ -362,8 +403,10 @@ This is how Claude Code surfaces messages the user sends mid-turn — within the
     });
 
     expect(invalid.text).toBeUndefined();
+    // `value` is not in a `required` list, so strict mode would reject it -- the claim is
+    // dropped and the reference is preserved untouched.
     expect(referenced.text).toEqual({
-      format: { type: "json_schema", name: "response", schema: refSchema },
+      format: { type: "json_schema", name: "response", schema: refSchema, strict: false },
     });
   });
 

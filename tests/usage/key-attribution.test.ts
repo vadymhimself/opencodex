@@ -27,6 +27,39 @@ describe("key attempt accounting", () => {
     expect(rows[0].usage).toMatchObject({ inputTokens: 300, outputTokens: 30 });
   });
 
+  test("a row surviving two rotations keeps the input estimate and the tier observer", () => {
+    // Estimated-usage adapters (kiro, cursor) report no per-turn input tokens, so the request
+    // floor in `usageLogInputTokens` IS their reported input, and `activeTierMetadata` is the
+    // live observer the response parse writes into. Both are request-level state that the
+    // sidecar and runTurn sites only ever READ (`run-turn-execution.ts:149`,
+    // `chat-native.ts:353`, `sidecar-execution.ts` twice) -- nothing re-seeds them between
+    // rotations there. Clearing either in the split therefore survives one rotation, because
+    // the rotating call captured its argument first, and then loses everything from the SECOND:
+    // `in: 0` on the adapters where the floor is the only input signal, and a tier confirmation
+    // that can only read "unknown". One rotation cannot catch it; this test takes two.
+    const active = beginRequestAttempt(1, "cursor (a)", "sonnet", "cursor");
+    const logCtx: RequestLogContext = {
+      provider: "cursor (a)", model: "sonnet", providerAdapter: "cursor",
+      activeAttempt: active, attempts: [active], activeAttemptStartedAt: Date.now(),
+      usageLogInputTokens: 1234,
+      activeTierMetadata: { observeResponseServiceTier() {}, markResponseUnparseable() {} } as never,
+    };
+    const oauth = { adapter: "cursor" as const, authMode: "oauth" as const, baseUrl: "https://cursor.test" };
+    // Account rotations, so the split fires on the provider axis exactly as the live pool does.
+    noteProviderAttemptSend(logCtx, "cursor", oauth, logCtx.usageLogInputTokens, undefined);
+    logCtx.provider = "cursor (b)";
+    noteProviderAttemptSend(logCtx, "cursor", oauth, logCtx.usageLogInputTokens, "oauth-account-429");
+    logCtx.provider = "cursor (c)";
+    noteProviderAttemptSend(logCtx, "cursor", oauth, logCtx.usageLogInputTokens, "oauth-account-429");
+
+    expect(logCtx.attempts).toHaveLength(3);
+    expect(logCtx.activeAttempt?.inputTokenEstimate).toBe(1234);
+    expect(logCtx.activeTierMetadata).toBeDefined();
+    const rows: RequestLogEntry[] = [];
+    addFinalRequestLog("two-rotation-estimate", Date.now(), logCtx, 200, undefined, row => rows.push(row));
+    expect(rows[0].usage).toMatchObject({ inputTokens: 1234, estimated: true });
+  });
+
   test("a reader takes the attempts or the request total, never both", () => {
     // The row above deliberately carries BOTH the per-attempt records (100 + 200) and the
     // request total (300). A consumer that added them would report 600 input tokens for 300

@@ -50,6 +50,7 @@ import {
   usageForFinalLog,
   usageStatusForFinalLog,
   usageTotalTokens,
+  credentialRecoveryStatus,
   type AttemptRecoveryKind,
   type AttemptRecoveryWithheld,
   type CacheTelemetryProvenance,
@@ -1852,12 +1853,14 @@ export function noteProviderAttemptSend(
   stampApiKeyAccountLabel(logCtx, providerName, provider);
   const next = logCtx.accountLogLabel;
   if (attempt && usesApiKeyAccount(provider)) keyUsageOwners.add(attempt);
-  if (attempt && attempt.sendCount > 0 && attemptAccountChanged(previous, next, attempt.provider, logCtx.provider)) {
+  const recoveryStatus = credentialRecoveryStatus(recovery);
+  if (attempt && attempt.sendCount > 0
+    && (recoveryStatus !== undefined || attemptAccountChanged(previous, next, attempt.provider, logCtx.provider))) {
     // An input estimate is not evidence that a failed send used that many tokens.
     delete attempt.inputTokenEstimate;
     finishRequestAttempt(attempt, attempt.status >= 100 ? attempt.status
-      : recovery === "key-401" ? 401 : recovery?.includes("403") ? 403
-      : recovery?.includes("429") ? 429 : 502,
+      : recoveryStatus ?? (recovery?.includes("403") ? 403
+      : recovery?.includes("429") ? 429 : 502),
     Date.now() - (logCtx.activeAttemptStartedAt ?? Date.now()), attempt.usage);
     // This attempt is being sealed because a NAMED recovery rejected it, so the recovery kind
     // is direct evidence here rather than an inference from history. Without this the sealed
@@ -1879,7 +1882,26 @@ export function noteProviderAttemptSend(
     }
     for (const key of Object.keys(attempt)) delete (attempt as unknown as Record<string, unknown>)[key];
     Object.assign(attempt, fresh);
+    // The finished row owns what it spent: leaving its totals here attributes them to the
+    // account that just failed, and a stale `usageIsRequestAggregate` is worse than a stale
+    // total, because settle refuses to attribute usage to an attempt carrying it -- the new row
+    // would then report nothing at all. `tierOutcome` is a plain value the fresh attempt above
+    // already copied, so it goes with them.
+    //
+    // Deliberately NOT the fork's full transition list. The fork also cleared
+    // `usageLogInputTokens` and `activeTierMetadata`, which it could because its transition ran
+    // at the dispatch moment; here the split runs INSIDE the send and both are read back after
+    // it. Measured on a two-rotation turn: clearing them leaves the second rotation's row with
+    // `inputTokenEstimate: undefined` and the final log with `usage: undefined` -- an
+    // estimated-usage adapter (kiro, cursor) reporting no input tokens at all -- and hands the
+    // response parse an undefined tier observer, so `confirmation` can only stay "unknown".
+    // `usageLogInputTokens` is request-level state that chat-native.ts:353,
+    // run-turn-execution.ts:149 and both sidecar sites pass into every later send;
+    // `activeTierMetadata` is a live observer armed once per build and never re-armed here.
     delete logCtx.usage;
+    delete logCtx.usageIsRequestAggregate;
+    delete logCtx.usageFromBridge;
+    delete logCtx.tierOutcome;
     logCtx.activeAttemptStartedAt = Date.now();
   }
   if (attempt) {

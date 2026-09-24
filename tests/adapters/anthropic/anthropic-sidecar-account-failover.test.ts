@@ -72,11 +72,16 @@ beforeAll(async () => {
       adapter: ProviderAdapter;
       incomingMeta: IncomingMeta;
       fetchForRequest: (request: AdapterRequest, parsed: OcxParsedRequest) => typeof fetch;
+      // Both recovery hooks return the rotated target plus the kind of recovery it was, so an
+      // account rotation cannot be logged as a key rotation.
       onCredentialError?: (response: Response, signal: AbortSignal) => Promise<{
         adapter: ProviderAdapter;
         recoveryKind: AttemptRecoveryKind;
       } | null>;
-      on429?: (retryAfter: string | null) => Promise<ProviderAdapter | null>;
+      on429?: (retryAfter: string | null) => Promise<{
+        adapter: ProviderAdapter;
+        recoveryKind: AttemptRecoveryKind;
+      } | null>;
     }) => {
       if (sidecarMode === "403") {
         // Credential-denial seam: the loop rotates on a 403 the provider fetch never sees,
@@ -105,7 +110,7 @@ beforeAll(async () => {
       await refused.body?.cancel();
       const rotated = await args.on429?.(retryAfter);
       if (!rotated) throw new Error("Anthropic sidecar did not rotate after 429");
-      const second = await rotated.buildRequest(args.parsed, args.incomingMeta);
+      const second = await rotated.adapter.buildRequest(args.parsed, args.incomingMeta);
       return args.fetchForRequest(second, args.parsed)(second.url, {
         method: second.method, headers: second.headers, body: second.body,
       });

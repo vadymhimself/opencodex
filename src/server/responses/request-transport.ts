@@ -47,6 +47,13 @@ import { captureConfigGeneration } from "../../lib/state-store-sweeper";
 import { recordAnthropicAccountQuotaFromHeaders, hasPassiveAccountQuota } from "../../providers/quota";
 import { checkOutboundBodySize, describeOutboundBodyRefusal } from "./outbound-body-guard";
 import { formatErrorResponse } from "../../bridge";
+import {
+  anthropicMessagesUrl,
+  canReplayAnthropicSource,
+  isExactCanonicalAnthropicMessagesUrl,
+} from "../../adapters/anthropic";
+import { comboRequestHasImageInput } from "../../combos";
+import { isModelTextOnly } from "../../vision";
 import { bindRouteReasoningReplayScope } from "./core-replay";
 import { sessionIdHeaderFromRequest, normalizeLogConversationId } from "../request-log-conversation";
 import { redactSecretString } from "../../lib/redact";
@@ -260,16 +267,26 @@ export async function prepareResponsesTransport(
       pendingKeySend?.estimate ?? logCtx.usageLogInputTokens, pendingKeySend?.recovery);
     pendingKeySend = undefined;
   };
-  const bindKeyUsageFromBridge = (usage: OcxUsage | undefined): void => {
+  const bindKeyUsageFromBridge = (
+    usage: OcxUsage | undefined,
+    options?: { requestAggregate?: boolean },
+  ): void => {
     logCtx.usageFromBridge = true;
     if (usesApiKeyAccount(route.provider)) {
       logCtx.usage = logCtx.activeAttempt?.usage;
       return;
     }
-    if (usage) {
-      logCtx.usage = usage;
-      if (logCtx.activeAttempt) logCtx.activeAttempt.usage = usage;
+    if (!usage) return;
+    logCtx.usage = usage;
+    // A sidecar's final total covers hidden rounds this attempt never sent, and on an account
+    // rotation those rounds belong to the account that spent them. Marking the row's usage as a
+    // request aggregate keeps the whole total off the attempt that happens to be active, which
+    // is how the second account used to get billed for the first account's tokens.
+    if (options?.requestAggregate) {
+      logCtx.usageIsRequestAggregate = true;
+      return;
     }
+    if (logCtx.activeAttempt) logCtx.activeAttempt.usage = usage;
   };
   const selectionIsCurrent = (binding: DispatchBinding | undefined): boolean => {
     if (route.provider.authMode === "forward") return true;
@@ -505,6 +522,10 @@ export async function prepareResponsesTransport(
         const admitted = await commitResolvedOAuthSelection(await getAnthropicPoolAccessSnapshot(selection.accountId), true, selection.reason);
         if (!admitted) return formatErrorResponse(409, "conflict_error", "OAuth account selection changed; retry the request");
         anthropicPoolAccountId = admitted.accountId;
+        // Same stamp the generic OAuth branch makes below: recovery compares this snapshot to
+        // decide whether a credential denial may rotate. Without it the pool looks like it has
+        // no served account, so an expired subscription's 403 stands instead of moving on.
+        replayOAuthCredentialSnapshot = { accountId: admitted.accountId, generation: admitted.generation };
         route.provider = { ...route.provider, apiKey: admitted.accessToken };
         logCtx.provider = formatAnthropicProviderForLog("anthropic", admitted.accountId, config);
       } else {
@@ -662,6 +683,40 @@ export async function prepareResponsesTransport(
     delete logCtx.accountLogLabel;
   }
   adapter = resolveSelectionAdapter(adapterProvider, config.cacheRetention);
+  // Canonical Anthropic entry gate. A route that reaches Anthropic's own /v1/messages must be
+  // served the caller's exact bytes; anything else would re-encode them, which is how native
+  // server tools, cache_control and citations get lost. So the moment the target is canonical
+  // and the source cannot be replayed verbatim, the request fails here rather than silently
+  // downgrading to a translated turn.
+  let anthropicMessagesSource = options.anthropicMessagesSource;
+  const canonicalAnthropicMessagesRoute = inboundWire === "anthropic"
+    && adapter.name === "anthropic"
+    && isExactCanonicalAnthropicMessagesUrl(anthropicMessagesUrl(adapterProvider.baseUrl));
+  const canReplayCurrentAnthropicSource = (): boolean => canonicalAnthropicMessagesRoute
+    && anthropicMessagesSource !== undefined
+    && canReplayAnthropicSource(anthropicMessagesSource.body, route.modelId, adapterProvider);
+  // A text-only target cannot receive the caller's images, and dropping them would change the
+  // bytes we promised to replay, so an image request to such a target is refused, not stripped.
+  const sourceReplayHasUnsupportedImages = isModelTextOnly(adapterProvider, route.modelId)
+    && comboRequestHasImageInput(parsed._rawBody);
+  const exactAnthropicSourceReplay = canReplayCurrentAnthropicSource()
+    && !sourceReplayHasUnsupportedImages;
+  if (canonicalAnthropicMessagesRoute
+    && (!canReplayCurrentAnthropicSource() || sourceReplayHasUnsupportedImages)) {
+    return formatErrorResponse(
+      400,
+      "invalid_request_error",
+      "Canonical Anthropic Messages routing requires exact replay of the caller request.",
+    );
+  }
+  if (anthropicMessagesSource?.requiresExactReplay === true
+    && (!canReplayCurrentAnthropicSource() || sourceReplayHasUnsupportedImages)) {
+    return formatErrorResponse(
+      400,
+      "invalid_request_error",
+      "Anthropic-native tools require exact canonical Anthropic Messages replay for this request.",
+    );
+  }
   bindRouteReasoningReplayScope({
     parsed,
     providerName: route.providerName,
@@ -817,6 +872,14 @@ export async function prepareResponsesTransport(
     selectionIsCurrent,
     resolveSelectionAdapter,
     refreshRunTurnAdapter,
+    exactAnthropicSourceReplay,
+    get anthropicMessagesSource(): typeof anthropicMessagesSource {
+      return anthropicMessagesSource;
+    },
+    /** Cleared when the request body is rewritten: mutated bytes are no longer the caller's. */
+    clearAnthropicMessagesSource(): void {
+      anthropicMessagesSource = undefined;
+    },
     oauthDispatch,
     noteRoutedAttemptSend,
     commitKeyAttemptSend,

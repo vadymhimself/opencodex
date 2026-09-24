@@ -1,3 +1,4 @@
+import type { AnthropicMessagesSource } from "../../adapters/base";
 import type { NativeResponseControl } from "./native-response-control";
 import type { OcxUsage, OcxProviderContinuationState, OcxConfig } from "../../types";
 import type { CodexAuthPolicyConfig, CodexAuthContext } from "../../codex/auth-context";
@@ -50,6 +51,23 @@ export interface HandleResponsesOptions {
   claudeGoAffinity?: { sessionLane?: string };
   /** Validated Claude metadata identity; projected only into final canonical attempt headers. */
   claudeNativeSessionId?: string;
+  /**
+   * The caller's own Anthropic Messages request, carried verbatim for exact canonical replay.
+   *
+   * A canonical Anthropic target is served with these bytes rather than a re-encoding of the
+   * translated body, which is what keeps native server tools, cache_control and citations
+   * intact. Present only for an Anthropic inbound; the dispatch path drops it the moment the
+   * request is mutated (vision describe/strip), because a rewritten body is no longer the
+   * caller's.
+   */
+  anthropicMessagesSource?: AnthropicMessagesSource;
+  /**
+   * Stable per-request key for weighted combo target selection. Two calls that belong to the
+   * same client turn (an Anthropic count_tokens and the generation that follows it) pass the
+   * same seed so they land on the same target instead of pricing one target and generating on
+   * another.
+   */
+  comboRandomSeed?: string;
   /** Original live policy owner; separate from caller-specific routing/sidecar snapshots. */
   codexAuthPolicy?: CodexAuthPolicyConfig;
   turnAdmissionLease?: AdmissionLease;
