@@ -53,6 +53,7 @@ import type { OcxConfig, OcxParsedRequest } from "../../src/types";
 import { installIsolatedCodexHome, type IsolatedCodexHome } from "../helpers/isolated-codex-home";
 import { logsFromApiBody } from "../helpers/logs-api";
 import { managementFetch as fetch } from "../helpers/management-auth";
+import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
 import { ownedServiceHomeInspection } from "../helpers/owned-service-home-inspection";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
 import { SERVER_BUDGET_MS } from "../helpers/test-budget";
@@ -1773,167 +1774,179 @@ test("count_tokens applies generation source eligibility before picking a combo 
 });
 
 test("generation preflight applies physical Anthropic combo eligibility", async () => {
-  const captured: Record<string, unknown>[] = [];
-  globalThis.fetch = async (input, init) => {
-    const request = new Request(input, init);
-    if (request.url !== "https://api.anthropic.com/v1/messages") {
-      throw new Error(`unexpected egress ${request.url}`);
-    }
-    captured.push(await request.json() as Record<string, unknown>);
-    return anthropicTextSse();
-  };
-  const config = {
-    port: 0,
-    defaultProvider: "estimated",
-    providers: {
-      estimated: {
-        adapter: "kiro",
-        baseUrl: "https://runtime.us-east-1.kiro.dev",
-        authMode: "key",
-        apiKey: "estimated-key",
+  // Direct physical dispatch needs the writer lease before the shared spend ledger.
+  const releaseSpendHome = acquireOwnedSpendHome();
+  try {
+    const captured: Record<string, unknown>[] = [];
+    globalThis.fetch = async (input, init) => {
+      const request = new Request(input, init);
+      if (request.url !== "https://api.anthropic.com/v1/messages") {
+        throw new Error(`unexpected egress ${request.url}`);
+      }
+      captured.push(await request.json() as Record<string, unknown>);
+      return anthropicTextSse();
+    };
+    const config = {
+      port: 0,
+      defaultProvider: "estimated",
+      providers: {
+        estimated: {
+          adapter: "kiro",
+          baseUrl: "https://runtime.us-east-1.kiro.dev",
+          authMode: "key",
+          apiKey: "estimated-key",
+        },
+        target: {
+          adapter: "anthropic",
+          baseUrl: "https://api.anthropic.com",
+          authMode: "key",
+          apiKey: "selected-key",
+        },
       },
-      target: {
-        adapter: "anthropic",
-        baseUrl: "https://api.anthropic.com",
-        authMode: "key",
-        apiKey: "selected-key",
+      combos: {
+        "source-preflight": {
+          strategy: "failover",
+          targets: [
+            { provider: "estimated", model: "claude-sonnet-4.5" },
+            { provider: "target", model: "claude-haiku-4-5" },
+          ],
+        },
       },
-    },
-    combos: {
-      "source-preflight": {
-        strategy: "failover",
-        targets: [
-          { provider: "estimated", model: "claude-sonnet-4.5" },
-          { provider: "target", model: "claude-haiku-4-5" },
-        ],
-      },
-    },
-    claudeCode: { modelMap: { "claude-haiku-4-5": "combo/source-preflight" } },
-  } as OcxConfig;
-  const logCtx: RequestLogContext = {};
+      claudeCode: { modelMap: { "claude-haiku-4-5": "combo/source-preflight" } },
+    } as OcxConfig;
+    const logCtx: RequestLogContext = {};
 
-  const response = await handleClaudeMessages(new Request("http://localhost/v1/messages", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(routedAnthropicNativeToolSource()),
-  }), config, logCtx);
+    const response = await handleClaudeMessages(new Request("http://localhost/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(routedAnthropicNativeToolSource()),
+    }), config, logCtx);
 
-  expect(response.status).toBe(200);
-  await response.text();
-  expect(captured).toEqual([{
-    ...structuredClone(routedAnthropicNativeToolSource()),
-    model: "claude-haiku-4-5",
-  }]);
-  expect(logCtx.usageLogInputTokens).toBeUndefined();
+    expect(response.status).toBe(200);
+    await response.text();
+    expect(captured).toEqual([{
+      ...structuredClone(routedAnthropicNativeToolSource()),
+      model: "claude-haiku-4-5",
+    }]);
+    expect(logCtx.usageLogInputTokens).toBeUndefined();
+  } finally {
+    releaseSpendHome();
+  }
 });
 
 test("count_tokens and following generation share a random combo target", async () => {
-  const captured: Array<{ path: string; model: string }> = [];
-  globalThis.fetch = async (input, init) => {
-    const request = new Request(input, init);
-    const body = await request.json() as { model: string };
-    const path = new URL(request.url).pathname;
-    captured.push({ path, model: body.model });
-    if (path === "/v1/messages/count_tokens") {
-      return Response.json({ input_tokens: 123 });
-    }
-    if (path !== "/v1/messages") throw new Error(`unexpected egress ${request.url}`);
-    return new Response([
-      `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_random", type: "message", role: "assistant", model: body.model, content: [], stop_reason: null, usage: { input_tokens: 3, output_tokens: 0 } } })}\n\n`,
-      'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
-      'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}\n\n',
-      'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
-      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}\n\n',
-      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
-    ].join(""), { headers: { "content-type": "text/event-stream" } });
-  };
-  const config = {
-    port: 0,
-    defaultProvider: "first",
-    providers: {
-      first: {
-        adapter: "anthropic",
-        baseUrl: "https://api.anthropic.com",
-        authMode: "key",
-        apiKey: "first-key",
-      },
-      second: {
-        adapter: "anthropic",
-        baseUrl: "https://api.anthropic.com",
-        authMode: "key",
-        apiKey: "second-key",
-      },
-    },
-    combos: {
-      "count-random": {
-        strategy: "random",
-        targets: [
-          { provider: "first", model: "claude-opus-5" },
-          { provider: "second", model: "claude-haiku-4-5" },
-        ],
-      },
-    },
-    claudeCode: { modelMap: { "claude-opus-5": "combo/count-random" } },
-  } as OcxConfig;
-  const source = {
-    model: "claude-opus-5",
-    metadata: { user_id: "random-count-generation-session" },
-    messages: [{ role: "user", content: "same request" }],
-  };
-  const originalRandom = Math.random;
-  const draws = [0, 0.99, 0.99];
-  Math.random = () => draws.shift() ?? 0.99;
+  // Direct physical dispatch needs the writer lease before the shared spend ledger.
+  const releaseSpendHome = acquireOwnedSpendHome();
   try {
-    const count = await handleClaudeCountTokens(new Request("http://localhost/v1/messages/count_tokens", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(source),
-    }), config);
-    expect(count.status).toBe(200);
-    expect(await count.json()).toEqual({ input_tokens: 123 });
-
-    const generation = await handleClaudeMessages(new Request("http://localhost/v1/messages", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ ...source, max_tokens: 1024, stream: true }),
-    }), config, {});
-    expect(generation.status).toBe(200);
-    expect(await generation.text()).toContain("message_stop");
-    expect(captured.map(entry => entry.path)).toEqual([
-      "/v1/messages/count_tokens",
-      "/v1/messages",
-    ]);
-    expect(captured[1]!.model).toBe(captured[0]!.model);
-
-    const changedSource = {
-      ...source,
-      metadata: { user_id: "random-count-generation-cooldown" },
-      messages: [{ role: "user", content: "eligibility changes" }],
+    const captured: Array<{ path: string; model: string }> = [];
+    globalThis.fetch = async (input, init) => {
+      const request = new Request(input, init);
+      const body = await request.json() as { model: string };
+      const path = new URL(request.url).pathname;
+      captured.push({ path, model: body.model });
+      if (path === "/v1/messages/count_tokens") {
+        return Response.json({ input_tokens: 123 });
+      }
+      if (path !== "/v1/messages") throw new Error(`unexpected egress ${request.url}`);
+      return new Response([
+        `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_random", type: "message", role: "assistant", model: body.model, content: [], stop_reason: null, usage: { input_tokens: 3, output_tokens: 0 } } })}\n\n`,
+        'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}\n\n',
+        'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}\n\n',
+        'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+      ].join(""), { headers: { "content-type": "text/event-stream" } });
     };
-    const changedCount = await handleClaudeCountTokens(new Request("http://localhost/v1/messages/count_tokens", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(changedSource),
-    }), config);
-    expect(changedCount.status).toBe(200);
-    await changedCount.text();
-    const countedModel = captured[2]!.model;
-    const cooledProvider = countedModel === "claude-opus-5" ? "first" : "second";
-    coolComboTarget("count-random", { provider: cooledProvider, model: countedModel }, { cooldownMs: 60_000 });
+    const config = {
+      port: 0,
+      defaultProvider: "first",
+      providers: {
+        first: {
+          adapter: "anthropic",
+          baseUrl: "https://api.anthropic.com",
+          authMode: "key",
+          apiKey: "first-key",
+        },
+        second: {
+          adapter: "anthropic",
+          baseUrl: "https://api.anthropic.com",
+          authMode: "key",
+          apiKey: "second-key",
+        },
+      },
+      combos: {
+        "count-random": {
+          strategy: "random",
+          targets: [
+            { provider: "first", model: "claude-opus-5" },
+            { provider: "second", model: "claude-haiku-4-5" },
+          ],
+        },
+      },
+      claudeCode: { modelMap: { "claude-opus-5": "combo/count-random" } },
+    } as OcxConfig;
+    const source = {
+      model: "claude-opus-5",
+      metadata: { user_id: "random-count-generation-session" },
+      messages: [{ role: "user", content: "same request" }],
+    };
+    const originalRandom = Math.random;
+    const draws = [0, 0.99, 0.99];
+    Math.random = () => draws.shift() ?? 0.99;
     try {
-      const changedGeneration = await handleClaudeMessages(new Request("http://localhost/v1/messages", {
+      const count = await handleClaudeCountTokens(new Request("http://localhost/v1/messages/count_tokens", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ ...changedSource, max_tokens: 1024, stream: true }),
+        body: JSON.stringify(source),
+      }), config);
+      expect(count.status).toBe(200);
+      expect(await count.json()).toEqual({ input_tokens: 123 });
+
+      const generation = await handleClaudeMessages(new Request("http://localhost/v1/messages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...source, max_tokens: 1024, stream: true }),
       }), config, {});
-      expect(changedGeneration.status).toBe(200);
-      await changedGeneration.text();
-      expect(captured[3]!.model).not.toBe(countedModel);
+      expect(generation.status).toBe(200);
+      expect(await generation.text()).toContain("message_stop");
+      expect(captured.map(entry => entry.path)).toEqual([
+        "/v1/messages/count_tokens",
+        "/v1/messages",
+      ]);
+      expect(captured[1]!.model).toBe(captured[0]!.model);
+
+      const changedSource = {
+        ...source,
+        metadata: { user_id: "random-count-generation-cooldown" },
+        messages: [{ role: "user", content: "eligibility changes" }],
+      };
+      const changedCount = await handleClaudeCountTokens(new Request("http://localhost/v1/messages/count_tokens", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(changedSource),
+      }), config);
+      expect(changedCount.status).toBe(200);
+      await changedCount.text();
+      const countedModel = captured[2]!.model;
+      const cooledProvider = countedModel === "claude-opus-5" ? "first" : "second";
+      coolComboTarget("count-random", { provider: cooledProvider, model: countedModel }, { cooldownMs: 60_000 });
+      try {
+        const changedGeneration = await handleClaudeMessages(new Request("http://localhost/v1/messages", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ ...changedSource, max_tokens: 1024, stream: true }),
+        }), config, {});
+        expect(changedGeneration.status).toBe(200);
+        await changedGeneration.text();
+        expect(captured[3]!.model).not.toBe(countedModel);
+      } finally {
+        clearComboTargetCooldowns("count-random");
+      }
     } finally {
-      clearComboTargetCooldowns("count-random");
+      Math.random = originalRandom;
     }
   } finally {
-    Math.random = originalRandom;
+    releaseSpendHome();
   }
 });
 
@@ -5301,120 +5314,126 @@ test("routed canonical source settles protocol terminals without waiting for tra
 });
 
 test("same metadata user keeps concurrent routed source aborts isolated", async () => {
-  clearRequestLogsForTests();
-  const encoder = new TextEncoder();
-  type PhysicalRequest = {
-    signal: AbortSignal;
-    controller: ReadableStreamDefaultController<Uint8Array>;
-    body: Record<string, any>;
-  };
-  const physical: PhysicalRequest[] = [];
-  let resolveFirstSend!: () => void;
-  let resolveSecondSend!: () => void;
-  let resolveFirstAbort!: () => void;
-  const firstSend = new Promise<void>(resolve => { resolveFirstSend = resolve; });
-  const secondSend = new Promise<void>(resolve => { resolveSecondSend = resolve; });
-  const firstAbort = new Promise<void>(resolve => { resolveFirstAbort = resolve; });
-
-  globalThis.fetch = async (input, init) => {
-    const request = new Request(input, init);
-    if (request.url !== "https://api.anthropic.com/v1/messages") {
-      throw new Error(`unexpected egress ${request.url}`);
-    }
-    let controller!: ReadableStreamDefaultController<Uint8Array>;
-    const stream = new ReadableStream<Uint8Array>({
-      start(next) {
-        controller = next;
-        next.enqueue(encoder.encode([
-          'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_held","type":"message","role":"assistant","model":"claude-opus-5","content":[],"stop_reason":null,"usage":{"input_tokens":3,"output_tokens":0}}}\n\n',
-          'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
-          'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"held"}}\n\n',
-        ].join("")));
-      },
-    });
-    const entry = {
-      signal: request.signal,
-      controller,
-      body: await request.json() as Record<string, any>,
-    };
-    physical.push(entry);
-    request.signal.addEventListener("abort", () => {
-      try { controller.error(request.signal.reason); } catch { /* already settled */ }
-      if (physical[0] === entry) resolveFirstAbort();
-    }, { once: true });
-    if (physical.length === 1) resolveFirstSend();
-    if (physical.length === 2) resolveSecondSend();
-    return new Response(stream, { headers: { "content-type": "text/event-stream" } });
-  };
-
-  const config = {
-    port: 0,
-    defaultProvider: "target",
-    providers: {
-      target: {
-        adapter: "anthropic",
-        baseUrl: "https://api.anthropic.com",
-        authMode: "key",
-        apiKey: "selected-key",
-      },
-    },
-    combos: {
-      isolated: {
-        strategy: "failover",
-        targets: [{ provider: "target", model: "claude-opus-5" }],
-      },
-    },
-    claudeCode: { modelMap: { "claude-haiku-4-5": "combo/isolated" } },
-  } as OcxConfig;
-  const invoke = (client: AbortController, text: string) => handleClaudeMessages(
-    new Request("http://localhost/v1/messages", {
-      method: "POST",
-      signal: client.signal,
-      headers: { "content-type": "application/json", "x-api-key": "placeholder" },
-      body: JSON.stringify({
-        model: "claude-haiku-4-5",
-        max_tokens: 16,
-        stream: true,
-        metadata: { user_id: "shared-user-id" },
-        messages: [{ role: "user", content: text }],
-      }),
-    }),
-    config,
-    { model: "", provider: "" } as RequestLogContext,
-  );
-
+  // Direct physical dispatch needs the writer lease before the shared spend ledger.
+  const releaseSpendHome = acquireOwnedSpendHome();
   try {
-    const firstClient = new AbortController();
-    const firstPending = invoke(firstClient, "first");
-    await firstSend;
-    const secondClient = new AbortController();
-    const secondPending = invoke(secondClient, "second");
-    await secondSend;
-    const [firstResponse, secondResponse] = await Promise.all([firstPending, secondPending]);
-    expect(firstResponse.status).toBe(200);
-    expect(secondResponse.status).toBe(200);
-    expect(physical).toHaveLength(2);
-    expect(physical[0]!.body.metadata).toEqual(physical[1]!.body.metadata);
-
-    firstClient.abort(new DOMException("first client closed", "AbortError"));
-    await firstAbort;
-    expect(physical[0]!.signal.aborted).toBe(true);
-    expect(physical[1]!.signal.aborted).toBe(false);
-
-    physical[1]!.controller.enqueue(encoder.encode([
-      'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
-      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
-      'event: message_stop\ndata: {"type":"message_stop"}\n\n',
-    ].join("")));
-    physical[1]!.controller.close();
-    expect(await secondResponse.text()).toContain("message_stop");
-  } finally {
-    for (const entry of physical) {
-      if (!entry.signal.aborted) {
-        try { entry.controller.close(); } catch { /* already settled */ }
-      }
-    }
     clearRequestLogsForTests();
+    const encoder = new TextEncoder();
+    type PhysicalRequest = {
+      signal: AbortSignal;
+      controller: ReadableStreamDefaultController<Uint8Array>;
+      body: Record<string, any>;
+    };
+    const physical: PhysicalRequest[] = [];
+    let resolveFirstSend!: () => void;
+    let resolveSecondSend!: () => void;
+    let resolveFirstAbort!: () => void;
+    const firstSend = new Promise<void>(resolve => { resolveFirstSend = resolve; });
+    const secondSend = new Promise<void>(resolve => { resolveSecondSend = resolve; });
+    const firstAbort = new Promise<void>(resolve => { resolveFirstAbort = resolve; });
+
+    globalThis.fetch = async (input, init) => {
+      const request = new Request(input, init);
+      if (request.url !== "https://api.anthropic.com/v1/messages") {
+        throw new Error(`unexpected egress ${request.url}`);
+      }
+      let controller!: ReadableStreamDefaultController<Uint8Array>;
+      const stream = new ReadableStream<Uint8Array>({
+        start(next) {
+          controller = next;
+          next.enqueue(encoder.encode([
+            'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_held","type":"message","role":"assistant","model":"claude-opus-5","content":[],"stop_reason":null,"usage":{"input_tokens":3,"output_tokens":0}}}\n\n',
+            'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+            'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"held"}}\n\n',
+          ].join("")));
+        },
+      });
+      const entry = {
+        signal: request.signal,
+        controller,
+        body: await request.json() as Record<string, any>,
+      };
+      physical.push(entry);
+      request.signal.addEventListener("abort", () => {
+        try { controller.error(request.signal.reason); } catch { /* already settled */ }
+        if (physical[0] === entry) resolveFirstAbort();
+      }, { once: true });
+      if (physical.length === 1) resolveFirstSend();
+      if (physical.length === 2) resolveSecondSend();
+      return new Response(stream, { headers: { "content-type": "text/event-stream" } });
+    };
+
+    const config = {
+      port: 0,
+      defaultProvider: "target",
+      providers: {
+        target: {
+          adapter: "anthropic",
+          baseUrl: "https://api.anthropic.com",
+          authMode: "key",
+          apiKey: "selected-key",
+        },
+      },
+      combos: {
+        isolated: {
+          strategy: "failover",
+          targets: [{ provider: "target", model: "claude-opus-5" }],
+        },
+      },
+      claudeCode: { modelMap: { "claude-haiku-4-5": "combo/isolated" } },
+    } as OcxConfig;
+    const invoke = (client: AbortController, text: string) => handleClaudeMessages(
+      new Request("http://localhost/v1/messages", {
+        method: "POST",
+        signal: client.signal,
+        headers: { "content-type": "application/json", "x-api-key": "placeholder" },
+        body: JSON.stringify({
+          model: "claude-haiku-4-5",
+          max_tokens: 16,
+          stream: true,
+          metadata: { user_id: "shared-user-id" },
+          messages: [{ role: "user", content: text }],
+        }),
+      }),
+      config,
+      { model: "", provider: "" } as RequestLogContext,
+    );
+
+    try {
+      const firstClient = new AbortController();
+      const firstPending = invoke(firstClient, "first");
+      await firstSend;
+      const secondClient = new AbortController();
+      const secondPending = invoke(secondClient, "second");
+      await secondSend;
+      const [firstResponse, secondResponse] = await Promise.all([firstPending, secondPending]);
+      expect(firstResponse.status).toBe(200);
+      expect(secondResponse.status).toBe(200);
+      expect(physical).toHaveLength(2);
+      expect(physical[0]!.body.metadata).toEqual(physical[1]!.body.metadata);
+
+      firstClient.abort(new DOMException("first client closed", "AbortError"));
+      await firstAbort;
+      expect(physical[0]!.signal.aborted).toBe(true);
+      expect(physical[1]!.signal.aborted).toBe(false);
+
+      physical[1]!.controller.enqueue(encoder.encode([
+        'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+        'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
+        'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+      ].join("")));
+      physical[1]!.controller.close();
+      expect(await secondResponse.text()).toContain("message_stop");
+    } finally {
+      for (const entry of physical) {
+        if (!entry.signal.aborted) {
+          try { entry.controller.close(); } catch { /* already settled */ }
+        }
+      }
+      clearRequestLogsForTests();
+    }
+  } finally {
+    releaseSpendHome();
   }
 });
 

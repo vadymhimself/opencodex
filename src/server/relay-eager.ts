@@ -335,6 +335,7 @@ export function relaySseEagerBounded(
                 terminalEncoder,
                 upstreamError,
                 terminalBoundary.upstreamRefusalCode(),
+                terminalBoundary.upstreamErrorType(),
               );
             queuedBytes += upstreamErrorFrame.byteLength + terminalSentinel.byteLength;
             try {

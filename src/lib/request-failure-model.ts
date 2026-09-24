@@ -225,12 +225,10 @@ const RECOVERY_KIND_CAUSE = {
   // its quota, so the turn continues on the next eligible one.
   "anthropic-oauth-403": "credential-rejected",
   "oauth-account-429": "rate-limit",
-  // The Codex pool rotated off an account whose window the body proved spent. Waiting does not
-  // help this credential; only a different one does.
-  "codex-account-retry": "quota-exhausted",
-  // An adapter-owned resend on its own endpoint ladder (Kiro fallback, Vertex host retry). The
-  // first send left and its fate is unknown, so it says the weaker thing.
-  "adapter-retry": "transport-ambiguous",
+  // The Codex pool rotated off an account whose window the body proved spent. Classified like
+  // its sibling `oauth-account-429`: the resend goes to a DIFFERENT credential, so it is funded.
+  // `quota-exhausted` would read as "resend is futile", which is false for a rotation.
+  "codex-account-retry": "rate-limit",
   "image-413": "payload-too-large",
   // The gateway rejects a body it accepts seconds later and the replay is byte-identical, so
   // nothing about the payload was wrong; the origin declined to take it at that moment.

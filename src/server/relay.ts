@@ -171,15 +171,16 @@ export function upstreamErrorTailFrame(
   encoder: TextEncoder,
   message: string,
   refusalCode?: string,
+  declaredType?: string,
 ): Uint8Array {
   return encoder.encode(
-    `event: response.failed\ndata: ${upstreamErrorFailedPayload(message, refusalCode)}\n\n`,
+    `event: response.failed\ndata: ${upstreamErrorFailedPayload(message, refusalCode, declaredType)}\n\n`,
   );
 }
 
-function upstreamErrorFailedPayload(message: string, refusalCode?: string): string {
+function upstreamErrorFailedPayload(message: string, refusalCode?: string, declaredType?: string): string {
   const error = {
-    type: refusalCode === undefined ? "upstream_error" : "invalid_request_error",
+    type: declaredType ?? (refusalCode === undefined ? "upstream_error" : "invalid_request_error"),
     code: refusalCode ?? "upstream_server_error",
     message: redactSecretString(message).slice(0, MAX_TAIL_ERROR_MESSAGE_CHARS),
   };
@@ -239,6 +240,7 @@ function boundedBareUpstreamErrorMessage(payload: unknown): string | undefined {
 function boundedBareUpstreamError(payload: unknown): {
   message: string;
   refusalCode: string | undefined;
+  declaredType: string | undefined;
 } | undefined {
   const root = asJsonRecord(payload);
   if (!root || root.type !== "error") return undefined;
@@ -260,9 +262,22 @@ function boundedBareUpstreamError(payload: unknown): {
   const refusalCode = code !== undefined
     ? (isTerminalRefusalCode(code) ? code : undefined)
     : message === undefined ? undefined : safetyRefusalCodeFromMessage(message);
-  if (message !== undefined) return { message, refusalCode };
+  // The upstream's own `type` survives when it declared one. Restamping every bare error as
+  // `upstream_error` told the status mapping this was a 5xx, so an explicit `invalid_request_error`
+  // reached the caller as a retryable 502 with its message intact and its classification replaced.
+  // `code` and `retryable` are deliberately NOT widened: Codex classifies this terminal by
+  // `error.code` alone, so the refusal roster still owns every retry decision.
+  // `type: "error"` on the root is the frame's own envelope tag, never a classification.
+  const declaredType = [
+    asJsonRecord(root.error),
+    asJsonRecord(root.last_error),
+    asJsonRecord(response?.error),
+  ]
+    .map(candidate => stringField(candidate, "type"))
+    .find(candidate => candidate !== undefined && candidate !== "error");
+  if (message !== undefined) return { message, refusalCode, declaredType };
   if (refusalCode === undefined) return undefined;
-  return { message: terminalRefusalFallbackMessage(refusalCode), refusalCode };
+  return { message: terminalRefusalFallbackMessage(refusalCode), refusalCode, declaredType };
 }
 
 export type SseTerminalOutputBoundary = {
@@ -272,6 +287,7 @@ export type SseTerminalOutputBoundary = {
   doneSeen(): boolean;
   upstreamError(): string | undefined;
   upstreamRefusalCode(): string | undefined;
+  upstreamErrorType(): string | undefined;
   dispose(): void;
 };
 
@@ -295,6 +311,7 @@ export function createSseTerminalOutputBoundary(
   let disposed = false;
   let upstreamError: string | undefined;
   let upstreamRefusalCode: string | undefined;
+  let upstreamErrorType: string | undefined;
 
   const processFrames = (
     frames: ReturnType<BoundedSseFrameBuffer["feed"]>,
@@ -312,6 +329,7 @@ export function createSseTerminalOutputBoundary(
       if (bare !== undefined) {
         upstreamError = bare.message;
         upstreamRefusalCode = bare.refusalCode;
+        upstreamErrorType = bare.declaredType;
       }
       const safetyBuffering = dropSafetyBuffering && parsed !== undefined
         ? codexSafetyBufferingBlockAction(parsed) : "keep";
@@ -385,6 +403,7 @@ export function createSseTerminalOutputBoundary(
     doneSeen: () => done,
     upstreamError: () => upstreamError,
     upstreamRefusalCode: () => upstreamRefusalCode,
+    upstreamErrorType: () => upstreamErrorType,
     dispose() {
       if (disposed) return;
       disposed = true;
@@ -460,6 +479,7 @@ export function relaySseWithFailedTail(
                   encoder,
                   upstreamError,
                   terminalBoundary.upstreamRefusalCode(),
+                  terminalBoundary.upstreamErrorType(),
                 ));
               controller.enqueue(doneFrame(encoder));
             }

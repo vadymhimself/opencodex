@@ -650,6 +650,7 @@
     "cold-spawn-warmup.test.ts": "ci-workflows",
     "combo-authoritative-reset.test.ts": "codex-integration",
     "combo-codex-exhaustion-cooldown.test.ts": "codex-integration",
+    "quota-explain.test.ts": "providers",
     "combo-child-headers.test.ts": "routing",
     "combo-last-resort.test.ts": "codex-integration",
     "combo-management-api.test.ts": "routing",
