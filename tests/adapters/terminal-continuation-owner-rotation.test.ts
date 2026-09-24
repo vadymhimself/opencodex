@@ -273,13 +273,20 @@ describe("terminal continuation provider-owner rotation", () => {
         usage: ROTATED_USAGE,
       },
     ]);
+    // `logCtx.usage` is the LIVE leg, not the request aggregate. The rotation split closes the
+    // first attempt and clears the context's totals with it (19b15fb6d), because leaving them
+    // would attribute the replay's tokens to the account that just failed. The sum still exists
+    // -- `aggregateAttemptUsage` rebuilds it from the attempt rows asserted above at
+    // finalization, which is the only place a reader is allowed to take it from.
     expect(rotatedLogCtx.usage).toMatchObject({
-      inputTokens: 30,
-      outputTokens: 5,
-      totalTokens: 35,
+      inputTokens: 20,
+      outputTokens: 3,
       contextTotalTokens: 140,
-      anthropicServerToolUse: { web_search_requests: 3, web_fetch_requests: 1 },
+      anthropicServerToolUse: { web_search_requests: 2, web_fetch_requests: 1 },
     });
+    expect(
+      (rotatedLogCtx.attempts ?? []).reduce((sum, row) => sum + (row.usage?.inputTokens ?? 0), 0),
+    ).toBe(30);
 
     const follow = await post({
       model: "owned/model",

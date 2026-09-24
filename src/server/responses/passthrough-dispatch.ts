@@ -1138,6 +1138,12 @@ export async function preparePassthroughExchange(
         // here on is a genuine transport attempt. The notifier is built once for the whole leg:
         // it fires on the first dispatch, and a replacement is another send of the same replay
         // rather than a second one to announce.
+        // The attempt row rides the SAME boundary as the dispatch signal, and for the same
+        // reason: `fetchWithHeaderTimeout` awaits pacing admission BEFORE reaching the executor,
+        // so booking it in the retry callback opens an attempt for a send a rejected pacing wait
+        // never made. `onTransportDispatch` fires once per PHYSICAL send, after admission, so a
+        // transient resend still books its own row while a refused replay books none.
+        let replayRecovery: AttemptRecoveryKind | undefined;
         const oauthReplayExecutor = storedPoolReplayDispatchNotifier(
           providerFetch(route.provider, options.codexWsRuntimeIdentity, {
             nativeControl: nativeResponseControlEligible(route.provider, options.nativeControl) && options.inboundTransport === "websocket" && !options.comboAttempt
@@ -1147,6 +1153,9 @@ export async function preparePassthroughExchange(
             providerName: route.providerName,
             modelId: route.modelId,
             onCodexWsQuota: codexWsQuotaObserver(admissionState.authCtx, route.provider, route.modelId),
+            onTransportDispatch: () => {
+              transportState.noteRoutedAttemptSend(passthroughEstimate, replayRecovery ?? "oauth-401");
+            },
             beforeDispatch: isCanonicalOpenAiForwardProvider(route.provider)
               ? createCodexReserveDispatchGuard(admissionState.authCtx, options.codexAuthPolicy ?? config, route.modelId, options.admission, options.visionDescribeTerminal === true) : undefined,
           }),
@@ -1159,7 +1168,7 @@ export async function preparePassthroughExchange(
         // have run it.
         upstreamResponse = await fetchWithTransientRetry(
           recovery => {
-            transportState.noteRoutedAttemptSend(passthroughEstimate, recovery ?? "oauth-401");
+            replayRecovery = recovery;
             return fetchWithHeaderTimeout(
               request.url,
               applyUpstreamRecoveryInit({

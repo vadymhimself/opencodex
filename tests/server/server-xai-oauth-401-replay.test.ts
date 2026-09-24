@@ -233,9 +233,18 @@ describe("xAI OAuth Responses opt-in upstream 401 replay", () => {
       expect(json.output?.find(item => item.type === "message")?.content?.[0]?.text).toBe("ok after refresh");
       expect(observed.counts.refresh).toBe(1);
       expect(observed.chatAuth).toEqual(["Bearer rejected-access", "Bearer fresh-access"]);
-      const attempt = readUsageEntries().at(-1)?.attempts?.[0];
+      // Two rows, not one send counted twice. A same-account 401 refresh moves neither the
+      // account label nor the provider string, so the older gate folded the refused send and its
+      // replay into a single attempt with `sendCount: 2` -- one row carrying two outcomes.
+      // `credentialRecoveryStatus` splits on the recovery itself (19b15fb6d + ef65d20ce,
+      // upstream PR #5752), so the refusal and the successful replay are now separate physical
+      // attempts, and the usage lands on the one that earned it.
+      const attempts = readUsageEntries().at(-1)?.attempts;
+      expect(attempts).toHaveLength(2);
+      expect(attempts?.map(row => row.sendCount)).toEqual([1, 1]);
+      expect(attempts?.[0]?.status).toBe(401);
+      const attempt = attempts?.at(-1);
       expect(attempt?.credentialSource).toBe("grok-oauth");
-      expect(attempt?.sendCount).toBe(2);
       expect(attempt?.totalTokens).toBe(5);
       const persisted = readFileSync(usageLogPath(), "utf8");
       expect(persisted).not.toContain("rejected-access");

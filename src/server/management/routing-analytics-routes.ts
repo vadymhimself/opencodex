@@ -10,6 +10,7 @@ import {
   ANALYTICS_MAX_ROWS,
   computeRoutingAnalytics,
 } from "../../routing/analytics";
+import { USAGE_RANGES, rangeWindow, type UsageRange } from "../../usage/summary";
 import { jsonResponse } from "../auth-cors";
 import type { ManagementContext } from "./context";
 
@@ -33,7 +34,22 @@ export async function handleRoutingAnalyticsRoutes(ctx: ManagementContext): Prom
   if (toParsed === "invalid") {
     return jsonResponse({ error: { code: "invalid_to", message: "to must be an integer timestamp" } }, 400, req, config);
   }
-  const from = fromParsed;
+  // `range` is the dashboard's calendar shorthand, resolved through the SAME helper the usage
+  // surface uses so both agree on where a local day starts. Explicit from/to wins: a caller that
+  // states an exact window means it. An unrecognized value is refused rather than silently read
+  // as the default window, which would answer a different question than the one asked.
+  const rangeRaw = url.searchParams.get("range")?.trim();
+  if (rangeRaw !== undefined && rangeRaw.length > 0
+    && !(USAGE_RANGES as readonly string[]).includes(rangeRaw)) {
+    return jsonResponse(
+      { error: { code: "invalid_range", message: `range must be one of ${USAGE_RANGES.join(", ")}` } },
+      400, req, config,
+    );
+  }
+  const rangeSince = rangeRaw && fromParsed === undefined
+    ? rangeWindow(rangeRaw as UsageRange, Date.now()).since ?? undefined
+    : undefined;
+  const from = fromParsed ?? rangeSince;
   const to = toParsed;
   if (from !== undefined && to !== undefined && from > to) {
     return jsonResponse({ error: { code: "invalid_range", message: "from must not be after to" } }, 400, req, config);

@@ -93,6 +93,10 @@ describe("fetchProviderQuotaReports", () => {
 
     expect(result.reports[0]?.quota.customWindows).toEqual([{
       label: "Opus",
+      // Structural proof from the producer, not the label text: `weekly_scoped` plus a non-empty
+      // `scope.model.display_name`. Routing keys on this so one spent family does not veto the
+      // whole provider.
+      scope: "model",
       percent: 41,
     }]);
   });

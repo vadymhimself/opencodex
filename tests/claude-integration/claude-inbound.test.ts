@@ -247,7 +247,10 @@ This is how Claude Code surfaces messages the user sends mid-turn — within the
     });
     expect(representable.requiresExactAnthropicReplay).toBe(false);
     expect(representable.body.tools).toEqual([
-      { type: "function", name: "Read", parameters: { type: "object" } },
+      // `strict: false` is upstream's stated source intent for a tool that did not opt in, not a
+      // default: an omitted strict lets Responses normalize an optional parameter into a
+      // required one. Added since this case was written against 2.59.
+      { type: "function", name: "Read", parameters: { type: "object" }, strict: false },
       { type: "web_search" },
     ]);
 
