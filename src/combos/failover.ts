@@ -232,7 +232,8 @@ export function coolComboTarget(
     ?? options?.cooldownMs
     // A depleted account window rolls in hours, so the 60s default re-sends to a dead account
     // every minute: 72h of production ledger showed 942 such doomed sends on one Codex window.
-    ?? (isAccountWindowExhausted(options?.message ?? "", options?.code) ? MAX_COOLDOWN_MS
+    ?? ((isAccountWindowExhausted(options?.message ?? "", options?.code)
+      || PROVIDER_SCOPED_FAILURE_CODES.has(normalizedFailureCode(options?.code))) ? MAX_COOLDOWN_MS
       : isTransientRequestRateLimit({
         status: options?.status,
         code: options?.code,

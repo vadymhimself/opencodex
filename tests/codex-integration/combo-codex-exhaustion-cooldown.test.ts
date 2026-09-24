@@ -24,6 +24,20 @@ const EXHAUSTED = "The usage limit has been reached";
 
 afterEach(() => clearComboTargetCooldowns(combo));
 
+test("permanent credential and billing failures use ten minutes unless a deadline is stated", () => {
+  for (const code of ["invalid_api_key", "insufficient_quota", "subscription_required", "payment_required", "billing_error", "insufficient_balance"]) {
+    coolComboTarget(combo, target, { now, status: 401, code });
+    expect(isComboTargetInCooldown(combo, target, now + 60_000)).toBe(true);
+    expect(isComboTargetInCooldown(combo, target, now + 599_999)).toBe(true);
+    expect(isComboTargetInCooldown(combo, target, now + 600_000)).toBe(false);
+    for (const deadline of [{ retryAfter: "30" }, { resetAt: now + 30_000 }, { cooldownMs: 30_000 }]) {
+      coolComboTarget(combo, target, { now, status: 401, code, ...deadline });
+      expect(isComboTargetInCooldown(combo, target, now + 29_999)).toBe(true);
+      expect(isComboTargetInCooldown(combo, target, now + 30_000)).toBe(false);
+    }
+  }
+});
+
 describe("a depleted Codex plan window", () => {
   test.each([
     ["502 prose", 502, "upstream_server_error", EXHAUSTED],
