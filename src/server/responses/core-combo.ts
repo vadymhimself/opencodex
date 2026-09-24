@@ -603,14 +603,6 @@ export async function executeComboResponses(
         // After the spread: the child must run on THIS target's ladder, not on the holder the
         // parent arrived with.
         sendBudget: targetSendBudget,
-        // The turn's admission lease belongs to the PARENT and is re-attached to whichever
-        // child response is accepted (`trackAcceptedComboResponse` below). A child must never
-        // bind it: `registerTurn` marks the lease transferred, and the child's own stream end
-        // calls `unregisterTurn`, which RELEASES the parent's lease mid-ladder -- the next
-        // target then binds a settled lease and is aborted with "turn already settled".
-        // Suppressed here, at the one place a child's options are built, rather than at each
-        // delivery site: a site added later cannot bind a lease the child never received.
-        turnAdmissionLease: undefined,
         comboAttempt: true,
         comboReplaySnapshot,
         deferCodexResetDerivedCooldown,

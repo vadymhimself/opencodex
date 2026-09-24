@@ -319,6 +319,12 @@ export async function deliverPassthroughResponse(
   >,
 ): Promise<Response> {
   const { logCtx, config, options, req } = requestContext;
+  // A combo child may READ the parent's lease (account selection and the native-main claim
+  // both need it) but must never BIND it: `registerTurn` marks the lease transferred and the
+  // child's own stream end calls `unregisterTurn`, releasing the parent's lease mid-ladder --
+  // the next target then binds a settled lease and is aborted with "turn already settled".
+  // The accepted response re-attaches it in core-combo.ts via `trackAcceptedComboResponse`.
+  const deliveryAdmissionLease = options.comboAttempt ? undefined : options.turnAdmissionLease;
   const {
     codexSafetyBufferingOptions,
     upstream,
@@ -483,7 +489,7 @@ export async function deliverPassthroughResponse(
         modelId: parsed._responseModelId ?? parsed.modelId,
         destinationIsXai: isXaiResponsesDestination(route.provider),
         translatorBudget,
-        turnAdmissionLease: options.turnAdmissionLease,
+        turnAdmissionLease: deliveryAdmissionLease,
       });
       if (policyRefusal) return policyRefusal;
       return formatPassthroughUpstreamError(upstreamResponse.status, errorText, {
@@ -501,7 +507,7 @@ export async function deliverPassthroughResponse(
       // contracts and would truncate it. Keep the bounded upstream as the sole reader.
       options.nativeControl.relayActive = true;
       commitReasoningReplayServingRoute(nativeExchange.request.headers);
-      const body = trackStreamLifetime(upstreamResponse.body, upstream, undefined, options.turnAdmissionLease);
+      const body = trackStreamLifetime(upstreamResponse.body, upstream, undefined, deliveryAdmissionLease);
       return new Response(body, { status: upstreamResponse.status, headers });
     }
 
@@ -764,7 +770,7 @@ export async function deliverPassthroughResponse(
       if (forceCodexWsEagerRelay || eagerPath?.useEagerRelay || win32EagerRewrite) {
         const turnAc = new AbortController();
         linkAbortSignal(upstream, turnAc.signal);
-        registerTurn(turnAc, options.turnAdmissionLease);
+        registerTurn(turnAc, deliveryAdmissionLease);
         const reportNativeTerminal = recordTerminalOutcomes
           ? (status: ResponsesTerminalStatus, httpStatusOverride?: number) => {
             terminalRecorder?.(status, httpStatusOverride);
@@ -848,7 +854,7 @@ export async function deliverPassthroughResponse(
       // Pace against raw bytes before rewrites, without detaching terminal ownership.
       const [nativeBody, inspectBody] = teeWithBoundedInspection(passthroughSseBody, { clientGoneSignal });
       linkAbortSignal(upstream, turnAc.signal);
-      registerTurn(turnAc, options.turnAdmissionLease);
+      registerTurn(turnAc, deliveryAdmissionLease);
       const inspectionConsumerOptions = {
         // Request abort can reject the fetch body before the response cancel hook runs.
         clientGoneSignal,
@@ -1100,7 +1106,7 @@ export async function deliverPassthroughResponse(
     commitReasoningReplayServingRoute(nativeExchange.request.headers);
     const body = relayWithAbort(upstreamResponse.body, upstream);
     const turnAc = new AbortController();
-    const tracked = body ? trackStreamLifetime(body, turnAc, undefined, options.turnAdmissionLease) : null;
+    const tracked = body ? trackStreamLifetime(body, turnAc, undefined, deliveryAdmissionLease) : null;
     return new Response(tracked, {
       status: upstreamResponse.status,
       headers,

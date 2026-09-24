@@ -237,7 +237,9 @@ export async function prepareAdapterExchange(
       // the raw stream would hold a lease for a turn that already has all of its output.
       const localTurnAc = new AbortController();
       return new Response(
-        trackStreamLifetime(localSse, localTurnAc, undefined, options.turnAdmissionLease),
+      // A combo child must not BIND the parent's lease -- its own stream end would release
+      // it mid-ladder. core-combo.ts re-attaches it to the response it accepts.
+        trackStreamLifetime(localSse, localTurnAc, undefined, options.comboAttempt ? undefined : options.turnAdmissionLease),
         {
           headers: {
             "Content-Type": "text/event-stream",
@@ -404,9 +406,8 @@ export async function prepareAdapterExchange(
         abortSignal: options.abortSignal,
         comboAttempt: options.comboAttempt,
         expectsSse: transportState.anthropicMessagesSource?.body.stream === true,
-        // A combo child never receives the parent's lease (suppressed where the child's options
-        // are built, in core-combo.ts), so this forwards whatever this turn legitimately holds.
-        turnAdmissionLease: options.turnAdmissionLease,
+        // A combo child's lease belongs to the parent turn, which settles it itself.
+        ...(options.comboAttempt ? {} : { turnAdmissionLease: options.turnAdmissionLease }),
       },
     );
   };

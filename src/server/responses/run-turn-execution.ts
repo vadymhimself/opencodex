@@ -459,7 +459,9 @@ export async function executeResponsesRunTurn(
         },
       );
       const bridgeTurnAc = new AbortController();
-      const trackedSse = trackStreamLifetime(sseStream, bridgeTurnAc, undefined, options.turnAdmissionLease);
+      // A combo child must not BIND the parent's lease -- its own stream end would release
+      // it mid-ladder. core-combo.ts re-attaches it to the response it accepts.
+      const trackedSse = trackStreamLifetime(sseStream, bridgeTurnAc, undefined, options.comboAttempt ? undefined : options.turnAdmissionLease);
       const response = new Response(trackedSse, {
         headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no" },
       });
