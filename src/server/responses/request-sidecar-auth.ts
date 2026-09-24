@@ -40,7 +40,10 @@ export async function prepareResponsesSidecarAuth(
     | "selectedForwardHeaders"
     | "translatorBudget"
   >,
-  transportState: Pick<ResponsesTransport, "adapter" | "isPassthrough">,
+  transportState: Pick<
+    ResponsesTransport,
+    "adapter" | "isPassthrough" | "exactAnthropicSourceReplay" | "clearAnthropicMessagesSource"
+  >,
 ) {
   const { options, config, req } = requestContext;
   const { parsed, route, translatorBudget } = requestState;
@@ -51,9 +54,14 @@ export async function prepareResponsesSidecarAuth(
   const visionDescribeTerminal = options.visionDescribeTerminal === true;
   const routedCompaction = parsed._compactionRequest === true
     && (!isCanonicalOpenAiForwardProvider(route.provider) || parsed._portableCompaction === true);
-  const needsOpenAiVision = !visionDescribeTerminal
+  // A turn that will be replayed to canonical Anthropic byte-for-byte runs no helper that
+  // rewrites the request: Anthropic serves its own vision and server-side search, and a
+  // describe/search rewrite would destroy the exactness the replay promises.
+  const exactAnthropicSourceReplay = transportState.exactAnthropicSourceReplay;
+  const needsOpenAiVision = !visionDescribeTerminal && !exactAnthropicSourceReplay
     && shouldResolveOpenAiVisionSidecar(config, route.provider, route.modelId, parsed, route.providerName);
   const needsOpenAiSearch = !routedCompaction && !transportState.adapter.runTurn
+    && !exactAnthropicSourceReplay
     && (shouldResolveOpenAiWebSearchSidecar(config, parsed, isPassthrough)
       || shouldResolveOpenAiPassthroughWebSearchBridge(route.provider, parsed, isPassthrough));
   if (needsOpenAiVision || needsOpenAiSearch) {
@@ -119,12 +127,13 @@ export async function prepareResponsesSidecarAuth(
   // call must never plan another describe. The flag arrives from the Chat
   // surface (whose bridge rebuilds headers) or as the raw header for native
   // Responses callers. Marked + text-only routed model → strip, depth cap 1.
-  const visionPlan = visionDescribeTerminal
+  const visionPlan = visionDescribeTerminal || exactAnthropicSourceReplay
     ? undefined
     : planVisionSidecar(config, route.provider, route.modelId, parsed, openAiSidecar, {
       admission: options.admission, codexAuthPolicy: options.codexAuthPolicy, providerName: route.providerName,
     });
   const recordSidecarOutcome = openAiSidecar?.recordOutcome;
+  let visionMutatedRequest = false;
   if (visionPlan) {
     try {
       await describeImagesInPlace(
@@ -135,6 +144,7 @@ export async function prepareResponsesSidecarAuth(
         recordSidecarOutcome,
         translatorBudget,
       );
+      visionMutatedRequest = true;
     } finally {
       // Local validation can reject every image before the sidecar fetch records an outcome.
       // Vision-only turns must hand that unused cooldown probe back; when a fetch did run the
@@ -144,9 +154,11 @@ export async function prepareResponsesSidecarAuth(
   } else if (requiresVisionPreprocessing(config, route.provider, route.modelId, route.providerName)) {
     // Image capability is not positively proven but no sidecar plan is dispatchable: fail closed.
     // Never forward raw image bytes to an unverified upstream.
-    stripImagesInPlace(parsed, translatorBudget);
+    visionMutatedRequest = stripImagesInPlace(parsed, translatorBudget);
     if (!needsOpenAiSearch) openAiSidecar?.releaseProbeLease?.();
   }
+  // The caller's bytes no longer describe this request, so it can never be replayed as theirs.
+  if (visionMutatedRequest) transportState.clearAnthropicMessagesSource();
 
   return {
     openAiSidecar,

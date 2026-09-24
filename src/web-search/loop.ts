@@ -487,11 +487,15 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
     };
     let firstPacingSlot = true;
     const reserveDispatchSlot = async (): Promise<void> => {
+      // With no pacing hook there is nothing to wait for, and clearing the just-armed deadline
+      // only to re-arm it churns its lifecycle: the cumulative header budget looks renewed to
+      // anything observing it, having measured no wait at all.
+      if (!waitForRequestSlot) return;
       if (firstPacingSlot) {
         firstPacingSlot = false;
         await paceThenResetHeaderDeadline();
       } else {
-        await waitForRequestSlot?.(headerDeadline.signal);
+        await waitForRequestSlot(headerDeadline.signal);
       }
     };
     try {

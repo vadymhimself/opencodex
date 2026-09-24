@@ -1453,6 +1453,11 @@ export async function preparePassthroughExchange(
       // limit, and rotating on it would cool down a key that refused nothing.
       && !isNonReplayableResponse(upstreamResponse)
       && hasKeyPoolFailover(route.provider)
+      // Checked HERE rather than left to rebuildAndRefetch's own reservation, for the same
+      // reason the same-target loop above checks it early: the rotation cancels the 429 body
+      // before replaying, so a refusal discovered after that can no longer hand back the real
+      // rate-limit answer and would surface a synthetic budget error in its place.
+      && !sendBudgetExhausted(transientSendAttempts())
     ) {
       const rotated = rotateProviderTransportOn429(config, route.providerName, route.provider, {
         retryAfter: upstreamResponse.headers.get("retry-after"),

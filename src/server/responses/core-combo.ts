@@ -66,7 +66,11 @@ import { beginRequestAttempt, sealRequestAttemptIdentity, finishRequestAttempt }
 import { rememberComboForLane } from "./combo-session-recall";
 import { runTurnAdapterSseResponses } from "./core-lifetime";
 import { isAnthropicSourceReplayResponse } from "../relay";
-import { comboTargetAcceptsAnthropicSource, preserveResponseMarkers } from "./anthropic-source-replay";
+import {
+  comboTargetAcceptsAnthropicSource,
+  preserveResponseMarkers,
+  trackAcceptedComboResponse,
+} from "./anthropic-source-replay";
 import { preflightComboStreamResponse } from "./combo-stream-preflight";
 import { streamingContextOverflowResponse, jsonContextOverflowResponse } from "./context-overflow";
 import { mandatoryResponsesReasoningReplayUnavailable } from "./core-replay";
@@ -431,7 +435,16 @@ export async function executeComboResponses(
   }
   // One immutable combo selection trace, before any child dispatch; child
   // adoption below must never replace it with a concrete child route trace.
-  logCtx.routeDecision = comboRouteDecisionTrace(config, comboId, pick, requestedModel);
+  // Pass the request-compatibility predicate so a target this request could never run on is
+  // traced as `request-incompatible` rather than an ordinary `not-selected` runner-up.
+  logCtx.routeDecision = comboRouteDecisionTrace(
+    config,
+    comboId,
+    pick,
+    requestedModel,
+    undefined,
+    targetEligible,
+  );
 
   const originalReasoning = body && typeof body === "object" && !Array.isArray(body)
     ? (body as { reasoning?: unknown }).reasoning
@@ -590,6 +603,14 @@ export async function executeComboResponses(
         // After the spread: the child must run on THIS target's ladder, not on the holder the
         // parent arrived with.
         sendBudget: targetSendBudget,
+        // The turn's admission lease belongs to the PARENT and is re-attached to whichever
+        // child response is accepted (`trackAcceptedComboResponse` below). A child must never
+        // bind it: `registerTurn` marks the lease transferred, and the child's own stream end
+        // calls `unregisterTurn`, which RELEASES the parent's lease mid-ladder -- the next
+        // target then binds a settled lease and is aborted with "turn already settled".
+        // Suppressed here, at the one place a child's options are built, rather than at each
+        // delivery site: a site added later cannot bind a lease the child never received.
+        turnAdmissionLease: undefined,
         comboAttempt: true,
         comboReplaySnapshot,
         deferCodexResetDerivedCooldown,
@@ -684,6 +705,11 @@ export async function executeComboResponses(
       });
       options.onCodexAuthContextResolved?.(resolvedAuth);
       options.setTerminalOutcomeRecorder?.(terminalRecorder);
+      // The other half of the suppression above: children never bind the lease, so the ACCEPTED
+      // response binds it here. Without this the slot is released before the first SSE byte --
+      // `maxActiveTurns` under-counts live streams, and a drain neither waits for nor aborts a
+      // stream it has no controller for.
+      response = trackAcceptedComboResponse(response, options.turnAdmissionLease, options.abortSignal);
       callbackGate.commit();
       return response;
     }
@@ -748,6 +774,9 @@ export async function executeComboResponses(
     const wantsStream = (rawBody as { stream?: unknown } | null)?.stream === true;
     // Local byte admission has its own diagnostic; do not relabel it as an upstream refusal.
     const classifyOverflow = failure.response.status === 413
+      // A canonical replay owes the caller the source's exact bytes. Synthesizing the overflow
+      // answer would replace a real upstream 413 with this proxy's own 200 SSE.
+      && !failure.passthroughResponse
       && (wantsStream || (failure.upstreamCode !== "outbound_body_too_large"
         && failure.upstreamCode !== "translation_buffer_limit"));
     lastFailureClassifiesOverflow = classifyOverflow;

@@ -46,7 +46,8 @@ import { isXaiResponsesDestination, resolveProviderTransport } from "../../provi
 import { resolveCopilotApiBaseUrl } from "../../oauth/github-copilot";
 import { resolveWireProtocolOverride } from "../adapter-resolve";
 import { bindRouteReasoningReplayScope } from "./core-replay";
-import { rotateAnthropicProviderOnCredentialDenial } from "./anthropic-source-replay";
+import { finalizeAnthropicSourceReplay, rotateAnthropicProviderOnCredentialDenial } from "./anthropic-source-replay";
+import { isExactCanonicalAnthropicMessagesUrl } from "../../adapters/anthropic";
 import {
   ANTHROPIC_POOL_MAX_FAILOVERS_PER_REQUEST,
   rotateAnthropicAccountOn429,
@@ -121,6 +122,7 @@ export async function prepareAdapterExchange(
     | "anthropicPoolAccountId"
     | "anthropicPoolFailovers"
     | "anthropicSessionKey"
+    | "anthropicMessagesSource"
     | "commitResolvedOAuthSelection"
     | "genericFailoverAccountId"
     | "genericFailovers"
@@ -250,11 +252,21 @@ export async function prepareAdapterExchange(
     notifyResponseComplete(json);
     return new Response(JSON.stringify(json), { headers: { "Content-Type": "application/json" } });
   }
+  // The canonical Anthropic replay lane is per-ATTEMPT, not per-request: every rebuilt request
+  // must carry the caller's original bytes, or a rotation or retry silently downgrades a replayed
+  // turn into a translated one -- which is the cache-prefix churn the lane exists to prevent.
+  // Guarded on the live adapter because only the Anthropic adapter can replay those bytes.
+  const anthropicSourceMeta = () => (
+    transportState.activeAdapter.name === "anthropic" && transportState.anthropicMessagesSource
+      ? { anthropicMessagesSource: transportState.anthropicMessagesSource }
+      : {}
+  );
   try {
     initialRequest = await transportState.activeAdapter.buildRequest(parsed, {
       headers: requestState.selectedForwardHeaders,
       translatorBudget,
       abortSignal: upstream.signal,
+      ...anthropicSourceMeta(),
     });
     refreshRequestToolAliases(initialRequest);
     recordAdapterReasoning(logCtx, initialRequest);
@@ -326,7 +338,9 @@ export async function prepareAdapterExchange(
             method: builtInitialRequest.method,
             headers: builtInitialRequest.headers,
             body: builtInitialRequest.body,
-          }, recovery), upstream.signal, connectMs, parsed.stream,
+            // An exact source replay never rides a pooled connection: the caller's bytes go out
+            // on a socket of their own so the upstream reads them as one clean cache prefix.
+          }, builtInitialRequest.anthropicSourceReplay === true ? "connection-reset" : recovery), upstream.signal, connectMs, parsed.stream,
             providerFetch(route.provider, options.codexWsRuntimeIdentity, {
               dispatchOverride: oauthDispatch(builtInitialRequest),
               providerName: route.providerName,
@@ -369,6 +383,33 @@ export async function prepareAdapterExchange(
   // replay that comes back 429 cannot silently re-arm a fresh budget) and is SHARED with the
   // terminal-guard continuation below, so the main loop + one continuation can never exceed
   // `attempts` same-key replays in total (bounded per request).
+  /**
+   * Exact canonical replay: the caller's own Anthropic Messages bytes went out, so the upstream
+   * answer is returned unchanged instead of being bridged back through the Responses
+   * translation. Error bytes included -- a replayed turn's 4xx/5xx body is the caller's answer
+   * too, and re-encoding it would lose the very fields the lane exists to preserve.
+   */
+  const anthropicSourceReplayResponse = async (): Promise<Response | undefined> => {
+    const responseRequest = transportState.sameTargetRequest ?? builtInitialRequest;
+    if (responseRequest.anthropicSourceReplay !== true
+      || inboundWire !== "anthropic"
+      || transportState.activeAdapter.name !== "anthropic"
+      || !isExactCanonicalAnthropicMessagesUrl(responseRequest.url)) return undefined;
+    return finalizeAnthropicSourceReplay(
+      upstreamResponse,
+      logCtx,
+      upstream,
+      cleanupUpstreamAbort,
+      {
+        abortSignal: options.abortSignal,
+        comboAttempt: options.comboAttempt,
+        expectsSse: transportState.anthropicMessagesSource?.body.stream === true,
+        // A combo child never receives the parent's lease (suppressed where the child's options
+        // are built, in core-combo.ts), so this forwards whatever this turn legitimately holds.
+        turnAdmissionLease: options.turnAdmissionLease,
+      },
+    );
+  };
   const rateLimitPolicy = rateLimitRetryPolicyFor(route.provider);
   let rateLimitRetries = 0;
   // Shared with the terminal-guard continuation below: an image-tier reduction that let the
@@ -427,6 +468,7 @@ export async function prepareAdapterExchange(
             translatorBudget,
             abortSignal: upstream.signal,
             ...(transportState.imageTierBias > 0 ? { imageTierBias: transportState.imageTierBias } : {}),
+            ...anthropicSourceMeta(),
           });
           recordAdapterReasoning(logCtx, retryRequest);
           recordAdapterTier(logCtx, retryRequest);
@@ -514,7 +556,7 @@ export async function prepareAdapterExchange(
                 return fetchWithHeaderTimeout(retryRequest.url,
                   applyUpstreamRecoveryInit({
                     method: retryRequest.method, headers: retryRequest.headers, body: retryRequest.body,
-                  }, recoveryKind), upstream.signal, connectMs, parsed.stream,
+                  }, retryRequest.anthropicSourceReplay === true ? "connection-reset" : recoveryKind), upstream.signal, connectMs, parsed.stream,
                   providerFetch(route.provider, options.codexWsRuntimeIdentity, {
                     dispatchOverride: oauthDispatch(retryRequest),
                     providerName: route.providerName,
@@ -1059,6 +1101,8 @@ export async function prepareAdapterExchange(
       }
       break;
     }
+    const recoveredSourceReplay = await anthropicSourceReplayResponse();
+    if (recoveredSourceReplay) return recoveredSourceReplay;
     if (!upstreamResponse.ok) {
       if (options.comboAttempt) {
         // No pre-read guard: `consumeComboFailure` -> `readBoundedResponseBody` reads
@@ -1151,6 +1195,9 @@ export async function prepareAdapterExchange(
       );
     }
   }
+
+  const sourceReplay = await anthropicSourceReplayResponse();
+  if (sourceReplay) return sourceReplay;
 
   cancelBodyOnAbort(upstreamResponse.body, upstream.signal);
 

@@ -863,7 +863,16 @@ export async function retryCodexPoolOnAlternateAccount(
         // The move is a physical send like any other, so the root workflow is charged too.
         chargeWorkflowSends(args.options.workflowRootId, 1);
       }
-      noteProviderAttemptSend(logCtx, route.providerName, route.provider, passthroughEstimate);
+      // The send that is about to happen is this lane's retry, and the attempt it replaces failed
+      // with `outcomeStatus`. Record both: the kind so the row says why a second send exists, and
+      // the observed status so the completed attempt carries the real terminal rather than the
+      // generic 502 the split infers when a recovery kind implies nothing about the status.
+      if (logCtx.activeAttempt?.status === 0 && outcomeStatus >= 100) {
+        logCtx.activeAttempt.status = outcomeStatus;
+      }
+      noteProviderAttemptSend(
+        logCtx, route.providerName, route.provider, passthroughEstimate, "codex-account-retry",
+      );
       try {
         upstreamResponse = await fetchWithHeaderTimeout(
           request.url,

@@ -239,7 +239,12 @@ export function providerFetch(
       sendWithConnectionPolicy(base, input, init, egressBinding),
     { preconnect },
   ) as typeof globalThis.fetch);
-  const httpFetch = Object.assign(
+  // `applyOverride` is false for exactly one caller: the HTTP fallback of a WS send that has
+  // ALREADY been wrapped in the override below. A fallback is the same logical dispatch as the
+  // WS attempt it replaces, and the override commits a key-auth send, so running it twice would
+  // report two sends for one. The egress decision below still keys on whether an override
+  // EXISTS, because one may already have rebuilt this request against another host.
+  const httpDispatch = (applyOverride: boolean) =>
     async (input: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) => {
       // Refuse before any dispatch side effect where that is sound. `beforeDispatch` commits
       // attempt accounting and consumes admission state, so a refusal firing after it would
@@ -261,16 +266,16 @@ export function providerFetch(
       // No proxy option is attached here: a `dispatchOverride` may rebuild this request against
       // a different destination, so the route is decided at the physical send instead.
       const dispatchInit = { ...withUpstreamHttpVersion(input, init, provider), timeout: 0 };
-      const response = options.dispatchOverride
+      const response = applyOverride && options.dispatchOverride
         ? options.dispatchOverride(input, dispatchInit, dispatch)
         : dispatch(input, dispatchInit);
       // Admission passed and the send is under way: count it before awaiting the response, so a
       // dispatch is recorded exactly once whether or not the upstream answers.
       options.onTransportDispatch?.(headers);
       return response;
-    },
-    { preconnect },
-  ) as typeof globalThis.fetch;
+    };
+  const httpFetch = Object.assign(httpDispatch(true), { preconnect }) as typeof globalThis.fetch;
+  const overriddenHttpFallback = Object.assign(httpDispatch(false), { preconnect }) as typeof globalThis.fetch;
   // ChatGPT Codex backend: streaming turns ride the responses_websockets
   // transport (measured ~3s faster TTFT than the SSE POST queue); everything
   // else keeps the provider's HTTP fetch. See ws-upstream.ts for the details.
@@ -283,12 +288,28 @@ export function providerFetch(
         warnEgressWebsocketDowngradeOnce(providerName, describeProviderEgressForLog(egress));
         return httpFetch(input, init);
       }
+      // A WS frame is a physical dispatch like every other, so it runs the SAME override: that
+      // is where a key-auth send is committed to its attempt row and where the OAuth snapshot is
+      // bound to the credential that actually left. Skipping it here reported `sendCount: 0` for
+      // every key-auth WS turn -- a send the request log, and any guard reading it, could not see.
+      //
       // The fallback has to be the same HTTP fetch the non-WS branch would have
       // used, protocol pin included: a WS turn that falls back is serving the
       // request over HTTP, and dropping the provider's `upstreamHttpVersion`
-      // there would silently negotiate a transport the operator ruled out.
-      return codexWsUpstreamFetch(input, init, httpFetch, runtime, options.onCodexWsQuota, options.beforeDispatch,
-        options.onTransportDispatch, options.nativeControl, () => waitForPacing(init.signal ?? undefined));
+      // there would silently negotiate a transport the operator ruled out. It skips the override
+      // only because this send already ran it.
+      const wsSend = Object.assign((
+        wsInput: Parameters<typeof globalThis.fetch>[0],
+        wsInit?: RequestInit,
+      ) => codexWsUpstreamFetch(
+        typeof wsInput === "string" ? wsInput : input,
+        (wsInit ?? init) as RequestInit,
+        overriddenHttpFallback, runtime, options.onCodexWsQuota, options.beforeDispatch,
+        options.onTransportDispatch, options.nativeControl, () => waitForPacing(init.signal ?? undefined)),
+      { preconnect }) as typeof globalThis.fetch;
+      return options.dispatchOverride
+        ? options.dispatchOverride(input, init, wsSend)
+        : wsSend(input, init);
     }
     return httpFetch(input, init);
   };
