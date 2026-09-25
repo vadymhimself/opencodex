@@ -1,3 +1,4 @@
+import { AnthropicTokenError } from "./anthropic";
 import { parseCallbackInput } from "./callback-server";
 import { retainedUtf8Bytes } from "../lib/admission";
 import type { GenerationContext } from "../lib/state-store-sweeper";
@@ -10,9 +11,114 @@ import type { GenerationContext } from "../lib/state-store-sweeper";
  * a login that has started and not yet settled, and none of it reads or writes a stored
  * credential. `index.ts` re-exports the two public names, so existing importers are unaffected.
  */
-export const loginState = new Map<string, { error?: string; done: boolean }>();
+/**
+ * Machine-readable outcome of a code-display login, so a caller that only ever sees one HTTP
+ * response can tell a bad paste from a dead flow from an unreachable provider. Never carries
+ * any part of the code, verifier, state or token.
+ */
+export type LoginCodeError =
+  | "state_mismatch"
+  | "invalid_or_expired_code"
+  | "no_pending_login"
+  | "provider_unreachable"
+  | "malformed_input"
+  | "code_mode_unsupported";
+
+export interface LoginFlowState {
+  error?: string;
+  done: boolean;
+  /** Absent means the default localhost-callback flow; "code" is the code-display flow. */
+  mode?: "callback" | "code";
+  flowId?: string;
+  /** Epoch ms after which a paste is refused as `no_pending_login`. */
+  expiresAt?: number;
+  errorCode?: LoginCodeError;
+}
+
+export const loginState = new Map<string, LoginFlowState>();
 export const loginAbort = new Map<string, { controller: AbortController; flowId?: string }>();
 export const kiroLoginSettling = new Set<string>();
+
+/**
+ * Map a login failure onto the code a code-mode caller receives. The error itself is never
+ * forwarded: a provider body can quote the submitted code back, and this response is the one
+ * surface a hosted caller renders to a user.
+ *
+ * `AnthropicTokenError` is named because anthropic is the only provider with a code-display
+ * redirect today; every other failure falls through the generic branches.
+ */
+export function classifyLoginCodeError(error: unknown): LoginCodeError {
+  const message = error instanceof Error ? error.message : "";
+  if (message.startsWith("OAuth callback cancelled")) return "no_pending_login";
+  if (error instanceof AnthropicTokenError) {
+    return error.httpStatus !== undefined && error.httpStatus >= 500
+      ? "provider_unreachable"
+      : "invalid_or_expired_code";
+  }
+  const name = error instanceof Error ? error.name : "";
+  // fetch() reports a dead network as TypeError and its own deadline as TimeoutError.
+  if (name === "TimeoutError" || name === "AbortError" || error instanceof TypeError) {
+    return "provider_unreachable";
+  }
+  return "invalid_or_expired_code";
+}
+
+/** Awaiting a terminal outcome for a provider's login (code mode answers its POST from this). */
+const loginSettleWaiters = new Map<string, Set<() => void>>();
+
+function wakeLoginWaiters(provider: string): void {
+  const waiters = loginSettleWaiters.get(provider);
+  if (!waiters) return;
+  loginSettleWaiters.delete(provider);
+  for (const wake of waiters) wake();
+}
+
+/**
+ * Record a login's terminal outcome and wake anything awaiting it. Flow identity
+ * (mode/flowId/expiresAt) is preserved so a settled flow still reports what it was.
+ */
+export function settleLoginFlow(
+  provider: string,
+  outcome: { error?: string; errorCode?: LoginCodeError } = {},
+): void {
+  const current = loginState.get(provider);
+  loginState.set(provider, {
+    ...current,
+    done: true,
+    error: outcome.error,
+    errorCode: outcome.errorCode,
+  });
+  wakeLoginWaiters(provider);
+}
+
+/** Drop a provider's flow state entirely; waiters are released rather than left hanging. */
+export function dropLoginFlow(provider: string): void {
+  loginState.delete(provider);
+  wakeLoginWaiters(provider);
+}
+
+/** Resolve true once the provider's login is terminal, false if `timeoutMs` elapses first. */
+export function waitForLoginSettled(provider: string, timeoutMs: number): Promise<boolean> {
+  const current = loginState.get(provider);
+  if (!current || current.done) return Promise.resolve(true);
+  return new Promise<boolean>(resolve => {
+    let waiters = loginSettleWaiters.get(provider);
+    if (!waiters) {
+      waiters = new Set();
+      loginSettleWaiters.set(provider, waiters);
+    }
+    let timer: ReturnType<typeof setTimeout>;
+    const wake = (): void => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    timer = setTimeout(() => {
+      waiters.delete(wake);
+      resolve(false);
+    }, timeoutMs);
+    waiters.add(wake);
+  });
+}
 
 /** Pending paste for a login in progress: either a waiter or a stashed early submission. */
 export interface ManualCodeSlot {
@@ -36,6 +142,11 @@ export function reconcileOAuthFlowState(context: GenerationContext): number {
   }
   lastOAuthFlowReconciledGeneration = context.generation;
   return removed;
+}
+
+/** Test-only counterpart to `resetOAuthReauthStateForTests`, for the same leak. */
+export function resetOAuthFlowReconcileStateForTests(): void {
+  lastOAuthFlowReconciledGeneration = 0;
 }
 
 export function clearManualCodeSlot(provider: string): void {
@@ -83,11 +194,36 @@ export function waitForManualLoginCode(provider: string, signal: AbortSignal, ex
  * here and re-prompted by the OAuth callback loop if they cannot be parsed / fail state checks.
  */
 export function submitManualLoginCode(provider: string, input: string): { ok: true } | { ok: false; error: string } {
+  const result = submitLoginCode(provider, input);
+  // The machine-readable code is dropped here on purpose: this return shape is the
+  // long-standing contract of the callback flow's paste route. Code mode calls
+  // submitLoginCode directly because it must answer with the code.
+  return result.ok ? { ok: true } : { ok: false, error: result.error };
+}
+
+/**
+ * Same validation as `submitManualLoginCode`, with the machine-readable reason attached.
+ * Optionally pins the submission to one `flowId` so a paste from a superseded attempt is
+ * refused rather than fed to whatever login is running now.
+ */
+export function submitLoginCode(
+  provider: string,
+  input: string,
+  expectedFlowId?: string,
+): { ok: true } | { ok: false; error: string; code: LoginCodeError } {
   const trimmed = input.trim();
-  if (!trimmed) return { ok: false, error: "empty code" };
-  if (retainedUtf8Bytes(trimmed) > OAUTH_PENDING_CODE_MAX_BYTES) return { ok: false, error: "code too large" };
+  if (!trimmed) return { ok: false, error: "empty code", code: "malformed_input" };
+  if (retainedUtf8Bytes(trimmed) > OAUTH_PENDING_CODE_MAX_BYTES) {
+    return { ok: false, error: "code too large", code: "malformed_input" };
+  }
   const st = loginState.get(provider);
-  if (!st || st.done) return { ok: false, error: "no login in progress" };
+  if (!st || st.done) return { ok: false, error: "no login in progress", code: "no_pending_login" };
+  if (expectedFlowId !== undefined && st.flowId !== expectedFlowId) {
+    return { ok: false, error: "no login in progress", code: "no_pending_login" };
+  }
+  if (st.expiresAt !== undefined && Date.now() > st.expiresAt) {
+    return { ok: false, error: "login expired", code: "no_pending_login" };
+  }
   const slot = ensureManualCodeSlot(provider);
   // Synchronous validation (validated request/ack): reject un-parseable input and
   // authorization responses (url/query kind) whose state is missing or mismatched
@@ -100,15 +236,20 @@ export function submitManualLoginCode(provider: string, input: string): { ok: tr
   // (`{ apiKey, state, ... }`). Keep that opaque to the generic raw parser so
   // hashes in JSON strings do not become a fake state suffix; its provider parser validates state.
   const isCommandCodeJson = provider === "command-code" && trimmed.startsWith("{");
-  if (!parsed.code && !isCommandCodeJson) return { ok: false, error: "no authorization code found in input" };
+  if (!parsed.code && !isCommandCodeJson) {
+    return { ok: false, error: "no authorization code found in input", code: "malformed_input" };
+  }
   // A raw paste carrying an explicit code#state suffix is state-bearing too: it
   // must match the expected state rather than bypass validation.
   const stateBearing = !isCommandCodeJson && (parsed.kind !== "raw" || parsed.state !== undefined);
   if (stateBearing && slot.expectedState !== undefined) {
-    if (parsed.state === undefined) return { ok: false, error: "redirect URL is missing the state parameter" };
+    if (parsed.state === undefined) {
+      return { ok: false, error: "redirect URL is missing the state parameter", code: "state_mismatch" };
+    }
     if (parsed.state !== slot.expectedState) {
       return {
         ok: false,
+        code: "state_mismatch",
         error: parsed.kind === "raw"
           ? "state mismatch — paste the bare code, or the correct code#state from THIS login attempt"
           : "state mismatch — paste the redirect URL from THIS login attempt",

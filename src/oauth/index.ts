@@ -31,7 +31,7 @@ import {
   type OAuthRefreshIntentCleanupPending,
 } from "./store";
 import { loginXai, refreshXaiToken, XAI_LOCAL_CLI_DETACH_WARNING, XaiTokenRequestError } from "./xai";
-import { ANTHROPIC_OAUTH_BETA, AnthropicTokenError, loginAnthropic, refreshAnthropicToken } from "./anthropic";
+import { ANTHROPIC_CODE_REDIRECT_URI, ANTHROPIC_OAUTH_BETA, AnthropicTokenError, loginAnthropic, refreshAnthropicToken } from "./anthropic";
 import { loginKimi, refreshKimiToken } from "./kimi";
 import { loginNous, NousTokenError, refreshNousToken, clearNousRefreshIntent, RefreshIntentIOError } from "./nous";
 import { loginChatGPT, refreshChatGPTToken, type ChatGPTLoginFlow } from "./chatgpt";
@@ -52,8 +52,10 @@ import { resolveProviderTransport } from "../providers/xai-transport";
 import { detectClaudeCodeToken, detectGrokCliToken, hasComparableGrokIdentity, isSameGrokIdentity, shouldAdoptGrokGeneration } from "./local-token-detect";
 import { logOAuthEvent } from "./log";
 import { captureConfigGeneration, sweepExpiredOnWrite } from "../lib/state-store-sweeper";
-import { clearManualCodeSlot, ensureManualCodeSlot, kiroLoginSettling, loginAbort, loginState, waitForManualLoginCode } from "./login-flow-state";
-export { reconcileOAuthFlowState, submitManualLoginCode } from "./login-flow-state";
+import { classifyLoginCodeError, clearManualCodeSlot, dropLoginFlow, ensureManualCodeSlot, kiroLoginSettling, loginAbort, loginState, settleLoginFlow, waitForManualLoginCode } from "./login-flow-state";
+import type { LoginCodeError } from "./login-flow-state";
+export { reconcileOAuthFlowState, submitLoginCode, submitManualLoginCode, waitForLoginSettled } from "./login-flow-state";
+export type { LoginCodeError, LoginFlowState } from "./login-flow-state";
 import { randomUUID } from "node:crypto";
 export {
   CODEX_HEALTH_AUTH_FAILED_NOTE,
@@ -176,6 +178,12 @@ export interface LoginOpts {
    * listener (#3366). Ignored by every other provider.
    */
   flow?: ChatGPTLoginFlow;
+  /**
+   * Code-display login: bind no callback server, advertise the provider's hosted code page as
+   * the redirect, and complete from a pasted code. Only providers with `codeRedirectUri` accept
+   * it; `startLoginFlow` rejects the rest rather than falling back to localhost.
+   */
+  codeMode?: boolean;
 }
 
 export interface LoginFlowLifecycle {
@@ -202,6 +210,11 @@ interface OAuthProviderDef {
    * overrides this. Default when unset here: "lazy-only".
    */
   defaultRefreshPolicy?: RefreshPolicy;
+  /**
+   * Provider-hosted redirect that DISPLAYS the authorization code instead of redirecting to a
+   * local port. Its presence is what makes `codeMode` available for the provider.
+   */
+  codeRedirectUri?: string;
 }
 
 function oauthConfig(id: string): OcxProviderConfig {
@@ -254,8 +267,12 @@ export const OAUTH_PROVIDERS: Record<string, OAuthProviderDef> = {
     defaultModel: oauthDefaultModel("xai"),
   },
   anthropic: {
-    login: (ctrl, opts) => loginAnthropic(ctrl, { importLocal: opts?.forceLogin ? "off" : "fallback" }),
+    login: (ctrl, opts) => loginAnthropic(ctrl, {
+      importLocal: opts?.forceLogin ? "off" : "fallback",
+      codeMode: opts?.codeMode === true,
+    }),
     refresh: refreshAnthropicToken,
+    codeRedirectUri: ANTHROPIC_CODE_REDIRECT_URI,
     providerConfig: oauthConfig("anthropic"),
     defaultModel: oauthDefaultModel("anthropic"),
     // Anthropic actively server-side-blocks subscription OAuth outside its own clients (Feb 2026).
@@ -363,6 +380,11 @@ export function isOAuthProvider(name: string): boolean {
 
 export function isPublicOAuthProvider(name: string): boolean {
   return name !== "chatgpt" && isOAuthProvider(name);
+}
+
+/** Providers that can log in from a displayed code, with no inbound port and no browser here. */
+export function supportsCodeLoginMode(name: string): boolean {
+  return OAUTH_PROVIDERS[name]?.codeRedirectUri !== undefined;
 }
 
 function isRefreshPolicy(value: unknown): value is RefreshPolicy {
@@ -1774,7 +1796,7 @@ export interface OAuthAccountSummary {
  * the config at its request boundary and resolves the policy there with `emailMaskingEnabled`.
  * The default masks, so every existing caller keeps today's behaviour.
  */
-export function getLoginStatus(provider: string, maskEmails = true): { loggedIn: boolean; email?: string; source?: OAuthCredentials["source"]; error?: string; done: boolean; activeAccountId?: string; accounts?: OAuthAccountSummary[] } {
+export function getLoginStatus(provider: string, maskEmails = true): { loggedIn: boolean; email?: string; source?: OAuthCredentials["source"]; error?: string; errorCode?: LoginCodeError; done: boolean; status: "idle" | "pending" | "complete" | "error"; mode?: "callback" | "code"; flowId?: string; expiresAt?: number; activeAccountId?: string; accounts?: OAuthAccountSummary[] } {
   const cred = getCredential(provider);
   const st = loginState.get(provider);
   const set = getAccountSet(provider);
@@ -1804,7 +1826,14 @@ export function getLoginStatus(provider: string, maskEmails = true): { loggedIn:
     email: projectEmail(cred?.email, maskEmails) ?? undefined,
     source: cred?.source,
     error: st?.error,
+    ...(st?.errorCode ? { errorCode: st.errorCode } : {}),
     done: st?.done ?? false,
+    // The flow's own lifecycle, which `done` alone cannot express: a finished flow that failed
+    // and one that succeeded both report done:true. Callers poll this.
+    status: !st ? "idle" : !st.done ? "pending" : st.error ? "error" : "complete",
+    ...(st?.mode ? { mode: st.mode } : {}),
+    ...(st?.flowId ? { flowId: st.flowId } : {}),
+    ...(st?.expiresAt !== undefined ? { expiresAt: st.expiresAt } : {}),
     ...(set ? { activeAccountId: set.activeAccountId, accounts } : {}),
   };
 }
@@ -1824,7 +1853,8 @@ export function clearLoginState(provider: string): void {
   loginAbort.get(provider)?.controller.abort("cleared");
   loginAbort.delete(provider);
   clearManualCodeSlot(provider);
-  loginState.delete(provider);
+  // Releases any code-mode POST awaiting this flow, instead of leaving it to time out.
+  dropLoginFlow(provider);
 }
 
 export function cancelLoginFlow(provider: string, flowId?: string): boolean {
@@ -1835,23 +1865,41 @@ export function cancelLoginFlow(provider: string, flowId?: string): boolean {
   active?.controller.abort("cancelled");
   loginAbort.delete(provider);
   clearManualCodeSlot(provider);
-  loginState.set(provider, { done: true, error: "Login cancelled" });
+  settleLoginFlow(provider, { error: "Login cancelled", errorCode: "no_pending_login" });
   return true;
+}
+
+/** A code-display flow the user never completes must stop accepting pastes. */
+export const CODE_LOGIN_TTL_MS = 10 * 60_000;
+
+export class CodeLoginUnsupportedError extends Error {
+  constructor(provider: string) {
+    super(`${provider} has no code-display login`);
+    this.name = "CodeLoginUnsupportedError";
+  }
 }
 
 export async function startLoginFlow(
   provider: string,
   opts?: LoginOpts,
   lifecycle?: LoginFlowLifecycle,
-): Promise<{ url: string; instructions?: string; deviceCode?: string }> {
+): Promise<{ url: string; instructions?: string; deviceCode?: string; expiresAt?: number }> {
   const def = OAUTH_PROVIDERS[provider];
   if (!def) throw new UnsupportedOAuthProviderError(provider);
+  // Never silently downgrade to the localhost redirect: the caller asked for code mode
+  // precisely because it cannot reach a localhost page.
+  if (opts?.codeMode && !supportsCodeLoginMode(provider)) throw new CodeLoginUnsupportedError(provider);
   const existing = loginState.get(provider);
   if ((existing && !existing.done) || (provider === "kiro" && kiroLoginSettling.has(provider))) {
     throw new Error(`A login for ${provider} is already in progress`);
   }
   clearManualCodeSlot(provider);
-  loginState.set(provider, { done: false });
+  const expiresAt = opts?.codeMode ? Date.now() + CODE_LOGIN_TTL_MS : undefined;
+  loginState.set(provider, {
+    done: false,
+    ...(opts?.codeMode ? { mode: "code" as const, expiresAt } : {}),
+    ...(lifecycle?.flowId ? { flowId: lifecycle.flowId } : {}),
+  });
   const abort = new AbortController();
   loginAbort.set(provider, { controller: abort, flowId: lifecycle?.flowId });
   if (provider === "kiro") kiroLoginSettling.add(provider);
@@ -1860,7 +1908,7 @@ export async function startLoginFlow(
     const ctrl: OAuthController = {
       onAuth: ({ url, instructions, deviceCode }) => {
         urlResolved = true;
-        resolve({ url, instructions, deviceCode });
+        resolve({ url, instructions, deviceCode, ...(expiresAt !== undefined ? { expiresAt } : {}) });
       },
       onProgress: () => {},
       // GUI fallback when the browser cannot hit the loopback callback server.
@@ -1889,7 +1937,7 @@ export async function startLoginFlow(
       if (finalError === undefined) {
         loginAbort.delete(provider);
         clearManualCodeSlot(provider);
-        loginState.set(provider, { done: true });
+        settleLoginFlow(provider);
         // Local-token import (grok-cli / Claude Code keychain) completes WITHOUT firing onAuth —
         // resolve so the GUI call returns instead of hanging.
         if (!urlResolved) resolve({ url: "", instructions: "Logged in via an existing local CLI/keychain token — no browser needed." });
@@ -1900,7 +1948,7 @@ export async function startLoginFlow(
       loginAbort.delete(provider);
       clearManualCodeSlot(provider);
       const msg = publicOAuthAuthenticationErrorMessage(e);
-      loginState.set(provider, { done: true, error: msg });
+      settleLoginFlow(provider, { error: msg, errorCode: classifyLoginCodeError(e) });
       if (!urlResolved) reject(e);
     };
     // Background: runLogin persists the credential + provider entry to disk. The lifecycle hook
@@ -1917,7 +1965,7 @@ export async function startLoginFlow(
       loginAbort.delete(provider);
       clearManualCodeSlot(provider);
       const msg = publicOAuthAuthenticationErrorMessage(e);
-      loginState.set(provider, { done: true, error: msg });
+      settleLoginFlow(provider, { error: msg, errorCode: classifyLoginCodeError(e) });
       if (!urlResolved) reject(e);
     }).finally(() => {
       if (provider === "kiro") kiroLoginSettling.delete(provider);

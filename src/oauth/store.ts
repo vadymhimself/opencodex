@@ -58,6 +58,17 @@ export function reconcileOAuthReauthState(context: GenerationContext): number {
   return 0;
 }
 
+/**
+ * Test-only reset so a file that drives real reconciliation cannot leak its high-water
+ * generation into the next one. `resetStateStoreSweeperForTests` restarts the sweeper's
+ * counter at zero, and this mark left behind above it silently disables every later
+ * `markAccountNeedsReauth`. Mirrors `resetProviderQuotaReconcileStateForTests`.
+ */
+export function resetOAuthReauthStateForTests(): void {
+  lastReconciledGeneration = 0;
+  liveOAuthAccountKeys = new Set();
+}
+
 /** Providers whose account set is pinned to a single slot (see module doc). */
 const SINGLE_SLOT_PROVIDERS = new Set(["chatgpt"]);
 
