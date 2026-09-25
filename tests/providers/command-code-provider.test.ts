@@ -315,7 +315,7 @@ describe("Command Code provider", () => {
       }
       throw new Error(`unexpected fetch: ${href}`);
     }) as typeof globalThis.fetch;
-    loginState.set("command-code", { done: false });
+    loginState.set("command-code", { done: false, provider: "command-code" });
     const prompts: string[] = [];
     let settled: Promise<void> = Promise.resolve();
     const promptCount = async (count: number) => {

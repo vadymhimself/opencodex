@@ -192,7 +192,7 @@ describe("OAuth manual login code fallback", () => {
   });
 
   test("Command Code callback JSON keeps hashes inside provider fields opaque", async () => {
-    loginState.set("command-code", { done: false });
+    loginState.set("command-code", { done: false, provider: "command-code" });
     const controller = new AbortController();
     const pending = waitForManualLoginCode("command-code", controller.signal, "expected-state");
     const callback = JSON.stringify({
