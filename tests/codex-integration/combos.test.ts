@@ -507,21 +507,29 @@ describe("combo target cooldowns", () => {
     expect(parseRetryAfterMs(new Date(now + 2 * 86_400_000).toUTCString(), now, serverDelay)).toBe(86_400_000);
   });
 
-  /** Verify recorded cooldowns expire at their own ceiling without truncating valid delays. */
-  test("caps only explicit server cooldowns at one day", () => {
+  /**
+   * FORK DEVIATION from upstream, 2026-09-28 pool-cooldown outage.
+   *
+   * Upstream lets an explicit server delay run to its own 24h ceiling. A combo target key is
+   * shared by every account in a provider's pool, so one spent account answering
+   * `Retry-After: 318747` cooled `anthropic/claude-opus-5-5` outright and left four healthy
+   * accounts unreachable for four hours. Until the key carries the account, every cooldown is
+   * capped at ten minutes here. Short delays are still honoured exactly.
+   */
+  test("caps every recorded cooldown at ten minutes, server-stated or not", () => {
     const now = Date.parse("2026-07-18T00:00:00.000Z");
     coolComboTarget("numeric-retry", target, { now, retryAfter: "999999" });
     coolComboTarget("date-retry", target, { now, retryAfter: new Date(now + 2 * 86_400_000).toUTCString() });
     coolComboTarget("multi-hour-retry", target, { now, retryAfter: "14400" });
     coolComboTarget("local-fallback", target, { now, cooldownMs: 999_999_999 });
-    for (const comboId of ["numeric-retry", "date-retry"]) {
-      expect(isComboTargetInCooldown(comboId, target, now + 86_400_000 - 1)).toBe(true);
-      expect(isComboTargetInCooldown(comboId, target, now + 86_400_000)).toBe(false);
+    coolComboTarget("short-retry", target, { now, retryAfter: "30" });
+    for (const comboId of ["numeric-retry", "date-retry", "multi-hour-retry", "local-fallback"]) {
+      expect(isComboTargetInCooldown(comboId, target, now + 600_000 - 1)).toBe(true);
+      expect(isComboTargetInCooldown(comboId, target, now + 600_000)).toBe(false);
     }
-    expect(isComboTargetInCooldown("multi-hour-retry", target, now + 14_400_000 - 1)).toBe(true);
-    expect(isComboTargetInCooldown("multi-hour-retry", target, now + 14_400_000)).toBe(false);
-    expect(isComboTargetInCooldown("local-fallback", target, now + 600_000 - 1)).toBe(true);
-    expect(isComboTargetInCooldown("local-fallback", target, now + 600_000)).toBe(false);
+    // A short, plausible directive is still obeyed to the millisecond.
+    expect(isComboTargetInCooldown("short-retry", target, now + 30_000 - 1)).toBe(true);
+    expect(isComboTargetInCooldown("short-retry", target, now + 30_000)).toBe(false);
   });
 
   test("rejects missing malformed zero and expired Retry-After values", () => {

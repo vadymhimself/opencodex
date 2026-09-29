@@ -240,8 +240,19 @@ export function coolComboTarget(
         message: options?.message,
       }) ? COMBO_REQUEST_RATE_COOLDOWN_MS : DEFAULT_COOLDOWN_MS);
   targetCooldowns.set(cooldownMapKey(comboId, target), {
-    // Local fallbacks are capped at ten minutes; explicit server delays at one day.
-    cooldownUntil: now + (serverDelayMs ?? Math.min(Math.max(cooldownMs, 1), MAX_COOLDOWN_MS)),
+    // Every cooldown, server-stated or inferred, is capped at ten minutes.
+    //
+    // A `Retry-After` is authoritative about the ACCOUNT that answered, and this key is a combo
+    // TARGET (`comboId` + provider/model) shared by every account in that provider's pool. On
+    // 2026-09-28 one spent account answered `Retry-After: 318747` (88.5h); honouring it here --
+    // clamped only by the 24h MAX_SERVER_DELAY_MS -- cooled the whole `anthropic/claude-opus-5-5`
+    // target and left four healthy accounts unreachable, returning 503 with zero upstream sends
+    // for four hours.
+    //
+    // Until the cooldown key carries the account, the ceiling is what bounds that blast radius.
+    // Ten minutes still stops a hot loop; the cost of being wrong is one probe per target per ten
+    // minutes, against a total outage for as long as the provider cares to name.
+    cooldownUntil: now + Math.min(Math.max(serverDelayMs ?? cooldownMs, 1), MAX_COOLDOWN_MS),
   });
   sweepExpiredOnWrite(now);
 }
