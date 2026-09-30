@@ -19,6 +19,8 @@ export const ANTHROPIC_MODEL_INPUT_MODALITIES: Record<string, string[]> = Object
 // through Opus 5 and Fable 5). Anthropic caps max_tokens per model server-side, so a
 // larger request never over-allocates; it only stops the 8192 truncation.
 export const ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS = 64_000;
+// Synchronous Messages limit: https://platform.claude.com/docs/en/models/opus-5-5/overview
+export const ANTHROPIC_MODEL_MAX_OUTPUT_TOKENS: Record<string, number> = { "claude-opus-5-5": 128_000 };
 /**
  * The effort rungs opencodex exposes for native Anthropic models. Without this the
  * providers advertised no ladder at all, so every client that keys its effort control off
