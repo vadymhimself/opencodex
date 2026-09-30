@@ -6,6 +6,7 @@ import { canReplayAnthropicSource } from "../../src/adapters/anthropic";
 import { saveConfig } from "../../src/config";
 import { providerConfigSeed } from "../../src/providers/derive";
 import { PROVIDER_REGISTRY_CORE } from "../../src/providers/registry/entries-core";
+import { ANTHROPIC_MODELS, ANTHROPIC_MODEL_MAX_OUTPUT_TOKENS } from "../../src/providers/registry/model-seeds";
 import { startServer } from "../../src/server";
 import type { OcxConfig } from "../../src/types";
 
@@ -66,6 +67,27 @@ const sse = [
   { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 2 } },
   { type: "message_stop" },
 ].map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
+
+// Every seeded maximum is load-bearing: the replay gate refuses a target whose stated maximum
+// is below the caller's max_tokens, so an entry that is too low is an outage for that model and
+// one that is too high forwards a request Anthropic will reject. Assert each entry accepts its
+// own value and refuses one token more, and that every model the provider seeds actually
+// resolves a maximum rather than silently inheriting a stale default.
+test("every seeded Anthropic model resolves the output maximum it was verified against", () => {
+  const provider = providerConfigSeed(PROVIDER_REGISTRY_CORE.find(entry => entry.id === "anthropic")!);
+  for (const [modelId, maximum] of Object.entries(ANTHROPIC_MODEL_MAX_OUTPUT_TOKENS)) {
+    expect(ANTHROPIC_MODELS).toContain(modelId);
+    expect(canReplayAnthropicSource({ ...source(maximum), model: modelId }, modelId, provider)).toBe(true);
+    expect(canReplayAnthropicSource({ ...source(maximum + 1), model: modelId }, modelId, provider)).toBe(false);
+  }
+  // Haiku 4.5 carries no entry on purpose; it must fall back to the 64K default, not to 128K.
+  expect(ANTHROPIC_MODEL_MAX_OUTPUT_TOKENS["claude-haiku-4-5"]).toBeUndefined();
+  for (const [maxTokens, accepted] of [[64_000, true], [64_001, false]] as const) {
+    expect(canReplayAnthropicSource(
+      { ...source(maxTokens), model: "claude-haiku-4-5" }, "claude-haiku-4-5", provider,
+    )).toBe(accepted);
+  }
+});
 
 // The incident shape, not just the 400 one. A combo whose Anthropic leg is filtered by the
 // replay gate still reports 503 "No available targets" rather than 400 "cannot be replayed",

@@ -19,19 +19,33 @@ export const ANTHROPIC_MODEL_INPUT_MODALITIES: Record<string, string[]> = Object
 // through Opus 5 and Fable 5). Anthropic caps max_tokens per model server-side, so a
 // larger request never over-allocates; it only stops the 8192 truncation.
 export const ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS = 64_000;
-// Synchronous Messages limit per model, from each model's overview page on
-// platform.claude.com (/docs/en/models/<slug>/overview). Only models that exceed
-// ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS need an entry; Haiku 4.5 is 64K and matches the default.
+// Synchronous Messages limit per model, each verified against that model's overview page on
+// platform.claude.com (/docs/en/models/<slug>/overview), which states it both in the header
+// line and in the Capabilities table. Deliberately NOT the 300K Message Batches extended-output
+// beta. Every seeded Claude model except Haiku 4.5 is 128K; Haiku 4.5 is genuinely 64K and is
+// omitted because it already equals ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS.
 //
 // This is not cosmetic metadata. `canReplayAnthropicSource` compares the caller's `max_tokens`
 // against this number and REFUSES the target when it is larger, so a stale value here is an
-// outage: Claude Code sends 128000 for Opus-class models, the 64000 default rejected it, and
-// on a combo the Anthropic leg was dropped from target selection with zero attempts — which
-// surfaces as "No available targets" rather than anything naming max_tokens.
+// outage, not a wrong label. Claude Code sends 128000 for Opus-class models; against the 64000
+// default that refusal is a 400 on the direct route, and on a combo it silently drops the
+// Anthropic leg from target selection with zero attempts, surfacing as "No available targets"
+// with nothing in the logs naming max_tokens.
+//
+// The default stays 64000 as a conservative floor for a model id not listed here. Raising it
+// instead would widen the blast radius past this gate: `defaultMaxOutputTokens` also feeds the
+// adapter's output budget when a caller sends no max_tokens, and the combo admission reserve
+// in resolveOutputCeiling.
 export const ANTHROPIC_MODEL_MAX_OUTPUT_TOKENS: Record<string, number> = {
   "claude-fable-5-1": 128_000,
   "claude-opus-5-5": 128_000,
   "claude-opus-5": 128_000,
+  "claude-sonnet-5": 128_000,
+  "claude-opus-4-8": 128_000,
+  "claude-opus-4-7": 128_000,
+  "claude-opus-4-6": 128_000,
+  "claude-sonnet-4-6": 128_000,
+  "claude-fable-5": 128_000,
 };
 /**
  * The effort rungs opencodex exposes for native Anthropic models. Without this the
