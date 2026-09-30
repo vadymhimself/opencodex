@@ -19,8 +19,20 @@ export const ANTHROPIC_MODEL_INPUT_MODALITIES: Record<string, string[]> = Object
 // through Opus 5 and Fable 5). Anthropic caps max_tokens per model server-side, so a
 // larger request never over-allocates; it only stops the 8192 truncation.
 export const ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS = 64_000;
-// Synchronous Messages limit: https://platform.claude.com/docs/en/models/opus-5-5/overview
-export const ANTHROPIC_MODEL_MAX_OUTPUT_TOKENS: Record<string, number> = { "claude-opus-5-5": 128_000 };
+// Synchronous Messages limit per model, from each model's overview page on
+// platform.claude.com (/docs/en/models/<slug>/overview). Only models that exceed
+// ANTHROPIC_DEFAULT_MAX_OUTPUT_TOKENS need an entry; Haiku 4.5 is 64K and matches the default.
+//
+// This is not cosmetic metadata. `canReplayAnthropicSource` compares the caller's `max_tokens`
+// against this number and REFUSES the target when it is larger, so a stale value here is an
+// outage: Claude Code sends 128000 for Opus-class models, the 64000 default rejected it, and
+// on a combo the Anthropic leg was dropped from target selection with zero attempts — which
+// surfaces as "No available targets" rather than anything naming max_tokens.
+export const ANTHROPIC_MODEL_MAX_OUTPUT_TOKENS: Record<string, number> = {
+  "claude-fable-5-1": 128_000,
+  "claude-opus-5-5": 128_000,
+  "claude-opus-5": 128_000,
+};
 /**
  * The effort rungs opencodex exposes for native Anthropic models. Without this the
  * providers advertised no ladder at all, so every client that keys its effort control off

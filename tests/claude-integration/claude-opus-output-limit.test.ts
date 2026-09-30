@@ -67,6 +67,51 @@ const sse = [
   { type: "message_stop" },
 ].map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
 
+// The incident shape, not just the 400 one. A combo whose Anthropic leg is filtered by the
+// replay gate still reports 503 "No available targets" rather than 400 "cannot be replayed",
+// because a second leg passes `sourceEligible` (compatibility is judged on an enabled view so
+// a disabled target keeps its real wire capabilities) while failing `targetProviderIsUsable`.
+// Zero attempts are made, so no log line names max_tokens and the cause is invisible.
+test("a combo whose Anthropic leg is the only usable target still serves 128000", async () => {
+  const comboModel = "claude-opus-5";
+  globalThis.fetch = async (input, init) => {
+    const request = new Request(input, init);
+    expect(JSON.parse(await request.text()).max_tokens).toBe(128_000);
+    return new Response(sse, { headers: { "content-type": "text/event-stream" } });
+  };
+  writeFileSync(join(home, "auth.json"), JSON.stringify({ anthropic: {
+    activeAccountId: "synthetic-account",
+    accounts: [{ id: "synthetic-account", credential: {
+      access: "synthetic-access", refresh: "synthetic-refresh", expires: 9999999999999,
+    } }],
+  } }), { mode: 0o600 });
+  saveConfig({
+    port: 0,
+    defaultProvider: "anthropic",
+    providers: {
+      anthropic: { adapter: "anthropic", baseUrl: "https://api.anthropic.com", authMode: "oauth" },
+      spare: { adapter: "openai-chat", baseUrl: "https://example.invalid/v1", authMode: "key", apiKey: "synthetic-key", disabled: true },
+    },
+    combos: { waterfall: { strategy: "failover", targets: [
+      { provider: "anthropic", model: comboModel },
+      { provider: "spare", model: "spare-model" },
+    ] } },
+    claudeCode: { modelMap: { [comboModel]: "combo/waterfall" } },
+  } as unknown as OcxConfig);
+  const server = startServer(0);
+  try {
+    const response = await originalFetch(new URL("/v1/messages?beta=true", server.url), {
+      method: "POST",
+      headers: { "content-type": "application/json", "anthropic-version": "2023-06-01", "anthropic-beta": beta, "x-api-key": "unused" },
+      body: JSON.stringify({ ...source(128_000), model: comboModel }),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe(sse);
+  } finally {
+    await server.stop(true);
+  }
+});
+
 for (const providerName of providers) {
   const entry = PROVIDER_REGISTRY_CORE.find(entry => entry.id === providerName)!;
 
