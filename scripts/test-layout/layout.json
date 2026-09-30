@@ -168,12 +168,14 @@
     }
   },
   "explicit": {
+    "combo-pool-cooldown-blast-radius.test.ts": "codex-integration",
     "deepseek-quota-currency.test.ts": "providers",
     "mimo-token-plan-capacity.test.ts": "providers",
     "command-code-tool-text-prose-split.test.ts": "providers",
     "cli-effort-slug.test.ts": "cli",
     "grok-47-build-fast-metadata.test.ts": "providers/xai",
     "abort-idle-deadline.test.ts": "lib",
+    "oauth-code-login.test.ts": "oauth",
     "tool-envelope-echo-whole-line.test.ts": "adapters",
     "abort-race.test.ts": "adapters",
     "account-import.test.ts": "server",
@@ -1691,7 +1693,7 @@
     "url-normalization.test.ts": "config",
     "usage-aggregate-cache.test.ts": "usage",
     "usage-anthropic-fast-pricing.test.ts": "usage",
-  "usage-cursor-fast-pricing.test.ts": "usage",
+    "usage-cursor-fast-pricing.test.ts": "usage",
     "usage-attempt-delivery.test.ts": "usage",
     "usage-cost.test.ts": "usage",
     "usage-debug.test.ts": "usage",
