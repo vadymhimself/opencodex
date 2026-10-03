@@ -556,6 +556,7 @@ describe("native main 401 refresh and replay", () => {
     // admission secret and not a forwardable Codex one: the pairing that tells a never-resolved
     // context apart from one that legitimately belongs to the caller.
     expect(skip).toContain("forwardableBearer=n");
+    expect(skip).toContain("injectedClaudeMain=n");
     expect(skip).toContain("admission=bearer");
   });
 
@@ -635,6 +636,12 @@ describe("native main 401 refresh and replay", () => {
       }),
     });
 
+    // The stored-main enrichment in handleClaudeMessages is gated on a claimed native-main
+    // profile for the turn, which needs a real admission lease. Without one the enrichment never
+    // fires and the leg resolves to `main-pool` -- which is exactly why every earlier attempt to
+    // reproduce the Mini from a leaseless harness came out already fixed.
+    const comboTurn = tryAdmitTurn();
+    expect(comboTurn).not.toBeNull();
     const warnings: string[] = [];
     const warnSpy = spyOn(console, "warn").mockImplementation((...args: unknown[]) => {
       warnings.push(args.map(String).join(" "));
@@ -645,7 +652,7 @@ describe("native main 401 refresh and replay", () => {
         messagesRequest(),
         comboConfig,
         { model: "", provider: "" } as RequestLogContext,
-        { requestId: `combo-401-${crypto.randomUUID()}`, start: Date.now() },
+        { requestId: `combo-401-${crypto.randomUUID()}`, start: Date.now(), turnAdmissionLease: comboTurn! },
       );
       await first.text();
     } finally {
@@ -674,7 +681,7 @@ describe("native main 401 refresh and replay", () => {
       messagesRequest(),
       comboConfig,
       { model: "", provider: "" } as RequestLogContext,
-      { requestId: `combo-401-${crypto.randomUUID()}`, start: Date.now() },
+      { requestId: `combo-401-${crypto.randomUUID()}`, start: Date.now(), turnAdmissionLease: comboTurn! },
     );
     await second.text();
     expect(second.status).toBe(200);
@@ -698,12 +705,13 @@ describe("native main 401 refresh and replay", () => {
       messagesRequest(),
       comboConfig,
       { model: "", provider: "" } as RequestLogContext,
-      { requestId: `combo-401-${crypto.randomUUID()}`, start: Date.now() },
+      { requestId: `combo-401-${crypto.randomUUID()}`, start: Date.now(), turnAdmissionLease: comboTurn! },
     );
     await third.text();
     expect(third.status).toBe(200);
     expect(fallbackSends).toBe(3);
     expect(codexSends).toHaveLength(1);
     expect(refreshes).toEqual(["refresh-grant"]);
+    comboTurn?.release();
   });
 });

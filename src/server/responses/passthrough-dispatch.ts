@@ -134,7 +134,12 @@ import {
 } from "../../providers/key-failover";
 import type { AttemptRecoveryKind } from "../../usage/log";
 import { resolveWireProtocolOverride } from "../adapter-resolve";
-import { refreshPoolForwardAuth, refreshNativeMainForwardAuth, withClaudeNativeSession } from "./core-auth";
+import {
+  injectedClaudeMainBearer,
+  refreshPoolForwardAuth,
+  refreshNativeMainForwardAuth,
+  withClaudeNativeSession,
+} from "./core-auth";
 import { bindRouteReasoningReplayScope } from "./core-replay";
 import type { OAuthAccessSnapshot } from "../../oauth";
 import { publicOAuthAuthenticationErrorMessage } from "../../oauth";
@@ -1083,11 +1088,15 @@ export async function preparePassthroughExchange(
           + ` kind=${admissionState.authCtx.kind}`
           // The resolver's OWN inputs, read through the same exported predicates it uses, rather
           // than a provenance field on the context: that type is pinned by exact-shape tests, and
-          // a diagnostic has no business widening it. Every branch of `resolveCodexAuthContext`
-          // that yields a caller-owned `main` requires a forwardable Codex bearer, so
-          // `forwardableBearer=n` alongside `kind=main` says the context was never resolved at
-          // all rather than resolved to the caller's own credential.
+          // a diagnostic has no business widening it.
+          //
+          // `forwardableBearer` reads the INBOUND headers, which is not what the resolution sees:
+          // a translated Claude turn has its bearer injected afterwards, so this reads `n` for a
+          // request that the resolver nonetheless treated as carrying one. `injectedClaudeMain`
+          // is that difference, and reading only the first of the two is what sent two rounds of
+          // this investigation at the wrong branch.
           + ` forwardableBearer=${hasForwardableCodexBearer(req.headers, config) ? "y" : "n"}`
+          + ` injectedClaudeMain=${injectedClaudeMainBearer(route, options) ? "y" : "n"}`
           + ` callerBearer=${req.headers.has("authorization") ? "y" : "n"}`
           + ` admission=${options.admission?.source ?? "none"}`
           + ` pinned=${config.activeCodexAccountPinned ?? "none"}`
