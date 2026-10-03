@@ -116,6 +116,12 @@ describe("combo failure hop/stop verdicts", () => {
     }
   });
 
+  test("a Codex model the ChatGPT plan cannot use hops instead of ending the chain", () => {
+    const body = JSON.stringify({ detail: "The 'gpt-6-astra' model is not supported when using Codex with a ChatGPT account." });
+    expect(comboFailureDecision(400, body)).toBe("hop");
+    expect(comboFailureDecision(400, JSON.stringify({ detail: "The 'gpt-6-astra' model is invalid." }))).toBe("stop");
+  });
+
   test("402 and 425 hop instead of ending the chain", () => {
     expect(comboFailureDecision(402, "payment required")).toBe("hop");
     expect(comboFailureDecision(425, "too early")).toBe("hop");

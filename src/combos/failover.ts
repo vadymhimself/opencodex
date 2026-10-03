@@ -667,6 +667,8 @@ function isDefiniteContextOverflow(status: number, message: string): boolean {
   return false;
 }
 
+const CODEX_ACCOUNT_MODEL_REFUSAL = /The '[^']{1,256}' model is not supported when using Codex with a ChatGPT account\./;
+
 export function comboFailureDecision(
   status: number,
   message: string,
@@ -735,6 +737,10 @@ export function comboFailureDecision(
   if (["model_not_found", "model_unavailable", "unsupported_model"].includes(failureCode)) {
     return "hop";
   }
+  // ChatGPT's Codex surface refuses a model the signed-in account's plan cannot use (a Free
+  // account, or a model still rolling out) with a code-less 400 in exactly this form. That is
+  // about this account and model, not the request, so the next combo target may serve it.
+  if (status === 400 && CODEX_ACCOUNT_MODEL_REFUSAL.test(message)) return "hop";
   // `free_rate_limited` no longer routes through `isProviderScopedQuotaCap` (it is a
   // per-request cap, not provider-wide evidence), so keep its hop verdict explicit here.
   if (failureCode === "free_rate_limited") return "hop";
