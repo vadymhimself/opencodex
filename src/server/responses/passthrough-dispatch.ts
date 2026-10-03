@@ -120,6 +120,7 @@ import {
   sleepWithAbort,
 } from "../../lib/upstream-retry";
 import { mapCodexAuthContextErrorToResponse } from "./codex-auth-error";
+import { hasForwardableCodexBearer } from "../auth-cors";
 import { classifyTransportFailureKind, transportErrorCode } from "../../lib/upstream-reachability";
 import { recordCodexUpstreamOutcome } from "../../codex/routing";
 import { describeUpstreamConnectFailure } from "./upstream-error";
@@ -1080,6 +1081,16 @@ export async function preparePassthroughExchange(
       console.warn(
         "[codex] 401 upstream without native-main refresh:"
           + ` kind=${admissionState.authCtx.kind}`
+          // The resolver's OWN inputs, read through the same exported predicates it uses, rather
+          // than a provenance field on the context: that type is pinned by exact-shape tests, and
+          // a diagnostic has no business widening it. Every branch of `resolveCodexAuthContext`
+          // that yields a caller-owned `main` requires a forwardable Codex bearer, so
+          // `forwardableBearer=n` alongside `kind=main` says the context was never resolved at
+          // all rather than resolved to the caller's own credential.
+          + ` forwardableBearer=${hasForwardableCodexBearer(req.headers, config) ? "y" : "n"}`
+          + ` callerBearer=${req.headers.has("authorization") ? "y" : "n"}`
+          + ` admission=${options.admission?.source ?? "none"}`
+          + ` pinned=${config.activeCodexAccountPinned ?? "none"}`
           + ` forwardPoolAuth=${usesCodexForwardPoolAuth(admissionState.authCtx, route.provider) ? "y" : "n"}`
           + ` adapter=${route.provider.adapter ?? "none"} authMode=${route.provider.authMode ?? "none"}`
           + ` accountMode=${route.codexAccountMode ?? "none"}`,

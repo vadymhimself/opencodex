@@ -505,6 +505,60 @@ describe("native main 401 refresh and replay", () => {
     },
   );
 
+  test("a main-context 401 names the branch that produced the context", async () => {
+    // The skip line is the only place a `main` context is identifiable: it carries no account id,
+    // so the request log has no account label for it and every branch looks the same afterwards.
+    // Direct with an admission bearer is the one `main` branch reachable from a test, and pinning
+    // it here is what keeps `mainReason` plumbed from the resolver to the log.
+    const payload = Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 86_400 })).toString("base64url");
+    writeFileSync(join(home, "auth.json"), JSON.stringify({
+      tokens: { access_token: `header.${payload}.signature`, refresh_token: "refresh-grant", account_id: "account-main" },
+    }));
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (!url.pathname.endsWith("/responses")) {
+        return Response.json({ rate_limit: { primary_window: { used_percent: 10 } } });
+      }
+      return Response.json({ error: { message: "invalidated", type: "invalid_request_error", code: "token_invalidated" } }, { status: 401 });
+    }) as typeof fetch;
+
+    const cfg = config();
+    cfg.hostname = "0.0.0.0";
+    cfg.providers.openai!.codexAccountMode = "direct";
+    cfg.apiKeys = [{
+      id: "direct-test", name: "direct-test", key: "ocx_data_direct_ingress",
+      createdAt: "2026-09-14T00:00:00.000Z",
+    }];
+    const req = request("/v1/responses");
+    req.headers.set("authorization", "Bearer ocx_data_direct_ingress");
+    const admission = resolveResponsesApiAuth(req, cfg);
+    expect(admission?.source).toBe("bearer");
+
+    const lines: string[] = [];
+    const warnSpy = spyOn(console, "warn").mockImplementation((...args: unknown[]) => {
+      lines.push(args.map(String).join(" "));
+    });
+    const turn = tryAdmitTurn();
+    try {
+      const response = await handleResponses(req, cfg, { model: "", provider: "" } as RequestLogContext, {
+        admission: admission!, turnAdmissionLease: turn!,
+      });
+      await response.text();
+    } finally {
+      warnSpy.mockRestore();
+      turn?.release();
+    }
+    const skip = lines.find(line => line.startsWith("[codex] 401 upstream without native-main refresh"));
+    expect(skip).toBeDefined();
+    expect(skip).toContain("kind=main");
+    expect(skip).toContain("accountMode=direct");
+    // Direct substitution forwards our stored credential, so the caller's own bearer is an
+    // admission secret and not a forwardable Codex one: the pairing that tells a never-resolved
+    // context apart from one that legitimately belongs to the caller.
+    expect(skip).toContain("forwardableBearer=n");
+    expect(skip).toContain("admission=bearer");
+  });
+
   /**
    * The shape that actually runs in production: Claude Code POSTs /v1/messages with
    * `model: combo/codexfirst`, whose first leg is the openai pool-main provider. The inbound
