@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { clearAccountNeedsReauth } from "../../src/codex/auth-api";
 import { CODEX_MAIN_SIGN_IN_REQUIRED_MESSAGE } from "../../src/codex/auth-context";
 import { saveCodexAccountCredential } from "../../src/codex/account-store";
-import { isAccountNeedsReauth } from "../../src/codex/account-runtime-state";
+import { isAccountNeedsReauth, markAccountNeedsReauth } from "../../src/codex/account-runtime-state";
 import { getValidMainAccountToken, MAIN_CODEX_ACCOUNT_ID } from "../../src/codex/main-account";
 import { withNativeMainSharedClaim } from "../../src/codex/native-main-claim";
 import type { NativeProfileContext } from "../../src/codex/native-profile-store";
@@ -13,10 +13,23 @@ import { clearCodexUpstreamHealth, clearThreadAccountMap } from "../../src/codex
 import { resolveResponsesApiAuth } from "../../src/server/auth-cors";
 import { tryAdmitTurn } from "../../src/server/lifecycle";
 import { handleResponses, handleResponsesCompact } from "../../src/server/responses";
+import { handleClaudeMessages } from "../../src/server/claude-messages";
+import { clearComboTargetCooldowns } from "../../src/combos/failover";
+import { clearComboSelectionState } from "../../src/combos/resolve";
 import type { RequestLogContext } from "../../src/server/request-log";
 import type { OcxConfig } from "../../src/types";
 import { acquireOwnedSpendHome } from "../helpers/owned-spend-home";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
+
+/** Smallest complete Anthropic stream: the combo's second target has to actually answer. */
+const ANTHROPIC_SSE = [
+  ["message_start", { type: "message_start", message: { id: "msg_fallback", type: "message", role: "assistant", model: "m2", content: [], stop_reason: null, usage: { input_tokens: 1, output_tokens: 0 } } }],
+  ["content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }],
+  ["content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "served" } }],
+  ["content_block_stop", { type: "content_block_stop", index: 0 }],
+  ["message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } }],
+  ["message_stop", { type: "message_stop" }],
+].map(([event, data]) => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`).join("");
 
 const originalFetch = globalThis.fetch;
 let home = "";
@@ -476,4 +489,152 @@ describe("native main 401 refresh and replay", () => {
       }
     },
   );
+
+  /**
+   * The shape that actually runs in production: Claude Code POSTs /v1/messages with
+   * `model: combo/codexfirst`, whose first leg is the openai pool-main provider. The inbound
+   * wire is claude-messages, so that leg is TRANSLATED rather than passed through -- it
+   * dispatches through `prepareAdapterExchange`, not the passthrough route, and that dispatch
+   * recorded no Codex account outcome and attempted no refresh on a pre-stream 401. The
+   * revoked session was therefore rediscovered by a fresh upstream 401 on every request.
+   */
+  test("a /v1/messages combo leg retires the dead grant instead of re-earning its 401", async () => {
+    const payload = Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 86_400 })).toString("base64url");
+    writeFileSync(join(home, "auth.json"), JSON.stringify({
+      tokens: {
+        access_token: `header.${payload}.signature`,
+        refresh_token: "refresh-grant",
+        account_id: "account-main",
+      },
+    }));
+    const codexSends: string[] = [];
+    const refreshes: string[] = [];
+    let fallbackSends = 0;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (url.hostname === "auth.openai.com") {
+        refreshes.push(new URLSearchParams(String(init?.body)).get("refresh_token") ?? "");
+        return Response.json({ error: "token_invalidated" }, { status: 401 });
+      }
+      if (url.hostname === "fallback.test") {
+        fallbackSends += 1;
+        return new Response(ANTHROPIC_SSE, { headers: { "content-type": "text/event-stream" } });
+      }
+      if (url.hostname !== "chatgpt.com") {
+        return Response.json({ rate_limit: { primary_window: { used_percent: 10 } } });
+      }
+      if (!url.pathname.endsWith("/responses")) {
+        return Response.json({ rate_limit: { primary_window: { used_percent: 10 } } });
+      }
+      codexSends.push(new Headers(init?.headers).get("authorization") ?? "");
+      return Response.json({
+        error: {
+          message: "Your authentication token has been invalidated. Please try signing in again.",
+          type: "invalid_request_error",
+          code: "token_invalidated",
+        },
+      }, { status: 401 });
+    }) as typeof fetch;
+
+    const comboConfig = {
+      ...config(),
+      providers: {
+        ...config().providers,
+        fallback: {
+          adapter: "anthropic",
+          baseUrl: "https://fallback.test",
+          apiKey: "k",
+        },
+      },
+      combos: {
+        codexfirst: {
+          strategy: "failover",
+          targets: [
+            { provider: "openai", model: "gpt-5.5" },
+            { provider: "fallback", model: "m2" },
+          ],
+        },
+      },
+    } as unknown as OcxConfig;
+    const messagesRequest = (): Request => new Request("http://localhost/v1/messages", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "combo/codexfirst",
+        max_tokens: 128,
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    });
+
+    const warnings: string[] = [];
+    const warnSpy = spyOn(console, "warn").mockImplementation((...args: unknown[]) => {
+      warnings.push(args.map(String).join(" "));
+    });
+    let first: Response;
+    try {
+      first = await handleClaudeMessages(
+        messagesRequest(),
+        comboConfig,
+        { model: "", provider: "" } as RequestLogContext,
+        { requestId: `combo-401-${crypto.randomUUID()}`, start: Date.now() },
+      );
+      await first.text();
+    } finally {
+      warnSpy.mockRestore();
+    }
+    // One failure is one line, and it names the refusal rather than reprinting the envelope.
+    // The raw body is multi-line JSON; a log built from it spread a single 401 over the screen.
+    const comboLine = warnings.find(line => line.startsWith("[combo] codexfirst: openai/"));
+    expect(comboLine).toBeDefined();
+    expect(comboLine).not.toContain("\n");
+    expect(comboLine).not.toContain("{");
+    expect(comboLine).toContain("codex login");
+    // The combo still serves the turn from its second target; that was never the problem.
+    expect(first.status).toBe(200);
+    expect(fallbackSends).toBe(1);
+    // One send, one refresh attempt, and the refusal retired the grant for good.
+    expect(codexSends).toHaveLength(1);
+    expect(refreshes).toEqual(["refresh-grant"]);
+    expect(isAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID)).toBe(true);
+
+    // Re-offer the openai leg. Without this the combo's own target cooldown skips it and the
+    // assertions below would pass whether or not the account was ever quarantined.
+    clearComboTargetCooldowns();
+    clearComboSelectionState();
+    const second = await handleClaudeMessages(
+      messagesRequest(),
+      comboConfig,
+      { model: "", provider: "" } as RequestLogContext,
+      { requestId: `combo-401-${crypto.randomUUID()}`, start: Date.now() },
+    );
+    await second.text();
+    expect(second.status).toBe(200);
+    expect(fallbackSends).toBe(2);
+    // THE POINT: the quarantined main account is not sent to again, and its dead grant is not
+    // retried either. Before the fix this was a second upstream 401, three hundred times over.
+    expect(codexSends).toHaveLength(1);
+    expect(refreshes).toEqual(["refresh-grant"]);
+
+    // The production loop, and the reason the quarantine did not hold on the Mini: the WHAM
+    // probe retracts a reauth quarantine on an EXPLICIT refresh (#327), which `ocx account list`
+    // and an open dashboard both trigger, and then re-marks the account from its own terminal
+    // verdict. The dead-grant finding must survive that round trip -- it is a fact about a
+    // specific refresh token, not about the quarantine that accompanied it -- or main becomes
+    // selectable again and buys another upstream 401 every time the operator looks at it.
+    clearAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
+    markAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
+    clearComboTargetCooldowns();
+    clearComboSelectionState();
+    const third = await handleClaudeMessages(
+      messagesRequest(),
+      comboConfig,
+      { model: "", provider: "" } as RequestLogContext,
+      { requestId: `combo-401-${crypto.randomUUID()}`, start: Date.now() },
+    );
+    await third.text();
+    expect(third.status).toBe(200);
+    expect(fallbackSends).toBe(3);
+    expect(codexSends).toHaveLength(1);
+    expect(refreshes).toEqual(["refresh-grant"]);
+  });
 });

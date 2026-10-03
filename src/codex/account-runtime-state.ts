@@ -1,5 +1,4 @@
 import { captureConfigGeneration, type GenerationContext } from "../lib/state-store-sweeper";
-import { MAIN_CODEX_ACCOUNT_ID } from "./account-id";
 import { isCodexAccountGenerationLive } from "./account-store";
 
 /**
@@ -90,6 +89,11 @@ export function clearAccountNeedsReauth(id: string, credentialGeneration?: numbe
     && (reauthAccounts.get(id) !== credentialGeneration
       || !isCodexAccountGenerationLive(id, credentialGeneration))) return;
   reauthAccounts.delete(id);
-  // The grant verdict qualifies main's quarantine, so whatever ends the quarantine ends it too.
-  if (id === MAIN_CODEX_ACCOUNT_ID) deadMainRefreshGrant = undefined;
+  // The dead-grant verdict deliberately SURVIVES this. It is a fact about one refresh token, not
+  // about the quarantine that accompanied it, and it already self-invalidates by fingerprint when
+  // the credential is replaced. Retracting it here let the WHAM probe's explicit-refresh clear
+  // (#327) -- which `ocx account list` and an open dashboard both trigger -- hand a grant upstream
+  // had already refused back to routing, and the probe's own re-mark could not stop it: with a
+  // grant apparently alive, `hasMainAccountRefreshGrant` cancels the quarantine. Every look at the
+  // dashboard bought another upstream 401.
 }

@@ -819,8 +819,13 @@ export async function executeComboResponses(
     // identical `failed with 401` lines and nothing saying the credential was refused. Both
     // fields come from the bounded body this failure already consumed -- no second read -- and
     // `normalizeUpstreamErrorText` has capped the text before it gets here.
+    //
+    // The parsed `error.message` first: `classificationText` is the whole envelope, so building
+    // the line from it printed a raw multi-line JSON body across the log. Whitespace is collapsed
+    // for the same reason -- one failure must be one line, or a reader cannot count them.
     const failureReason = redactSecretString(
-      [failure.upstreamCode, failure.classificationText].filter(Boolean).join(": "),
+      [failure.upstreamCode, failure.upstreamMessage ?? failure.classificationText]
+        .filter(Boolean).join(": ").replace(/\s+/g, " ").trim(),
     ).slice(0, 200);
     console.warn(
       `[combo] ${comboId}: ${targetKey(pick.target)} failed with ${failure.response.status}`
