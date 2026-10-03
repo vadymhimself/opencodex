@@ -17,7 +17,12 @@ import {
 import { atomicWriteFile, resolveWriteTarget } from "../config/atomic-write";
 import { resolveCodexHomeDir } from "./home";
 import { assertNotRealCodexHomeUnderTest } from "../lib/test-home-guard";
-import { clearAccountNeedsReauth } from "./account-runtime-state";
+import {
+  clearAccountNeedsReauth,
+  isMainRefreshGrantDead,
+  markAccountNeedsReauth,
+  setMainRefreshGrantDead,
+} from "./account-runtime-state";
 import { advanceCodexCredentialMutationEpoch } from "./credential-mutation-epoch";
 import { withNativeMainExclusiveClaim } from "./native-main-claim";
 import { resolveNativeProfileContext } from "./native-profile-store";
@@ -153,7 +158,10 @@ export function isMainAccountCredentialUsable(now = Date.now()): boolean {
 }
 
 export function hasMainAccountRefreshGrant(): boolean {
-  return !!readMainAuthJsonCredential()?.refreshToken;
+  const refreshToken = readMainAuthJsonCredential()?.refreshToken;
+  // A grant the token endpoint has already refused cannot revive the account, so it must not
+  // override the quarantine that refusal produced.
+  return !!refreshToken && !isMainRefreshGrantDead(refreshGrantFingerprintForToken(refreshToken));
 }
 
 function assertMainAuthJsonSnapshotUnchanged(expected: MainAuthJsonCredential): void {
@@ -402,6 +410,16 @@ async function resolveMainAccountToken(
           const reason = /invalid_grant|invalidated|revoked|expired/.test(message)
             ? "reauth" as const
             : "transient" as const;
+          // The shared point every request path reaches a terminal native-main verdict through:
+          // the forced refresh after an upstream 401, the pre-send refresh of an expired bearer,
+          // and the compact twin all land here. Recording the quarantine at the callers instead
+          // left the native main slot alone unrecorded -- `refreshNativeMainForwardAuth` has no
+          // `quarantine` flag for its caller to act on the way the stored-pool twin does -- so a
+          // revoked session stayed `needsReauth: false` and every request re-earned its own 401.
+          if (reason === "reauth") {
+            setMainRefreshGrantDead(lockKey);
+            markAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
+          }
           throw new MainAccountTokenRefreshError(reason, { cause });
         }
         // The refresh may resolve after the caller went away (an implementation that does
@@ -411,6 +429,11 @@ async function resolveMainAccountToken(
         // before its own commit above.
         if (dependencies.signal?.aborted) throw dependencies.signal.reason;
         const result = persistRefreshedMainAuthJson(locked, refreshed);
+        // Retracted even under `preserveReauth`: that option preserves a quarantine whose cause
+        // this refresh did not speak to, while a 200 from the token endpoint is direct proof
+        // about the grant itself. Unconditional because a rotation-less success keeps the same
+        // refresh token, so the fingerprint alone would not clear the verdict.
+        setMainRefreshGrantDead(undefined);
         if (dependencies.preserveReauth !== true) clearAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
         return result;
       }),

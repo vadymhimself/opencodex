@@ -1,4 +1,5 @@
 import { captureConfigGeneration, type GenerationContext } from "../lib/state-store-sweeper";
+import { MAIN_CODEX_ACCOUNT_ID } from "./account-id";
 import { isCodexAccountGenerationLive } from "./account-store";
 
 /**
@@ -17,6 +18,28 @@ import { isCodexAccountGenerationLive } from "./account-store";
 const reauthAccounts = new Map<string, number | undefined>();
 let lastReconciledGeneration = 0;
 let liveAccountIds = new Set<string>();
+/**
+ * Fingerprint of the native-main refresh grant the token endpoint itself refused.
+ *
+ * A main quarantine is deliberately overridable by the presence of a refresh grant
+ * ({@link import("./main-account").hasMainAccountRefreshGrant}), because a bare WHAM 401 can
+ * quarantine a credential the next refresh would have fixed. A grant the token endpoint answered
+ * with `invalid_grant` can fix nothing, so it must stop vouching for the account — otherwise a
+ * revoked session is rediscovered by an upstream round trip on every single request.
+ *
+ * A fingerprint, never a token, and never the account id: a replacement credential written by
+ * login, reauth, or another process carries a different grant and makes this verdict inert.
+ */
+let deadMainRefreshGrant: string | undefined;
+
+/** `undefined` retracts the verdict: a refresh that succeeded proved the grant is alive. */
+export function setMainRefreshGrantDead(fingerprint: string | undefined): void {
+  deadMainRefreshGrant = fingerprint;
+}
+
+export function isMainRefreshGrantDead(fingerprint: string): boolean {
+  return deadMainRefreshGrant === fingerprint;
+}
 
 export function markAccountNeedsReauth(
   id: string,
@@ -67,4 +90,6 @@ export function clearAccountNeedsReauth(id: string, credentialGeneration?: numbe
     && (reauthAccounts.get(id) !== credentialGeneration
       || !isCodexAccountGenerationLive(id, credentialGeneration))) return;
   reauthAccounts.delete(id);
+  // The grant verdict qualifies main's quarantine, so whatever ends the quarantine ends it too.
+  if (id === MAIN_CODEX_ACCOUNT_ID) deadMainRefreshGrant = undefined;
 }

@@ -320,6 +320,64 @@ describe("native main 401 refresh and replay", () => {
     });
   }
 
+  test("retires native main when the token endpoint rejects its grant so the next request never sends", async () => {
+    // The incident shape: ChatGPT revoked the session, so every send earns `token_invalidated`
+    // while the access-token JWT still looks live. Nothing about the bearer is expired, so only
+    // the forced refresh can prove the credential is dead -- and when it does, that verdict has
+    // to outlast the request that discovered it.
+    const payload = Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 86_400 })).toString("base64url");
+    writeFileSync(join(home, "auth.json"), JSON.stringify({
+      tokens: {
+        access_token: `header.${payload}.signature`,
+        refresh_token: "refresh-grant",
+        account_id: "account-main",
+      },
+    }));
+    const sends: string[] = [];
+    const refreshes: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (url.hostname === "auth.openai.com") {
+        refreshes.push(new URLSearchParams(String(init?.body)).get("refresh_token") ?? "");
+        return Response.json({ error: "invalid_grant" }, { status: 400 });
+      }
+      if (!url.pathname.endsWith("/responses")) {
+        return Response.json({ rate_limit: { primary_window: { used_percent: 10 } } });
+      }
+      sends.push(new Headers(init?.headers).get("authorization") ?? "");
+      return Response.json({
+        error: {
+          message: "Your authentication token has been invalidated. Please try signing in again.",
+          type: "invalid_request_error",
+          code: "token_invalidated",
+        },
+      }, { status: 401 });
+    }) as typeof fetch;
+
+    const first = await handleResponses(
+      request("/v1/responses"),
+      config(),
+      { model: "", provider: "" } as RequestLogContext,
+    );
+    await first.text();
+    expect(first.status).toBe(401);
+    expect(sends).toHaveLength(1);
+    expect(refreshes).toEqual(["refresh-grant"]);
+    expect(isAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID)).toBe(true);
+
+    const second = await handleResponses(
+      request("/v1/responses"),
+      config(),
+      { model: "", provider: "" } as RequestLogContext,
+    );
+    await second.text();
+    // The point of the quarantine: the second request is refused locally, so a combo's next
+    // target is reached without paying another upstream round trip on a dead credential.
+    expect(sends).toHaveLength(1);
+    expect(refreshes).toEqual(["refresh-grant"]);
+    expect(second.status).toBe(401);
+  });
+
   test.each(["/v1/responses", "/v1/responses/compact"] as const)(
     "%s keeps the WebSocket string-abort claim cancellation as 499 without quarantining main",
     async path => {
