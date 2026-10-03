@@ -478,7 +478,7 @@ describe("main quota refresh diagnostics", () => {
       expect(reads).toBe(1);
       if (invalidation === "none") {
         const expected = outcome === "http" ? { status: "http_error", httpStatus: 503 }
-          : outcome === "terminal_http" ? { status: "http_error", httpStatus: 403 }
+          : outcome === "terminal_http" ? { status: "http_error", httpStatus: 403, code: "invalid_workspace_selected" }
           : { status: outcome === "body" ? "network_error" : "ok" };
         expect(result.quotaRefresh).toEqual(expected);
       } else {
@@ -1177,6 +1177,36 @@ describe("codex-auth API", () => {
     const data = await resp!.json() as { accounts: Array<{ id: string; needsReauth?: boolean }> };
 
     expect(data.accounts.find(account => account.id === MAIN_CODEX_ACCOUNT_ID)?.needsReauth).toBe(true);
+    expect(isAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID)).toBe(true);
+    clearAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
+  });
+
+  test("main account revoked by a plan change is terminal, names the code and keeps the last plan", async () => {
+    writeFileSync(join(TEST_CODEX_HOME, "auth.json"), JSON.stringify({
+      tokens: { access_token: jwtWithExp(Math.floor(Date.now() / 1000) + 3600), account_id: "acct-main" },
+    }));
+    globalThis.fetch = (async () => Response.json({
+      plan_type: "pro",
+      rate_limit: { primary_window: { used_percent: 46 } },
+    })) as typeof fetch;
+    const first = new Request("http://localhost/api/codex-auth/accounts?refresh=1");
+    await handleCodexAuthAPI(first, new URL(first.url), makeConfig());
+
+    globalThis.fetch = (async () => Response.json({
+      error: { message: "Your authentication token has been invalidated.", code: "token_invalidated" },
+      status: 401,
+    }, { status: 401 })) as typeof fetch;
+    const req = new Request("http://localhost/api/codex-auth/accounts?refresh=1");
+    const resp = await handleCodexAuthAPI(req, new URL(req.url), makeConfig());
+    const data = await resp!.json() as { accounts: CodexAuthAccountDto[] };
+
+    expect(data.accounts.find(account => account.id === MAIN_CODEX_ACCOUNT_ID)).toMatchObject({
+      needsReauth: true,
+      reauthReason: "unauthorized",
+      plan: "pro",
+      quota: null,
+      quotaRefresh: { status: "http_error", httpStatus: 401, code: "token_invalidated" },
+    });
     expect(isAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID)).toBe(true);
     clearAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID);
   });
