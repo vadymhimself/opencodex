@@ -28,6 +28,7 @@ import {
 } from "../../combos";
 import { formatErrorResponse } from "../../bridge";
 import { SEND_BUDGET_EXHAUSTED_CODE } from "../../lib/errors";
+import { redactSecretString } from "../../lib/redact";
 import {
   expandPreviousResponseInput,
   previousResponseReplayFailure,
@@ -814,8 +815,16 @@ export async function executeComboResponses(
       }
       return lastFailure;
     }
+    // The status alone is what made a revoked ChatGPT session read as a provider outage: 300
+    // identical `failed with 401` lines and nothing saying the credential was refused. Both
+    // fields come from the bounded body this failure already consumed -- no second read -- and
+    // `normalizeUpstreamErrorText` has capped the text before it gets here.
+    const failureReason = redactSecretString(
+      [failure.upstreamCode, failure.classificationText].filter(Boolean).join(": "),
+    ).slice(0, 200);
     console.warn(
-      `[combo] ${comboId}: ${targetKey(pick.target)} failed with ${failure.response.status} after ${Date.now() - started}ms`,
+      `[combo] ${comboId}: ${targetKey(pick.target)} failed with ${failure.response.status}`
+        + ` after ${Date.now() - started}ms${failureReason ? `: ${failureReason}` : ""}`,
     );
     const failureNow = Date.now();
     const attemptedTargets = pick.attempted;

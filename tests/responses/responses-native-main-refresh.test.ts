@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { clearAccountNeedsReauth } from "../../src/codex/auth-api";
+import { CODEX_MAIN_SIGN_IN_REQUIRED_MESSAGE } from "../../src/codex/auth-context";
 import { saveCodexAccountCredential } from "../../src/codex/account-store";
 import { isAccountNeedsReauth } from "../../src/codex/account-runtime-state";
 import { getValidMainAccountToken, MAIN_CODEX_ACCOUNT_ID } from "../../src/codex/main-account";
@@ -359,8 +360,8 @@ describe("native main 401 refresh and replay", () => {
       config(),
       { model: "", provider: "" } as RequestLogContext,
     );
-    await first.text();
     expect(first.status).toBe(401);
+    expect(JSON.parse(await first.text()).error.message).toBe(CODEX_MAIN_SIGN_IN_REQUIRED_MESSAGE);
     expect(sends).toHaveLength(1);
     expect(refreshes).toEqual(["refresh-grant"]);
     expect(isAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID)).toBe(true);
@@ -370,12 +371,13 @@ describe("native main 401 refresh and replay", () => {
       config(),
       { model: "", provider: "" } as RequestLogContext,
     );
-    await second.text();
     // The point of the quarantine: the second request is refused locally, so a combo's next
-    // target is reached without paying another upstream round trip on a dead credential.
+    // target is reached without paying another upstream round trip on a dead credential -- and
+    // it says the same actionable thing the discovering request said, not "no usable credential".
+    expect(second.status).toBe(401);
+    expect(JSON.parse(await second.text()).error.message).toBe(CODEX_MAIN_SIGN_IN_REQUIRED_MESSAGE);
     expect(sends).toHaveLength(1);
     expect(refreshes).toEqual(["refresh-grant"]);
-    expect(second.status).toBe(401);
   });
 
   test.each(["/v1/responses", "/v1/responses/compact"] as const)(
