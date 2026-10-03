@@ -115,12 +115,30 @@ async function refreshNativeMainGrant(
   });
   if (!resp.ok) {
     const body = await resp.text().catch(() => "");
-    const { reason, description } = classifyChatgptRefreshFailure(resp.status, body);
-    throw new MainAccountTokenRefreshError(reason === "unknown" ? "transient" : "reauth", {
+    const { reason, description, code } = classifyChatgptRefreshFailure(resp.status, body);
+    const verdict = reason === "unknown" ? "transient" as const : "reauth" as const;
+    noteNativeMainRefresh(verdict, resp.status, code);
+    throw new MainAccountTokenRefreshError(verdict, {
       cause: new Error(`ChatGPT refresh failed: ${resp.status} ${description}`),
     });
   }
+  noteNativeMainRefresh("ok", resp.status);
   return credsFromToken((await resp.json()) as Record<string, unknown>);
+}
+
+/**
+ * One line per native-main refresh verdict, so a dead grant is diagnosable from service.log.
+ *
+ * A revoked session is invisible from the outside: the grant is refused, nothing is written, and
+ * the request fails with a status that looks like every other 401. Carries the token endpoint's
+ * HTTP status and its structured `error` code and nothing else -- never a token, never a body.
+ */
+function noteNativeMainRefresh(outcome: string, status?: number, code?: string): void {
+  console.warn(
+    `[codex] native main refresh: ${outcome}`
+      + (status === undefined ? "" : ` status=${status}`)
+      + ` code=${code && /^[A-Za-z0-9._-]{1,64}$/.test(code) ? code : "none"}`,
+  );
 }
 
 function nonEmptyString(value: unknown): string | undefined {
@@ -391,13 +409,23 @@ async function resolveMainAccountToken(
   rejectedAccessToken?: string,
 ): Promise<{ accessToken: string; chatgptAccountId: string } | null> {
   const initial = readMainAuthJsonCredential();
-  if (!initial) return null;
+  // Every skip below ends a forced refresh WITHOUT asking the token endpoint anything, which from
+  // the outside is indistinguishable from a refusal: same failed request, no write, no verdict.
+  // A forced refresh is the only caller that passes `rejectedAccessToken`, so only it reports.
+  if (!initial) {
+    if (rejectedAccessToken !== undefined) noteNativeMainRefresh("skipped-no-credential");
+    return null;
+  }
   const now = Date.now();
   if (initial.accessToken !== rejectedAccessToken
     && mainAccessTokenFresh(initial.accessToken, now, MAIN_TOKEN_REFRESH_SKEW_MS)) {
+    // The stored credential is no longer the one upstream rejected: somebody else replaced it
+    // while this request was in flight, so there is nothing here to refresh or to retire.
+    if (rejectedAccessToken !== undefined) noteNativeMainRefresh("skipped-credential-replaced");
     return { accessToken: initial.accessToken!, chatgptAccountId: initial.chatgptAccountId };
   }
   if (!initial.refreshToken) {
+    if (rejectedAccessToken !== undefined) noteNativeMainRefresh("skipped-no-refresh-grant");
     return initial.accessToken !== rejectedAccessToken
       && mainAccessTokenFresh(initial.accessToken, now, 0)
       ? { accessToken: initial.accessToken!, chatgptAccountId: initial.chatgptAccountId }

@@ -554,7 +554,7 @@ const CHATGPT_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 export function classifyChatgptRefreshFailure(
   status: number,
   body: string,
-): { reason: "expired" | "revoked" | "unknown"; description: string } {
+): { reason: "expired" | "revoked" | "unknown"; description: string; code?: string } {
   let errDesc: string;
   let errCodeExact: string | undefined;
   try {
@@ -584,7 +584,7 @@ export function classifyChatgptRefreshFailure(
     : structuredCode === "refresh_token_expired"
       || (proseIsOnlySignal && errDesc.includes("expired")) ? "expired" as const
     : "unknown" as const;
-  return { reason, description: errDesc };
+  return { reason, description: errDesc, ...(structuredCode ? { code: structuredCode } : {}) };
 }
 
 export class TokenRefreshError extends Error {

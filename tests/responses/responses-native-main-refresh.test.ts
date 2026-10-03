@@ -387,14 +387,23 @@ describe("native main 401 refresh and replay", () => {
     "retires native main on %i %s so the next request never sends",
     async (status, code) => {
     const { sends, refreshes } = installRevokedSessionHarness({ status, body: { error: code } });
+    const refreshLines: string[] = [];
+    const warnSpy = spyOn(console, "warn").mockImplementation((...args: unknown[]) => {
+      refreshLines.push(args.map(String).join(" "));
+    });
 
     const first = await handleResponses(
       request("/v1/responses"),
       config(),
       { model: "", provider: "" } as RequestLogContext,
     );
+    warnSpy.mockRestore();
     expect(first.status).toBe(401);
     expect(JSON.parse(await first.text()).error.message).toBe(CODEX_MAIN_SIGN_IN_REQUIRED_MESSAGE);
+    // The verdict is on the record, with the endpoint's own status and code and nothing else.
+    // A revoked session is otherwise invisible: no write, and a status like any other 401.
+    expect(refreshLines).toContain(`[codex] native main refresh: reauth status=${status} code=${code}`);
+    expect(refreshLines.some(line => line.startsWith("[codex] 401 upstream without native-main refresh"))).toBe(false);
     expect(sends).toHaveLength(1);
     expect(refreshes).toEqual(["refresh-grant"]);
     expect(isAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID)).toBe(true);
@@ -424,11 +433,17 @@ describe("native main 401 refresh and replay", () => {
       body: { error: "server_error", error_description: "session expired or revoked; retry" },
     });
 
+    const transientLines: string[] = [];
+    const warnSpy = spyOn(console, "warn").mockImplementation((...args: unknown[]) => {
+      transientLines.push(args.map(String).join(" "));
+    });
     const response = await handleResponses(
       request("/v1/responses"),
       config(),
       { model: "", provider: "" } as RequestLogContext,
     );
+    warnSpy.mockRestore();
+    expect(transientLines).toContain("[codex] native main refresh: transient status=503 code=server_error");
     expect(response.status).toBe(503);
     expect(sends).toHaveLength(1);
     expect(refreshes).toEqual(["refresh-grant"]);

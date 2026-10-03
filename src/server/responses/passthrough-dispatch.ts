@@ -1064,6 +1064,27 @@ export async function preparePassthroughExchange(
     // Keep recovery kinds in sync with the generic `recovery:` loop below.
     passthroughRecovery: for (;;) {
 
+    // Why a 401 did NOT reach the refresh-and-classify below. Without this the skip is silent and
+    // indistinguishable from a refresh that ran and was refused: both end as one 401 with one
+    // send. The three conditions are the whole gate, so naming them names the cause -- and
+    // `kind` is the one that cannot be read back from the request log, because a caller-owned
+    // `main` context carries no account id and therefore no account label.
+    if (
+      upstreamResponse.status === 401
+      && codex401ReplayKind === null
+      && !(
+        (admissionState.authCtx.kind === "main-pool" || admissionState.authCtx.kind === "pool")
+        && usesCodexForwardPoolAuth(admissionState.authCtx, route.provider)
+      )
+    ) {
+      console.warn(
+        "[codex] 401 upstream without native-main refresh:"
+          + ` kind=${admissionState.authCtx.kind}`
+          + ` forwardPoolAuth=${usesCodexForwardPoolAuth(admissionState.authCtx, route.provider) ? "y" : "n"}`
+          + ` adapter=${route.provider.adapter ?? "none"} authMode=${route.provider.authMode ?? "none"}`
+          + ` accountMode=${route.codexAccountMode ?? "none"}`,
+      );
+    }
     if (
       upstreamResponse.status === 401
       && (admissionState.authCtx.kind === "main-pool" || admissionState.authCtx.kind === "pool")
