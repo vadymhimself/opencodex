@@ -321,11 +321,15 @@ describe("native main 401 refresh and replay", () => {
     });
   }
 
-  test("retires native main when the token endpoint rejects its grant so the next request never sends", async () => {
-    // The incident shape: ChatGPT revoked the session, so every send earns `token_invalidated`
-    // while the access-token JWT still looks live. Nothing about the bearer is expired, so only
-    // the forced refresh can prove the credential is dead -- and when it does, that verdict has
-    // to outlast the request that discovered it.
+  /**
+   * The revoked-session harness: the access-token JWT still looks live, every send earns
+   * `token_invalidated`, and only the forced refresh can prove the credential is dead. The
+   * token endpoint's answer to that refresh is the variable.
+   */
+  function installRevokedSessionHarness(refusal: { status: number; body: unknown }): {
+    sends: string[];
+    refreshes: string[];
+  } {
     const payload = Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 86_400 })).toString("base64url");
     writeFileSync(join(home, "auth.json"), JSON.stringify({
       tokens: {
@@ -340,7 +344,7 @@ describe("native main 401 refresh and replay", () => {
       const url = new URL(input instanceof Request ? input.url : String(input));
       if (url.hostname === "auth.openai.com") {
         refreshes.push(new URLSearchParams(String(init?.body)).get("refresh_token") ?? "");
-        return Response.json({ error: "invalid_grant" }, { status: 400 });
+        return Response.json(refusal.body, { status: refusal.status });
       }
       if (!url.pathname.endsWith("/responses")) {
         return Response.json({ rate_limit: { primary_window: { used_percent: 10 } } });
@@ -354,6 +358,22 @@ describe("native main 401 refresh and replay", () => {
         },
       }, { status: 401 });
     }) as typeof fetch;
+    return { sends, refreshes };
+  }
+
+  // Production only ever confirmed bare 400 `invalid_grant`. These are the siblings upstream
+  // also emits for a revoked or downgraded session; each must retire the grant, not just the
+  // one code the incident happened to produce.
+  test.each([
+    [400, "invalid_grant"],
+    [401, "refresh_token_invalidated"],
+    [401, "token_invalidated"],
+    [401, "refresh_token_expired"],
+    [401, "refresh_token_reused"],
+  ] as const)(
+    "retires native main on %i %s so the next request never sends",
+    async (status, code) => {
+    const { sends, refreshes } = installRevokedSessionHarness({ status, body: { error: code } });
 
     const first = await handleResponses(
       request("/v1/responses"),
@@ -378,6 +398,28 @@ describe("native main 401 refresh and replay", () => {
     expect(JSON.parse(await second.text()).error.message).toBe(CODEX_MAIN_SIGN_IN_REQUIRED_MESSAGE);
     expect(sends).toHaveLength(1);
     expect(refreshes).toEqual(["refresh-grant"]);
+  },
+  );
+
+  test("keeps a 5xx whose description reads terminal transient and leaves the grant alive", async () => {
+    // The other half of the classification, and the reason it reads the structured code rather
+    // than the formatted message: upstream puts arbitrary prose in `error_description`, so a
+    // token-endpoint 5xx that happens to say "session expired" must stay a retryable refusal.
+    // Quarantining on it would retire a live grant and demand a sign-in nobody needs.
+    const { sends, refreshes } = installRevokedSessionHarness({
+      status: 503,
+      body: { error: "server_error", error_description: "session expired or revoked; retry" },
+    });
+
+    const response = await handleResponses(
+      request("/v1/responses"),
+      config(),
+      { model: "", provider: "" } as RequestLogContext,
+    );
+    expect(response.status).toBe(503);
+    expect(sends).toHaveLength(1);
+    expect(refreshes).toEqual(["refresh-grant"]);
+    expect(isAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID)).toBe(false);
   });
 
   test.each(["/v1/responses", "/v1/responses/compact"] as const)(

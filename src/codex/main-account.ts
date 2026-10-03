@@ -3,14 +3,17 @@ import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { readCodexTokens } from "./auth-collision";
 import {
+  CHATGPT_CLIENT_ID,
+  CHATGPT_TOKEN_URL,
+  credsFromToken,
   decodeJwtPayload,
   extractAccountId,
-  refreshChatGPTToken,
 } from "../oauth/chatgpt";
 import type { OAuthCredentials } from "../oauth/types";
 import { extractChatgptPlanType } from "./plan";
 import { MAIN_CODEX_ACCOUNT_ID } from "./account-id";
 import {
+  classifyChatgptRefreshFailure,
   refreshGrantFingerprintForToken,
   withCodexRefreshFileLock,
 } from "./account-store";
@@ -81,6 +84,43 @@ export class MainAccountTokenRefreshError extends Error {
       : "Codex main token refresh did not complete", options);
     this.name = "MainAccountTokenRefreshError";
   }
+}
+
+/**
+ * The native-main refresh, posted here rather than through `refreshChatGPTToken` so the token
+ * endpoint's structured `error` code survives to {@link classifyChatgptRefreshFailure}.
+ *
+ * `refreshChatGPTToken` collapses the refusal into one display string, and classifying a grant
+ * from that string is what let `refresh_token_reused` pass as transient -- the grant never
+ * retired, every request re-earning its own 401 -- while a 5xx whose description merely read
+ * "session expired" passed as proof and would have retired a live grant.
+ *
+ * Same endpoint, client id and grant type as every other ChatGPT refresh, and the success path
+ * is `credsFromToken` itself, so only the failure branch differs: it classifies by code, exactly
+ * as the stored-pool refresh does.
+ */
+async function refreshNativeMainGrant(
+  refreshToken: string,
+  options: { signal: AbortSignal },
+): Promise<OAuthCredentials> {
+  const resp = await fetch(CHATGPT_TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      client_id: CHATGPT_CLIENT_ID,
+      refresh_token: refreshToken,
+    }).toString(),
+    signal: options.signal,
+  });
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => "");
+    const { reason, description } = classifyChatgptRefreshFailure(resp.status, body);
+    throw new MainAccountTokenRefreshError(reason === "unknown" ? "transient" : "reauth", {
+      cause: new Error(`ChatGPT refresh failed: ${resp.status} ${description}`),
+    });
+  }
+  return credsFromToken((await resp.json()) as Record<string, unknown>);
 }
 
 function nonEmptyString(value: unknown): string | undefined {
@@ -400,16 +440,20 @@ async function resolveMainAccountToken(
           && mainAccessTokenFresh(locked.accessToken, Date.now(), MAIN_TOKEN_REFRESH_SKEW_MS)) {
           return { accessToken: locked.accessToken!, chatgptAccountId: locked.chatgptAccountId };
         }
-        const refresh = dependencies.refreshToken
-          ?? ((refreshToken: string, options: { signal: AbortSignal }) => refreshChatGPTToken(refreshToken, options));
+        const refresh = dependencies.refreshToken ?? refreshNativeMainGrant;
         let refreshed: OAuthCredentials;
         try {
           refreshed = await refresh(locked.refreshToken, { signal });
         } catch (cause) {
+          // A refusal already classified at the endpoint keeps that verdict. An injected refresh
+          // threw an ordinary Error and has only its message, so prose still decides there --
+          // and only there, where there is no structured code to read.
           const message = cause instanceof Error ? cause.message.toLowerCase() : "";
-          const reason = /invalid_grant|invalidated|revoked|expired/.test(message)
-            ? "reauth" as const
-            : "transient" as const;
+          const reason = cause instanceof MainAccountTokenRefreshError
+            ? cause.reason
+            : /invalid_grant|invalidated|revoked|expired/.test(message)
+              ? "reauth" as const
+              : "transient" as const;
           // The shared point every request path reaches a terminal native-main verdict through:
           // the forced refresh after an upstream 401, the pre-send refresh of an expired bearer,
           // and the compact twin all land here. Recording the quarantine at the callers instead
