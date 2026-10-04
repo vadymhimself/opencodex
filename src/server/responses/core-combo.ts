@@ -21,6 +21,7 @@ import {
   concreteComboRequestBody,
   comboDefaultEffort,
   isComboTargetInCooldown,
+  remainingComboCooldownMs,
   noteComboSuccess,
   comboFailureDecision,
   advanceComboAfterFailure,
@@ -481,6 +482,18 @@ export async function executeComboResponses(
   // is gone, so carry the loop's own classification decision instead of re-deriving a
   // weaker one from the status alone (#4149).
   let lastFailureClassifiesOverflow = false;
+  // The first quota/rate-limit refusal of the ladder. A fallback that then refuses its own
+  // credential or plan (401/403, or a 400 the ladder hopped past) says nothing about why the
+  // request failed: the primary target ran out. Returning that fallback refusal told clients
+  // "OpenAI account pool has no usable account credential" while every Claude account was spent.
+  let quotaFailure: Response | undefined;
+  const exhaustedFailure = (): Response => {
+    if (!lastFailure || ![400, 401, 403].includes(lastFailure.status)) return lastFailure!;
+    if (quotaFailure) return quotaFailure;
+    // The quota-refused target was cooled before this request picked, so the ladder never saw
+    // its refusal. The cooldown, with its Retry-After, is still the honest answer.
+    return remainingComboCooldownMs(comboId) !== undefined ? comboUnavailable(comboId) : lastFailure;
+  };
   while (pick) {
     if (options.abortSignal?.aborted) return clientCancelledResponse();
     // Per attempt: the preflight's retained source bytes, which a failing canonical replay owes
@@ -507,7 +520,7 @@ export async function executeComboResponses(
       // intact rather than to mint a synthetic error, and a later target only exists because
       // an earlier one already recorded one.
       if (lastFailedChildLog) adoptFailedChildLog(lastFailedChildLog);
-      return lastFailure!;
+      return exhaustedFailure();
     }
     const targetSendBudget = comboSendScope
       ? comboTargetSendBudget(comboSendScope, combo.targets.length - 1 - comboTargetsDispatched)
@@ -747,6 +760,7 @@ export async function executeComboResponses(
     );
     attemptRetained = true;
     lastFailure = failure.passthroughResponse ?? failure.response;
+    if (lastFailure.status === 429 || lastFailure.status === 402) quotaFailure ??= lastFailure;
     lastFailedChildLog = childLog;
     // A replacement that answers 200 is unmarked, and its zero-output failure only exists once
     // preflight has rebuilt the stream as a fresh Response. A spent grant never hops: a status the
@@ -917,5 +931,5 @@ export async function executeComboResponses(
       ? streamingContextOverflowResponse(requestedModel, options.translatorBudget)
       : jsonContextOverflowResponse();
   }
-  return lastFailure!;
+  return exhaustedFailure();
 }
