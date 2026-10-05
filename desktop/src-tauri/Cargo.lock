@@ -2541,7 +2541,7 @@ dependencies = [
 
 [[package]]
 name = "opencodex-desktop"
-version = "2.65.0-vadymhimself.11"
+version = "2.65.0-vadymhimself.12"
 dependencies = [
  "dbus",
  "reqwest 0.12.24",
