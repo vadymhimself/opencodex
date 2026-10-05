@@ -11,6 +11,18 @@ import {
 
 interface TargetCooldown {
   cooldownUntil: number;
+  status?: number;
+}
+
+/**
+ * Whether an account pool behind `provider` can serve right now. A 429/402 cooldown on a pooled
+ * target only says every account was spent when it was recorded; a newly connected or re-authed
+ * account, or one whose window rolled, makes it stale. Registered by the pool owner so this
+ * module keeps no import on the OAuth stores.
+ */
+let poolHasEligibleAccount: ((provider: string, now: number) => boolean) | undefined;
+export function setComboPoolEligibilityProbe(probe: typeof poolHasEligibleAccount): void {
+  poolHasEligibleAccount = probe;
 }
 
 const DEFAULT_COOLDOWN_MS = 60_000;
@@ -153,7 +165,8 @@ export function isComboTargetInCooldown(
   const key = cooldownMapKey(comboId, target);
   const entry = targetCooldowns.get(key);
   if (!entry) return false;
-  if (entry.cooldownUntil <= now) {
+  if (entry.cooldownUntil <= now
+    || ((entry.status === 429 || entry.status === 402) && poolHasEligibleAccount?.(target.provider, now))) {
     targetCooldowns.delete(key);
     return false;
   }
@@ -253,6 +266,7 @@ export function coolComboTarget(
     // Ten minutes still stops a hot loop; the cost of being wrong is one probe per target per ten
     // minutes, against a total outage for as long as the provider cares to name.
     cooldownUntil: now + Math.min(Math.max(serverDelayMs ?? cooldownMs, 1), MAX_COOLDOWN_MS),
+    status: options?.status,
   });
   sweepExpiredOnWrite(now);
 }

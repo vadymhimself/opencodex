@@ -772,7 +772,11 @@ export function canReplayAnthropicSource(
     || !Object.hasOwn(outputConfig, "effort")) {
     return true;
   }
-  return supportsAnthropicSourceEffort(thinkingType, (outputConfig as Record<string, unknown>).effort);
+  const effort = (outputConfig as Record<string, unknown>).effort;
+  // Effort without a thinking block is what Claude Code's hook evaluator sends; an adaptive
+  // target accepts it as is. Rejecting it left a single-target Anthropic combo with no route.
+  if (thinkingType === undefined) return targetAcceptsAdaptive && typeof effort === "string" && ANTHROPIC_SOURCE_EFFORTS.has(effort);
+  return supportsAnthropicSourceEffort(thinkingType, effort);
 }
 
 /** `output_config.effort` accepts low|medium|high|xhigh|max — "minimal" is rejected with a 400. */

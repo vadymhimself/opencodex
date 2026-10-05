@@ -32,6 +32,7 @@ import {
 } from "../codex/pool-rotation";
 import type { OcxAccountPoolQuotaWindow, OcxAccountPoolRotationStrategy, OcxConfig } from "../types";
 import { sweepExpiredOnWrite } from "../lib/state-store-sweeper";
+import { setComboPoolEligibilityProbe } from "../combos/failover";
 import { retainedUtf8Bytes } from "../lib/admission";
 
 /**
@@ -269,6 +270,9 @@ function isPoolCredentialUsable(accountId: string, now: number): boolean {
   if (canRefreshAnthropicPoolAccount(accountId)) return true;
   return cred.expires > now + TOKEN_SKEW_MS;
 }
+
+setComboPoolEligibilityProbe((provider, now) =>
+  provider === PROVIDER && getEligibleAnthropicAccounts(now).length > 0);
 
 export function getEligibleAnthropicAccounts(now = Date.now()): string[] {
   const set = getAccountSet(PROVIDER);
