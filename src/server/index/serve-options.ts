@@ -293,6 +293,10 @@ export function createServeOptions(ctx: ServeOptionsContext) {
       maxRequestBodySize: inboundBodyLimitBytes,
       async fetch(req: Request, requestServer: Server<WsData>): Promise<Response> {
       const ingress = ingressForServer(requestServer);
+      if ((req.headers.has("x-agentradar-account-id") || req.headers.has("x-agentradar-account-provider"))
+        && !["/v1/messages", "/v1/chat/completions"].includes(codexCompatibleUrl(req.url).pathname)) {
+        return formatErrorResponse(400, "invalid_request_error", "AgentRadar account pin is only honoured on /v1/messages and /v1/chat/completions");
+      }
       // The unauthenticated loopback listener (#1102) serves a fixed allowlist and nothing
       // else. Rejecting here, before any handler runs, is what keeps the surface from growing
       // silently when a route is added below.
