@@ -95,6 +95,8 @@ type OAuthAccountSelection = NonNullable<ReturnType<typeof captureOAuthAccountSe
 // Undefined means this runtime has not admitted a selection yet; null means consumed.
 // The startup baseline comes from the authoritative store, never a second persisted pin.
 let manualPreference: OAuthAccountSelection | null | undefined;
+/** The preference above is the store's selection read at startup, not a pick made in this process. */
+let manualFromStartup = false;
 
 function normalizeAffinityComponent(value: string | null | undefined): string {
   const normalized = value?.trim() ?? "";
@@ -593,15 +595,20 @@ export function resolveAnthropicAccountForSession(
     manualPreference = set.selectionRevision !== undefined
       ? { accountId: set.activeAccountId, revision: set.selectionRevision }
       : null;
+    manualFromStartup = true;
   }
 
   if (!isAnthropicAccountPoolEnabled(config)) {
     return { accountId: set.activeAccountId, reason: "pool-disabled" };
   }
 
+  const key = normalizeAffinityComponent(sessionKey);
+  const strategy = anthropicPoolStrategy(config);
   // A manual choice is a one-dispatch preference, not a lower-priority quota hint.
   // Consume it only after admission commits, so a failed token lookup cannot spend it.
-  if (manualPreference) {
+  // The store's startup selection does not seat a keyed round-robin session: every fresh
+  // process (Lambda environment) would otherwise put that process's first session on it.
+  if (manualPreference && !(manualFromStartup && key && strategy === "round-robin")) {
     if (manualPreference.accountId !== set.activeAccountId || manualPreference.revision !== set.selectionRevision) {
       manualPreference = null;
     } else {
@@ -616,8 +623,6 @@ export function resolveAnthropicAccountForSession(
     }
   }
 
-  const key = normalizeAffinityComponent(sessionKey);
-  const strategy = anthropicPoolStrategy(config);
   // Round-robin's pick is arbitrary, so a keyed session always takes its hash seat, ahead of the
   // in-process binding: warm and fresh processes agree, and a session moved off a spent seat
   // returns to it in every process once it recovers instead of alternating between processes.
@@ -847,6 +852,7 @@ export function commitAnthropicSelectionRouting(
 export function resetAnthropicRoutingForManualSelection(accountId: string): void {
   sessionAffinity.clear();
   manualPreference = captureOAuthAccountSelection(PROVIDER);
+  manualFromStartup = false;
   seedPoolRotationAccount(POOL_KEY_ANTHROPIC, accountId);
   // A manual account selection is an operator statement about the roster; do not answer the
   // next activation question from a count read before it.

@@ -152,7 +152,8 @@ async function seedThreeAccounts() {
 }
 
 describe("anthropic account pool", () => {
-  test.each(["round-robin", "quota"] as const)("persisted manual choice survives restart before the first %s dispatch", async strategy => {
+  // Round-robin is covered by "the store's startup selection does not seat a keyed round-robin session".
+  test.each(["quota"] as const)("persisted manual choice survives restart before the first %s dispatch", async strategy => {
     const { aId, bId } = await seedTwoAccounts();
     setCachedProviderAccountQuotaForTests("anthropic", aId, { fiveHourPercent: 11 });
     setCachedProviderAccountQuotaForTests("anthropic", bId, { fiveHourPercent: 30 });
@@ -169,8 +170,7 @@ describe("anthropic account pool", () => {
     expect((await admitAnthropic("restart-first", config)).accountId).toBe(bId);
     // Once the authoritative first selection commits, the ordinary algorithm resumes.
     expect((await admitAnthropic("restart-next", config)).accountId).toBe(aId);
-    // Round-robin then pins the session to its hash seat, the one every process agrees on.
-    if (strategy === "quota") expect(resolveAnthropicAccountForSession("restart-first", config).accountId).toBe(bId);
+    expect(resolveAnthropicAccountForSession("restart-first", config).accountId).toBe(bId);
   });
 
   test("pool-off 429 recovery commits the replacement and notifies before dispatch", async () => {
@@ -429,6 +429,31 @@ describe("anthropic account pool", () => {
     // Recovery: this warm process returns the session to its seat, as a fresh one would.
     clearAnthropicAccountCooldown(seat);
     expect(resolveAnthropicAccountForSession("s0", config)).toEqual({ accountId: seat, reason: "hash" });
+  });
+
+  test("the store's startup selection does not seat a keyed round-robin session", async () => {
+    const { aId } = await seedThreeAccounts();
+    const config = cfg(true, 80, { strategy: "round-robin" });
+    // A fresh process whose stored selection (with a revision) is A: a key hashed elsewhere keeps its seat.
+    clearAnthropicAccountPoolState();
+    clearPoolRotationState();
+    expect(getAccountSet("anthropic")!.selectionRevision).toBeDefined();
+    let key = "";
+    for (let i = 0; !key && i < 50; i++) {
+      clearAnthropicAccountPoolState();
+      const pick = resolveAnthropicAccountForSession(`fresh-${i}`, cfg(true, 80, { strategy: "quota" }));
+      expect(pick).toEqual({ accountId: aId, reason: "manual" });
+      clearAnthropicAccountPoolState();
+      const seat = resolveAnthropicAccountForSession(`fresh-${i}`, config);
+      if (seat.accountId !== aId) {
+        expect(seat.reason).toBe("hash");
+        key = `fresh-${i}`;
+      }
+    }
+    expect(key).not.toBe("");
+    // A pick made in this process still wins its one dispatch.
+    resetAnthropicRoutingForManualSelection(aId);
+    expect(resolveAnthropicAccountForSession(key, config)).toEqual({ accountId: aId, reason: "manual" });
   });
 
   test("null/empty session key holds active under RR instead of rotating every turn", async () => {
