@@ -54,7 +54,26 @@ export interface ConsumedComboFailure {
 
 
 
+/** AgentRadar image patch: trusted per-request account pin, set only by the authenticated bridge. */
+export const AGENTRADAR_PIN = Symbol.for("agentradar.accountPin");
+export interface AgentRadarAccountPin { provider: "claude" | "codex" | "grok" | "kimi"; accountId: string }
+/** undefined = no pin; null = malformed pin, which must be refused rather than served unpinned. */
+export function agentRadarAccountPin(headers: Headers): AgentRadarAccountPin | null | undefined {
+  const accountId = headers.get("x-agentradar-account-id");
+  const provider = headers.get("x-agentradar-account-provider");
+  if (accountId === null && provider === null) return undefined;
+  if (!accountId || !/^[!-~]{1,256}$/.test(accountId)) return null; // printable ASCII, no spaces
+  return provider === "claude" || provider === "codex" || provider === "grok" || provider === "kimi" ? { provider, accountId } : null;
+}
+/** The pinned request's own config; a Claude pin sends web search to the Anthropic helper, which runs on the pin. */
+export function agentRadarPinnedConfig<T extends OcxConfig>(config: T, pin: AgentRadarAccountPin): T {
+  return { ...config, [AGENTRADAR_PIN]: pin,
+    ...(pin.provider === "claude" ? { webSearchSidecar: { ...config.webSearchSidecar, backend: "anthropic" as const } } : {}) };
+}
+
 export interface HandleResponsesOptions {
+  /** AgentRadar pin: serve only this stored account; never commit the global selection. */
+  agentRadarAccount?: AgentRadarAccountPin;
   /** Internal Claude replay identity; consumed only by the final canonical Go transport. */
   claudeGoAffinity?: { sessionLane?: string };
   /** Validated Claude metadata identity; projected only into final canonical attempt headers. */
