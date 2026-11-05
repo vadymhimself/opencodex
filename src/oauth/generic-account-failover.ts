@@ -367,6 +367,8 @@ export function rotateGenericOAuthAccountOn429(
   });
   sweepExpiredOnWrite(now);
 
+  // AgentRadar image patch: a pinned request records the cooldown above but never switches accounts.
+  if ((config as any)[Symbol.for("agentradar.accountPin")]) return null;
   const eligible = eligibleFailoverAccounts(providerName, now, family).filter(id => id !== failedAccountId);
   if (eligible.length === 0) return null;
   // A rotation means the roster in use just changed; do not answer the next activation question

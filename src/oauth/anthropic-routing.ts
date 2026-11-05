@@ -769,6 +769,8 @@ export function rotateAnthropicAccountOn429(
   // A rotation means the roster in use just changed; do not answer the next activation question
   // from a count read taken before the failure.
   quorumCache = null;
+  // AgentRadar image patch: a pinned request records the cooldown above but never switches accounts.
+  if ((config as any)[Symbol.for("agentradar.accountPin")]) return null;
 
   // The pool's strategy is a PROACTIVE policy. When the pool is disabled, reactive
   // presence-only recovery must not silently reactivate round-robin/fill-first merely
@@ -954,6 +956,8 @@ export async function rotateAnthropicAccountOnCredentialDenial(
   clearAnthropicSessionAffinityForAccount(rejected.accountId);
   notePoolRotationFailure(POOL_KEY_ANTHROPIC, rejected.accountId);
   quorumCache = null;
+  // AgentRadar image patch: a pinned request records the reauth mark above but never switches accounts.
+  if ((config as any)[Symbol.for("agentradar.accountPin")]) return null;
 
   const current = getAccountCredential(PROVIDER, rejected.accountId);
   const currentGenerationReplaced = current !== null
