@@ -341,6 +341,23 @@ export function anthropicRequestCorrelationKey(raw: unknown): string | undefined
   return createHash("sha256").update(canonicalJson(normalized)).digest("hex");
 }
 
+/**
+ * Claude Code's metadata.user_id is a JSON blob whose extra fields (`tk`, extra metadata) can
+ * differ between calls of one session. Key on the session (its parent's for a fork), so every
+ * call of a conversation shares one prompt_cache_key and one pooled account. Any other string
+ * is keyed whole, as before.
+ */
+function claudeSessionOf(userId: string): string {
+  try {
+    const parsed: unknown = JSON.parse(userId);
+    if (isRec(parsed)) {
+      const id = parsed.parent_session_id ?? parsed.session_id;
+      if (typeof id === "string" && id) return id;
+    }
+  } catch { /* not JSON */ }
+  return userId;
+}
+
 /** Provenance of the generated prompt_cache_key (never serialized into the wire body). */
 export type ClaudeCacheKeySource = "metadata" | "system" | null;
 
@@ -475,7 +492,7 @@ function translateAnthropicRequest(
     // cached_tokens: 0 on the ChatGPT backend — devlog 090). Claude Code's
     // metadata.user_id embeds the session uuid, so hashing it yields a stable
     // per-session key with a bounded length/charset.
-    body.prompt_cache_key = userIdHash.slice(0, 32);
+    body.prompt_cache_key = createHash("sha256").update(claudeSessionOf(raw.metadata.user_id)).digest("hex").slice(0, 32);
     cacheKeySource = "metadata";
   } else if (systemParts.length > 0) {
     // Claude Desktop sends no metadata.user_id (H1, devlog 130): without any key the

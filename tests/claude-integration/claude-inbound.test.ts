@@ -636,7 +636,20 @@ describe("prompt cache key provenance (devlog 130 B3)", () => {
       metadata: { user_id: userId },
     });
     expect(body.user).toBe(createHash("sha256").update(userId).digest("hex"));
-    expect(body.prompt_cache_key).toBe(createHash("sha256").update(userId).digest("hex").slice(0, 32));
+    expect(body.prompt_cache_key).toBe(createHash("sha256").update("s".repeat(36)).digest("hex").slice(0, 32));
+  });
+
+  test("every call of one Claude Code session shares one key, whatever else its user_id carries", () => {
+    const key = (meta: object) => anthropicToResponsesTranslation({
+      model: "m", max_tokens: 1, messages, metadata: { user_id: JSON.stringify(meta) },
+    }).body.prompt_cache_key;
+    const base = { device_id: "d".repeat(64), account_uuid: "acct", session_id: "sess-1" };
+    // A side call with a different agent token (`tk`) is the same session.
+    expect(key({ ...base, tk: "agent-a" })).toBe(key({ ...base, tk: "agent-b" }));
+    expect(key({ ...base, tk: "agent-a" })).toBe(key(base));
+    // A fork keys on its parent, so it lands where the parent's cache is.
+    expect(key({ ...base, session_id: "fork-1", parent_session_id: "sess-1" })).toBe(key(base));
+    expect(key({ ...base, session_id: "sess-2" })).not.toBe(key(base));
   });
 
   test("metadata.user_id boundary: exactly 64 chars forwarded, 65 chars hashed", () => {
