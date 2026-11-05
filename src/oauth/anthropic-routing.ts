@@ -12,7 +12,7 @@
  *
  * Affinity is cached per process; under round-robin an unbound keyed session takes the
  * rendezvous-hash winner of its key over the eligible accounts, so a fresh process lands it on the
- * same account; a session moved off a cooled seat stays bound to its runner-up in that process.
+ * same account, and returns to it once it recovers.
  * Cooldown uses Retry-After when present, else the reset time of whichever
  * rate-limit window upstream reports as rejected, else a default backoff. 401/403 credential failures should set needsReauth on the store (existing OAuth
  * path) so the account is excluded from eligibility.
@@ -55,7 +55,7 @@ const DEFAULT_AUTO_SWITCH_THRESHOLD = 80;
 const DEFAULT_QUOTA_WINDOW: OcxAccountPoolQuotaWindow = "five-hour";
 const VALID_QUOTA_WINDOWS = new Set<OcxAccountPoolQuotaWindow>(["five-hour", "weekly", "max-utilization"]);
 /** Cap same-request 429 rotations so short Retry-After cannot infinite-loop. */
-export const ANTHROPIC_POOL_MAX_FAILOVERS_PER_REQUEST = 3;
+export const ANTHROPIC_POOL_MAX_FAILOVERS_PER_REQUEST = 16;
 
 export interface AnthropicAccountPoolConfig {
   enabled?: boolean;
@@ -95,6 +95,8 @@ type OAuthAccountSelection = NonNullable<ReturnType<typeof captureOAuthAccountSe
 // Undefined means this runtime has not admitted a selection yet; null means consumed.
 // The startup baseline comes from the authoritative store, never a second persisted pin.
 let manualPreference: OAuthAccountSelection | null | undefined;
+/** The preference above is the store's selection read at startup, not a pick made in this process. */
+let manualFromStartup = false;
 
 function normalizeAffinityComponent(value: string | null | undefined): string {
   const normalized = value?.trim() ?? "";
@@ -593,15 +595,20 @@ export function resolveAnthropicAccountForSession(
     manualPreference = set.selectionRevision !== undefined
       ? { accountId: set.activeAccountId, revision: set.selectionRevision }
       : null;
+    manualFromStartup = true;
   }
 
   if (!isAnthropicAccountPoolEnabled(config)) {
     return { accountId: set.activeAccountId, reason: "pool-disabled" };
   }
 
+  const key = normalizeAffinityComponent(sessionKey);
+  const strategy = anthropicPoolStrategy(config);
   // A manual choice is a one-dispatch preference, not a lower-priority quota hint.
   // Consume it only after admission commits, so a failed token lookup cannot spend it.
-  if (manualPreference) {
+  // The store's startup selection does not seat a keyed round-robin session: every fresh
+  // process (Lambda environment) would otherwise put that process's first session on it.
+  if (manualPreference && !(manualFromStartup && key && strategy === "round-robin")) {
     if (manualPreference.accountId !== set.activeAccountId || manualPreference.revision !== set.selectionRevision) {
       manualPreference = null;
     } else {
@@ -616,7 +623,11 @@ export function resolveAnthropicAccountForSession(
     }
   }
 
-  const key = normalizeAffinityComponent(sessionKey);
+  // Round-robin's pick is arbitrary, so a keyed session always takes its hash seat, ahead of the
+  // in-process binding: warm and fresh processes agree, and a session moved off a spent seat
+  // returns to it in every process once it recovers instead of alternating between processes.
+  const hashed = strategy === "round-robin" ? sessionHashAccount(key, getEligibleAnthropicAccounts(now)) : null;
+  if (hashed) return { accountId: hashed, reason: sessionAffinity.get(key)?.accountId === hashed ? "affinity" : "hash" };
   if (key) {
     const affined = sessionAffinity.get(key);
     if (affined && now - affined.lastUsedAt <= AFFINITY_IDLE_TTL_MS) {
@@ -628,10 +639,6 @@ export function resolveAnthropicAccountForSession(
     }
   }
 
-  const strategy = anthropicPoolStrategy(config);
-  // Round-robin's pick is arbitrary, so a keyed session takes its hash seat instead: same in every process.
-  const hashed = strategy === "round-robin" ? sessionHashAccount(key, getEligibleAnthropicAccounts(now)) : null;
-  if (hashed) return { accountId: hashed, reason: "hash" };
   // No session identity (Desktop turns without a sticky key): hold the current
   // active under RR/fill-first instead of treating every turn as a new session.
   // Round-robin only when there is a real new-session key (or active is unusable).
@@ -757,6 +764,8 @@ export function rotateAnthropicAccountOn429(
   // A rotation means the roster in use just changed; do not answer the next activation question
   // from a count read taken before the failure.
   quorumCache = null;
+  // AgentRadar image patch: a pinned request records the cooldown above but never switches accounts.
+  if ((config as any)[Symbol.for("agentradar.accountPin")]) return null;
 
   // The pool's strategy is a PROACTIVE policy. When the pool is disabled, reactive
   // presence-only recovery must not silently reactivate round-robin/fill-first merely
@@ -833,6 +842,7 @@ export function commitAnthropicSelectionRouting(
 export function resetAnthropicRoutingForManualSelection(accountId: string): void {
   sessionAffinity.clear();
   manualPreference = captureOAuthAccountSelection(PROVIDER);
+  manualFromStartup = false;
   seedPoolRotationAccount(POOL_KEY_ANTHROPIC, accountId);
   // A manual account selection is an operator statement about the roster; do not answer the
   // next activation question from a count read before it.
@@ -942,6 +952,8 @@ export async function rotateAnthropicAccountOnCredentialDenial(
   clearAnthropicSessionAffinityForAccount(rejected.accountId);
   notePoolRotationFailure(POOL_KEY_ANTHROPIC, rejected.accountId);
   quorumCache = null;
+  // AgentRadar image patch: a pinned request records the reauth mark above but never switches accounts.
+  if ((config as any)[Symbol.for("agentradar.accountPin")]) return null;
 
   const current = getAccountCredential(PROVIDER, rejected.accountId);
   const currentGenerationReplaced = current !== null

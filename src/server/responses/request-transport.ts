@@ -89,6 +89,12 @@ export async function prepareResponsesTransport(
 ) {
   const { config, logCtx, options, req } = requestContext;
   const { route, parsed, inboundWire, translatorBudget } = requestState;
+  // AgentRadar image patch: the pinned account's own snapshot and credential generation are the
+  // only admission; the global selection, affinity and pool cursors are never read or written.
+  const pin = route.provider.authMode === "oauth" ? options.agentRadarAccount : undefined;
+  const pinnedSnapshot = (): Promise<OAuthAccessSnapshot> => route.providerName === "anthropic"
+    ? getAnthropicPoolAccessSnapshot(pin!.accountId)
+    : getValidAccessSnapshotForAccount(route.providerName, pin!.accountId, { requireUsableAccount: true });
 
 
   // OAuth providers: swap in a fresh access token (auto-refreshed) as the Bearer key, so the
@@ -133,6 +139,15 @@ export async function prepareResponsesTransport(
     proactive = false,
     anthropicReason?: AnthropicAccountSelectionReason,
   ): Promise<OAuthAccessSnapshot | null> => {
+    if (pin) {
+      if (candidate.accountId !== pin.accountId) return null;
+      const row = getAccountCredentialWithStatus(route.providerName, pin.accountId);
+      if (!row || row.needsReauth || row.credential.expires <= Date.now()
+        || credentialGeneration(row.credential) !== candidate.generation) candidate = await pinnedSnapshot();
+      servingOAuthSnapshot = candidate;
+      logCtx.servedAccountId = candidate.accountId;
+      return candidate;
+    }
     const maxSelectionAttempts = 3;
     for (let attempt = 0; attempt < maxSelectionAttempts; attempt++) {
       if (!oauthSelection) return null;
@@ -159,6 +174,7 @@ export async function prepareResponsesTransport(
         )) return null;
         oauthSelection = committed;
         servingOAuthSnapshot = candidate;
+        logCtx.servedAccountId = candidate.accountId;
         forgetGenericFailoverRoster(route.providerName);
         return candidate;
       }
@@ -177,7 +193,7 @@ export async function prepareResponsesTransport(
     const current = captureOAuthAccountSelection(route.providerName);
     const unchanged = current?.accountId === oauthSelection?.accountId
       && current?.revision === oauthSelection?.revision;
-    const candidate = unchanged ? await forceRefreshOAuthAccessSnapshot(sent) : sent;
+    const candidate = unchanged || pin ? await forceRefreshOAuthAccessSnapshot(sent) : sent;
     const admitted = await commitResolvedOAuthSelection(candidate);
     if (!admitted) throw new Error("OAuth selection changed during credential recovery");
     genericFailoverAccountId = admitted.accountId;
@@ -294,7 +310,7 @@ export async function prepareResponsesTransport(
     if (binding.kind === "api-key") return providerApiKeySelectionIsCurrent(config, route.providerName, binding.provider);
     const selected = captureOAuthAccountSelection(route.providerName);
     const row = getAccountCredentialWithStatus(route.providerName, binding.snapshot.accountId);
-    return selected?.accountId === binding.selection.accountId && selected?.revision === binding.selection.revision
+    return (pin !== undefined || selected?.accountId === binding.selection.accountId && selected?.revision === binding.selection.revision)
       && !!row && !row.needsReauth && row.credential.expires > Date.now()
       && credentialGeneration(row.credential) === binding.snapshot.generation;
   };
@@ -505,7 +521,19 @@ export async function prepareResponsesTransport(
     : null;
   if (route.provider.authMode === "oauth") {
     try {
-      if (route.providerName === "anthropic" && isAnthropicAccountPoolEnabled(config)) {
+      if (pin) {
+        const admitted = (await commitResolvedOAuthSelection(await pinnedSnapshot()))!;
+        replayOAuthCredentialSnapshot = { accountId: admitted.accountId, generation: admitted.generation };
+        if (isOAuth401ReplayProvider) sentOAuthSnapshot = admitted;
+        route.provider = { ...route.provider, apiKey: admitted.accessToken };
+        stampOAuthAccountLabel(logCtx, route.providerName, route.provider, admitted.accountId);
+        // The failover ids only let a 429 record the cooldown; the rotators return null under a pin.
+        if (route.providerName === "anthropic") {
+          anthropicPoolAccountId = admitted.accountId;
+          logCtx.provider = formatAnthropicProviderForLog("anthropic", admitted.accountId, config);
+        } else genericFailoverAccountId = admitted.accountId;
+        if (hasPassiveAccountQuota(route.providerName)) passiveQuotaWriterGeneration = captureConfigGeneration();
+      } else if (route.providerName === "anthropic" && isAnthropicAccountPoolEnabled(config)) {
         const selection = resolveAnthropicAccountForSession(anthropicSessionKey, config);
         if (!selection.accountId) {
           if (selection.reason === "all-cooled") {
@@ -528,6 +556,8 @@ export async function prepareResponsesTransport(
         replayOAuthCredentialSnapshot = { accountId: admitted.accountId, generation: admitted.generation };
         route.provider = { ...route.provider, apiKey: admitted.accessToken };
         logCtx.provider = formatAnthropicProviderForLog("anthropic", admitted.accountId, config);
+        const arHash = (v: string) => new Bun.CryptoHasher("sha256").update(v).digest("hex").slice(0, 8);
+        if (process.env.OPENCODEX_AGENTRADAR === "1") console.error("[ar-acct] a=" + arHash(admitted.accountId) + " r=" + selection.reason + " s=" + (anthropicSessionKey ? arHash(anthropicSessionKey) : "none"));
       } else {
         // Prefer the account with known headroom BEFORE the first attempt. Rotation alone
         // only reacts to a 429, so a turn could open on an account a previous probe already

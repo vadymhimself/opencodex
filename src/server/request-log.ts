@@ -152,6 +152,8 @@ export interface RequestLogContext {
   localTerminalReason?: string;
   /** Stable non-PII Codex Pool account identity for durable usage attribution. */
   accountLogLabel?: string;
+  /** Stored OAuth account id (the pin header's format) that served this turn; answered as `x-agentradar-served-account-id`. */
+  servedAccountId?: string;
   requestedModel?: string;
   /** User-facing alias selector when routing resolved one; native model remains `model`. */
   requestedAlias?: string;

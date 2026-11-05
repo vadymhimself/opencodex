@@ -11,6 +11,7 @@ import {
   requiresVisionPreprocessing,
   stripImagesInPlace,
 } from "../../vision";
+import { formatErrorResponse } from "../../bridge";
 import { shouldResolveOpenAiWebSearchSidecar } from "../../web-search";
 import { shouldResolveOpenAiPassthroughWebSearchBridge } from "../../web-search/passthrough-bridge";
 import {
@@ -64,6 +65,7 @@ export async function prepareResponsesSidecarAuth(
     && !exactAnthropicSourceReplay
     && (shouldResolveOpenAiWebSearchSidecar(config, parsed, isPassthrough)
       || shouldResolveOpenAiPassthroughWebSearchBridge(route.provider, parsed, isPassthrough));
+  if (options.agentRadarAccount && (needsOpenAiVision || needsOpenAiSearch)) return formatErrorResponse(400, "invalid_request_error", "AgentRadar pinned requests cannot use helper models (vision, image or video bridge, or web search outside a Claude pin)");
   if (needsOpenAiVision || needsOpenAiSearch) {
     try {
       const candidates = listOpenAiForwardSidecarCandidates(config);
@@ -132,6 +134,7 @@ export async function prepareResponsesSidecarAuth(
     : planVisionSidecar(config, route.provider, route.modelId, parsed, openAiSidecar, {
       admission: options.admission, codexAuthPolicy: options.codexAuthPolicy, providerName: route.providerName,
     });
+  if (options.agentRadarAccount && visionPlan) return formatErrorResponse(400, "invalid_request_error", "AgentRadar pinned requests cannot use helper models (vision, image or video bridge, or web search outside a Claude pin)");
   const recordSidecarOutcome = openAiSidecar?.recordOutcome;
   let visionMutatedRequest = false;
   if (visionPlan) {

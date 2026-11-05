@@ -168,7 +168,10 @@ export async function runAnthropicWebSearch(
   const url = `${base}/v1/messages`;
   let token: string;
   try {
-    token = await getValidAccessToken(providerName);
+    const agentRadarPin = (provider as any)[Symbol.for("agentradar.accountPin")];
+    token = agentRadarPin
+      ? (await (await import("../oauth/anthropic-routing")).getAnthropicPoolAccessSnapshot(agentRadarPin.accountId)).accessToken
+      : await getValidAccessToken(providerName);
   } catch (e) {
     return { text: "", sources: [], error: `anthropic sidecar auth failed: ${publicOAuthAuthenticationErrorMessage(e)}` };
   }

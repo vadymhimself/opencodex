@@ -38,7 +38,7 @@ import { sweepExpiredOnWrite } from "../lib/state-store-sweeper";
 import type { OcxConfig, OcxProviderConfig } from "../types";
 
 /** Cap same-request rotations so a short Retry-After cannot spin. Mirrors the Anthropic bound. */
-export const GENERIC_OAUTH_MAX_FAILOVERS_PER_REQUEST = 3;
+export const GENERIC_OAUTH_MAX_FAILOVERS_PER_REQUEST = 16;
 
 const DEFAULT_COOLDOWN_MS = 60_000;
 
@@ -367,6 +367,8 @@ export function rotateGenericOAuthAccountOn429(
   });
   sweepExpiredOnWrite(now);
 
+  // AgentRadar image patch: a pinned request records the cooldown above but never switches accounts.
+  if ((config as any)[Symbol.for("agentradar.accountPin")]) return null;
   const eligible = eligibleFailoverAccounts(providerName, now, family).filter(id => id !== failedAccountId);
   if (eligible.length === 0) return null;
   // A rotation means the roster in use just changed; do not answer the next activation question

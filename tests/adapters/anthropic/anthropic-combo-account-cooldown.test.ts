@@ -14,6 +14,7 @@ import { join } from "node:path";
 import { clearComboSelectionState } from "../../../src/combos/resolve";
 import { clearComboTargetCooldowns, isComboTargetInCooldown } from "../../../src/combos/failover";
 import {
+  ANTHROPIC_POOL_MAX_FAILOVERS_PER_REQUEST,
   clearAnthropicAccountPoolState,
   forgetAnthropicFailoverQuorum,
   getAnthropicAccountHealthSnapshot,
@@ -127,7 +128,8 @@ afterEach(async () => {
 });
 
 test("a spent pool account does not cool the combo target for the accounts that still answer", async () => {
-  const ids = await seed(5);
+  // More accounts than one request may walk, so some still answer after the first refusal.
+  const ids = await seed(ANTHROPIC_POOL_MAX_FAILOVERS_PER_REQUEST + 2);
   let refuse = true;
   const config = configFor(() => refuse ? spent() : answered());
 

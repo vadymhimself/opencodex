@@ -51,6 +51,7 @@ import {
 } from "./request-log";
 import { responseWithDeferredRequestLog } from "./relay";
 import { handleResponses } from "./responses";
+import { agentRadarAccountPin, agentRadarPinnedConfig } from "./responses/core-options";
 import { providerConsumesCallerAuthorization } from "../providers/caller-authorization";
 import { captureExplicitOpenAiCallerAuth } from "../providers/openai-sidecar";
 import { captureCallerDirectAuth } from "../providers/caller-authorization";
@@ -123,6 +124,11 @@ async function handleChatCompletionsWithBudget(
   translatorBudget: TranslatorBudget,
   logIds?: { requestId: string; start: number; turnAdmissionLease?: AdmissionLease; admission?: DataPlaneAdmission },
 ): Promise<Response> {
+  const agentRadarAccount = agentRadarAccountPin(req.headers);
+  if (agentRadarAccount === null) {
+    if (logIds) addFinalRequestLog(logIds.requestId, logIds.start, logCtx, 400, { closeReason: "non_stream" });
+    return chatCompletionsErrorResponse(400, "Invalid AgentRadar account pin", "invalid_request_error");
+  }
   let chatBody: Rec;
   try {
     const rawBody = await readChatBody(req, translatorBudget, resolveInboundBodyLimitBytes(config.maxInboundBodyBytes));
@@ -232,7 +238,7 @@ async function handleChatCompletionsWithBudget(
     /* unknown model: let handleResponses shape the 404 */
   }
 
-  if (chatNativeRoute) {
+  if (chatNativeRoute && !agentRadarAccount) {
     return handleNativeChatCompletions({
       req,
       config,
@@ -324,7 +330,7 @@ async function handleChatCompletionsWithBudget(
   }
   // Existing primary enrichment stays on non-caller-auth routes. Caller-auth routes defer
   // optional stored sidecar auth until the final helper plan actually needs it.
-  if (!callerAuthorizationRoute) {
+  if (!callerAuthorizationRoute && !agentRadarAccount) {
     // This enrichment is optional for routed/non-main providers. If native main
     // is fenced, omit it and let auth-context reject only a final physical-main
     // selection while healthy pool/provider routes continue.
@@ -379,9 +385,10 @@ async function handleChatCompletionsWithBudget(
     nativeLogged = true;
     addFinalRequestLog(logIds.requestId, logIds.start, logCtx, status, meta);
   };
-  const upstream = await handleResponses(internalReq, config, logCtx, {
+  const upstream = await handleResponses(internalReq, agentRadarAccount ? agentRadarPinnedConfig(config, agentRadarAccount) : config, logCtx, {
+    ...(agentRadarAccount ? { agentRadarAccount } : {}),
     openAiSidecarAuth,
-    allowStoredOpenAiSidecarAuth: !!(callerAuthorizationRoute && settledRoute
+    allowStoredOpenAiSidecarAuth: !agentRadarAccount && !!(callerAuthorizationRoute && settledRoute
       && !isCanonicalOpenAiForwardProvider(settledRoute.provider)),
     nativeCallerAuth,
     callerDirectAuth,
