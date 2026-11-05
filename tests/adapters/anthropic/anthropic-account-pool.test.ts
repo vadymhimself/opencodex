@@ -7,6 +7,7 @@ import {
   anthropicQuotaWindow,
   anthropicSessionKeyFromParts,
   bindAnthropicSessionAffinity,
+  clearAnthropicAccountCooldown,
   clearAnthropicAccountPoolState,
   formatAnthropicProviderForLog,
   getEligibleAnthropicAccounts,
@@ -168,7 +169,8 @@ describe("anthropic account pool", () => {
     expect((await admitAnthropic("restart-first", config)).accountId).toBe(bId);
     // Once the authoritative first selection commits, the ordinary algorithm resumes.
     expect((await admitAnthropic("restart-next", config)).accountId).toBe(aId);
-    expect(resolveAnthropicAccountForSession("restart-first", config).accountId).toBe(bId);
+    // Round-robin then pins the session to its hash seat, the one every process agrees on.
+    if (strategy === "quota") expect(resolveAnthropicAccountForSession("restart-first", config).accountId).toBe(bId);
   });
 
   test("pool-off 429 recovery commits the replacement and notifies before dispatch", async () => {
@@ -392,6 +394,41 @@ describe("anthropic account pool", () => {
     // The cooled hash seat fails over to the session's runner-up, and the bystander moves off it too.
     expect(resolveAnthropicAccountForSession("s0", config)).toEqual({ accountId: next, reason: "hash" });
     expect(resolveAnthropicAccountForSession(bystander, config).accountId).not.toBe(seat);
+  });
+
+  test("a pinned session stays through a short rate limit, moves off a spent seat, and returns on recovery", async () => {
+    await seedThreeAccounts();
+    const config = cfg(true, 80, { strategy: "round-robin" });
+    const seat = resolveAnthropicAccountForSession("s0", config).accountId!;
+    bindAnthropicSessionAffinity("s0", seat);
+
+    // Quota left (unified status allowed): the 429 goes back to the client, nothing moves or cools.
+    const shortLimit = new Headers({ "retry-after": "5", "anthropic-ratelimit-unified-status": "allowed" });
+    expect(rotateAnthropicAccountOn429(config, seat, "5", "s0", Date.now(), shortLimit)).toBeNull();
+    expect(getEligibleAnthropicAccounts()).toContain(seat);
+    expect(resolveAnthropicAccountForSession("s0", config)).toEqual({ accountId: seat, reason: "affinity" });
+
+    // Five-hour window spent: the session fails over to its hash runner-up and stays there.
+    const spent = new Headers({
+      "anthropic-ratelimit-unified-status": "rejected",
+      "anthropic-ratelimit-unified-5h-status": "rejected",
+      "anthropic-ratelimit-unified-5h-reset": String(Math.ceil(Date.now() / 1000) + 3600),
+    });
+    const next = rotateAnthropicAccountOn429(config, seat, null, "s0", Date.now(), spent)!;
+    expect(next).toBeTruthy();
+    expect(next).not.toBe(seat);
+    bindAnthropicSessionAffinity("s0", next);
+    expect(resolveAnthropicAccountForSession("s0", config)).toEqual({ accountId: next, reason: "affinity" });
+    // A fresh process does not know the seat is spent: its first 429 lands on the same runner-up.
+    clearAnthropicAccountPoolState();
+    clearPoolRotationState();
+    await admitAnthropic("", cfg(false));
+    expect(resolveAnthropicAccountForSession("s0", config).accountId).toBe(seat);
+    expect(rotateAnthropicAccountOn429(config, seat, null, "s0", Date.now(), spent)).toBe(next);
+    bindAnthropicSessionAffinity("s0", next);
+    // Recovery: this warm process returns the session to its seat, as a fresh one would.
+    clearAnthropicAccountCooldown(seat);
+    expect(resolveAnthropicAccountForSession("s0", config)).toEqual({ accountId: seat, reason: "hash" });
   });
 
   test("null/empty session key holds active under RR instead of rotating every turn", async () => {

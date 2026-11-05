@@ -12,7 +12,7 @@
  *
  * Affinity is cached per process; under round-robin an unbound keyed session takes the
  * rendezvous-hash winner of its key over the eligible accounts, so a fresh process lands it on the
- * same account; a session moved off a cooled seat stays bound to its runner-up in that process.
+ * same account, and returns to it once it recovers. A pinned session moves only off a spent account.
  * Cooldown uses Retry-After when present, else the reset time of whichever
  * rate-limit window upstream reports as rejected, else a default backoff. 401/403 credential failures should set needsReauth on the store (existing OAuth
  * path) so the account is excluded from eligibility.
@@ -617,6 +617,12 @@ export function resolveAnthropicAccountForSession(
   }
 
   const key = normalizeAffinityComponent(sessionKey);
+  const strategy = anthropicPoolStrategy(config);
+  // Round-robin's pick is arbitrary, so a keyed session always takes its hash seat, ahead of the
+  // in-process binding: warm and fresh processes agree, and a session moved off a spent seat
+  // returns to it in every process once it recovers instead of alternating between processes.
+  const hashed = strategy === "round-robin" ? sessionHashAccount(key, getEligibleAnthropicAccounts(now)) : null;
+  if (hashed) return { accountId: hashed, reason: sessionAffinity.get(key)?.accountId === hashed ? "affinity" : "hash" };
   if (key) {
     const affined = sessionAffinity.get(key);
     if (affined && now - affined.lastUsedAt <= AFFINITY_IDLE_TTL_MS) {
@@ -628,10 +634,6 @@ export function resolveAnthropicAccountForSession(
     }
   }
 
-  const strategy = anthropicPoolStrategy(config);
-  // Round-robin's pick is arbitrary, so a keyed session takes its hash seat instead: same in every process.
-  const hashed = strategy === "round-robin" ? sessionHashAccount(key, getEligibleAnthropicAccounts(now)) : null;
-  if (hashed) return { accountId: hashed, reason: "hash" };
   // No session identity (Desktop turns without a sticky key): hold the current
   // active under RR/fill-first instead of treating every turn as a new session.
   // Round-robin only when there is a real new-session key (or active is unusable).
@@ -736,6 +738,17 @@ export function rotateAnthropicAccountOn429(
   // Presence is the activation rule, the same one an apiKeyPool of two keys already uses.
   if (!isAnthropicAccountPoolEnabled(config) && !hasAnthropicFailoverQuorum(now)) return null;
 
+  // A pinned session leaves its account only when that account is spent. A 429 whose unified
+  // headers still report quota is a short rate limit: it goes back to the client, which retries
+  // here and keeps its prompt cache. Without those headers the 429 is treated as spent, as before.
+  const key = normalizeAffinityComponent(sessionKey);
+  const unified = rateLimitHeaders?.get("anthropic-ratelimit-unified-status")?.trim();
+  if (key && isAnthropicAccountPoolEnabled(config) && unified && unified !== "rejected"
+    && parseRateLimitResetMs(rateLimitHeaders, now) === undefined) {
+    console.warn(`[anthropic-pool] 429 on ${formatAnthropicAccountOrdinal(failedAccountId)} with quota left; keeping the session there`);
+    return null;
+  }
+
   // Retry-After first: it is the header written FOR this decision. The rejected window's
   // reset is the fallback, because a 429 that omits Retry-After still carries it -- and
   // without that fallback such a refusal cools for the 60s default and the exhausted
@@ -751,7 +764,6 @@ export function rotateAnthropicAccountOn429(
   });
   sweepExpiredOnWrite(now);
   // Unbind only the session that hit the 429; others on the account move on their own next call.
-  const key = normalizeAffinityComponent(sessionKey);
   sessionAffinity.delete(key);
   notePoolRotationFailure(POOL_KEY_ANTHROPIC, failedAccountId);
   // A rotation means the roster in use just changed; do not answer the next activation question
