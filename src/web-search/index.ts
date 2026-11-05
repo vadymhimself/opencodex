@@ -169,7 +169,10 @@ export function planWebSearch(
   // Shared auth state (#2188): presence only — backend PREFERENCE stays with
   // resolveSidecarBackend's explicit-or-openai contract.
   const auth = resolveSidecarAuth(config);
-  const anthropicSidecar = auth.isAnthropicAuth && auth.anthropicProviderName && auth.anthropicProvider
+  const agentRadarPin = (config as any)[Symbol.for("agentradar.accountPin")];
+  const anthropicSidecar = agentRadarPin?.provider === "claude"
+    ? (config.providers?.anthropic ? { providerName: "anthropic", provider: { ...config.providers.anthropic, [Symbol.for("agentradar.accountPin")]: agentRadarPin } } : undefined)
+    : auth.isAnthropicAuth && auth.anthropicProviderName && auth.anthropicProvider
     ? { providerName: auth.anthropicProviderName, provider: auth.anthropicProvider }
     : undefined;
   const backend = resolveSidecarBackend(cfg.backend);
