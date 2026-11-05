@@ -107,6 +107,7 @@ import {
   responseWithDeferredRequestLog,
 } from "./relay";
 import { handleResponses } from "./responses";
+import { agentRadarAccountPin, agentRadarPinnedConfig } from "./responses/core-options";
 import { comboTargetAcceptsAnthropicSource } from "./responses/anthropic-source-replay";
 import {
   isApiAuthRequired,
@@ -271,7 +272,7 @@ function wantsNativePassthrough(
 
 function shouldForwardNativeHeader(name: string, value: string, config: OcxConfig): boolean {
   const lowerName = name.toLowerCase();
-  if (PASSTHROUGH_STRIP_HEADERS.has(lowerName)) return false;
+  if (PASSTHROUGH_STRIP_HEADERS.has(lowerName) || lowerName.startsWith("x-agentradar-")) return false;
   if (lowerName !== "authorization" && lowerName !== "x-api-key") return true;
   const token = singleCredentialToken(lowerName, value);
   return !!token && !isProxyAdmissionSecret(token, config);
@@ -846,6 +847,11 @@ async function handleClaudeMessagesWithBudget(
   ingress: ClaudeIngressOptions = {},
 ): Promise<Response> {
   logCtx.surface = "claude";
+  const agentRadarAccount = agentRadarAccountPin(req.headers);
+  if (agentRadarAccount === null) {
+    if (logIds) addFinalRequestLog(logIds.requestId, logIds.start, logCtx, 400, { closeReason: "non_stream" });
+    return anthropicErrorResponse(400, "Invalid AgentRadar account pin", "invalid_request_error");
+  }
   const disabled = claudeInboundDisabled(config);
   if (disabled) {
     if (logIds) addFinalRequestLog(logIds.requestId, logIds.start, logCtx, 403, { closeReason: "non_stream" });
@@ -930,7 +936,7 @@ async function handleClaudeMessagesWithBudget(
     // caller's body with the caller's credential and never runs the Anthropic adapter, so the
     // proxy-owned `speed` + beta (anthropic-speed wire) and its usage.speed observation would be
     // silently skipped. Translation reaches the adapter, which owns both.
-    if (!effortRow && !fastRow && isRec(anthropicBody) && wantsNativePassthrough(req, config, requestPolicy, anthropicBody.model, cc)) {
+    if (!agentRadarAccount && !effortRow && !fastRow && isRec(anthropicBody) && wantsNativePassthrough(req, config, requestPolicy, anthropicBody.model, cc)) {
       return await anthropicNativePassthrough(req, config, logCtx, logIds, anthropicBody, "/v1/messages");
     }
     // Capture source semantics before effort rewriting or translation drops fields.
@@ -1132,7 +1138,7 @@ async function handleClaudeMessagesWithBudget(
   // native replays have no caller ChatGPT credential. This enrichment is optional:
   // auth-context later rejects a real physical-main selection, while routed/pool
   // traffic continues without reading native credentials during a fence/recovery.
-  if (tryClaimNativeMainProfileForTurn(logIds?.turnAdmissionLease)) {
+  if (!agentRadarAccount && tryClaimNativeMainProfileForTurn(logIds?.turnAdmissionLease)) {
     const { getMainAccountToken } = await import("../codex/main-account");
     const token = getMainAccountToken();
     if (token) {
@@ -1194,7 +1200,10 @@ async function handleClaudeMessagesWithBudget(
     nativeLogged = true;
     addFinalRequestLog(logIds.requestId, logIds.start, logCtx, status, meta);
   };
-  const upstream = await handleResponses(internalReq, buildClaudeReplayConfig(config), logCtx, {
+  const upstream = await handleResponses(internalReq, agentRadarAccount
+    ? agentRadarPinnedConfig(buildClaudeReplayConfig(config), agentRadarAccount)
+    : buildClaudeReplayConfig(config), logCtx, {
+    ...(agentRadarAccount ? { agentRadarAccount } : {}),
     // Routing keeps Claude-only sidecar overrides; admission policy must follow the live owner.
     codexAuthPolicy: config,
     ...(logIds?.admission ? { admission: logIds.admission } : {}),
