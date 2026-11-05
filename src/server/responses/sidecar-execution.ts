@@ -161,6 +161,8 @@ export async function executeResponsesSidecars(
     : undefined;
   const imgPlan = canPlanSidecars ? await planImageBridge(config, parsed, route.provider) : undefined;
   const vidPlan = canPlanSidecars ? await planVideoBridge(config, parsed, route.provider) : undefined;
+  if (options.agentRadarAccount && ((wsPlan && !(options.agentRadarAccount.provider === "claude" && wsPlan.backend === "anthropic"))
+    || imgPlan || vidPlan)) return formatErrorResponse(400, "invalid_request_error", "AgentRadar pinned requests cannot use helper models (vision, image or video bridge, or web search outside a Claude pin)");
   const canRunWebSearch = !!wsPlan && !transportState.adapter.runTurn;
   const rotateSidecarProviderOn429 = async (
     retryAfter: string | null,
