@@ -348,14 +348,14 @@ export function anthropicRequestCorrelationKey(raw: unknown): string | undefined
  * is keyed whole, as before.
  */
 function claudeSessionOf(userId: string): string {
+  let parsed: unknown;
   try {
-    const parsed: unknown = JSON.parse(userId);
-    if (isRec(parsed)) {
-      const id = parsed.parent_session_id ?? parsed.session_id;
-      if (typeof id === "string" && id) return id;
-    }
-  } catch { /* not JSON */ }
-  return userId;
+    parsed = JSON.parse(userId);
+  } catch {
+    return userId; // not a JSON blob: key the whole string
+  }
+  const id = isRec(parsed) ? parsed.parent_session_id ?? parsed.session_id : undefined;
+  return typeof id === "string" && id ? id : userId;
 }
 
 /** Provenance of the generated prompt_cache_key (never serialized into the wire body). */

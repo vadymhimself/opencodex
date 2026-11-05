@@ -99,9 +99,10 @@ globalThis.fetch = ((input: any, init?: any) => {
   });
   const ocx = { proc, home, admin, base: `http://127.0.0.1:${port}`, log: "" };
   (async () => { for await (const chunk of proc.stderr) ocx.log += new TextDecoder().decode(chunk); })();
+  let lastError: unknown;
   for (let i = 0; ; i++) {
-    try { if ((await fetch(`${ocx.base}/healthz`)).status < 500) break; } catch {}
-    if (i > 300) throw new Error(`OCX did not start: ${ocx.log}`);
+    try { if ((await fetch(`${ocx.base}/healthz`)).status < 500) break; } catch (error) { lastError = error; }
+    if (i > 300) throw new Error(`OCX did not start (${String(lastError)}): ${ocx.log}`);
     await Bun.sleep(100);
   }
   return ocx;
