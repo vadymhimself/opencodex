@@ -3,6 +3,7 @@ import {
   MAX_DECOMPRESSED_BODY_BYTES,
   resolveInboundBodyLimitBytes,
 } from "./request-decompress";
+import { withAgentRadarServedAccount } from "./responses/core-options";
 import { withCors, type RequestPolicyView } from "./auth-cors";
 import { codexCompatibleUrl } from "../codex/context-compat";
 import { addFinalRequestLog, markLocalRequestLogRefusal } from "./request-log";
@@ -174,7 +175,8 @@ export function runAdmittedBodyWork(
   work: () => Promise<Response>,
   refusalLog?: WorkflowRefusalLog,
 ): Promise<Response> {
-  return withRaisedInboundBodyAdmission(req, codexCompatibleUrl(req.url).pathname, configuredLimit, work, refused => {
+  const served = async () => withAgentRadarServedAccount(await work(), refusalLog?.logCtx.servedAccountId);
+  return withRaisedInboundBodyAdmission(req, codexCompatibleUrl(req.url).pathname, configuredLimit, served, refused => {
     if (refusalLog) {
       markLocalRequestLogRefusal(refusalLog.logCtx, "server_busy");
       refusalLog.logCtx.errorCode = "server_busy";

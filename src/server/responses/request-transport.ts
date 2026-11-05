@@ -557,7 +557,7 @@ export async function prepareResponsesTransport(
         route.provider = { ...route.provider, apiKey: admitted.accessToken };
         logCtx.provider = formatAnthropicProviderForLog("anthropic", admitted.accountId, config);
         const arHash = (v: string) => new Bun.CryptoHasher("sha256").update(v).digest("hex").slice(0, 8);
-        console.error("[ar-acct] a=" + arHash(admitted.accountId) + " r=" + selection.reason + " s=" + (anthropicSessionKey ? arHash(anthropicSessionKey) : "none"));
+        if (process.env.OPENCODEX_AGENTRADAR === "1") console.error("[ar-acct] a=" + arHash(admitted.accountId) + " r=" + selection.reason + " s=" + (anthropicSessionKey ? arHash(anthropicSessionKey) : "none"));
       } else {
         // Prefer the account with known headroom BEFORE the first attempt. Rotation alone
         // only reacts to a 429, so a turn could open on an account a previous probe already

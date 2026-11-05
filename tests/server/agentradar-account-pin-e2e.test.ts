@@ -7,6 +7,7 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
+import { agentRadarAccountPin } from "../../src/server/responses/core-options";
 
 const CLI = join(import.meta.dir, "../../src/cli/index.ts");
 const sha = (v: string) => createHash("sha256").update(v).digest("hex");
@@ -95,7 +96,7 @@ globalThis.fetch = ((input: any, init?: any) => {
 `);
   const admin = `ocx_admin_${crypto.randomUUID()}${crypto.randomUUID()}`;
   const proc = Bun.spawn(["bun", "--preload", `${home}/fake-net.ts`, CLI, "start", "--port", String(port)], {
-    env: { ...process.env, OPENCODEX_HOME: home, HOME: home, OPENCODEX_ADMIN_AUTH_TOKEN: admin }, stdout: "ignore", stderr: "pipe",
+    env: { ...process.env, OPENCODEX_HOME: home, HOME: home, OPENCODEX_ADMIN_AUTH_TOKEN: admin, OPENCODEX_AGENTRADAR: "1" }, stdout: "ignore", stderr: "pipe",
   });
   const ocx = { proc, home, admin, base: `http://127.0.0.1:${port}`, log: "" };
   (async () => { for await (const chunk of proc.stderr) ocx.log += new TextDecoder().decode(chunk); })();
@@ -128,6 +129,20 @@ const accounts = async (ocx: Ocx, provider: string) => (await fetch(`${ocx.base}
 afterAll(() => {
   fake.stop(true);
   for (const home of homes) removeTreeWithRetry(home);
+});
+
+test("outside an AgentRadar gateway a pin is refused, never served unpinned", () => {
+  const prior = process.env.OPENCODEX_AGENTRADAR;
+  const headers = new Headers({ "x-agentradar-account-provider": "claude", "x-agentradar-account-id": "A" });
+  try {
+    delete process.env.OPENCODEX_AGENTRADAR;
+    expect(agentRadarAccountPin(headers)).toBeNull();
+    expect(agentRadarAccountPin(new Headers())).toBeUndefined();
+    process.env.OPENCODEX_AGENTRADAR = "1";
+    expect(agentRadarAccountPin(headers)).toEqual({ provider: "claude", accountId: "A" });
+  } finally {
+    if (prior === undefined) delete process.env.OPENCODEX_AGENTRADAR; else process.env.OPENCODEX_AGENTRADAR = prior;
+  }
 });
 
 test("an AgentRadar account pin serves exactly its own stored account (pin.check)", async () => {
