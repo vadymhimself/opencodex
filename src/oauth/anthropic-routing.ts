@@ -12,7 +12,8 @@
  *
  * Affinity is cached per process; under round-robin an unbound keyed session takes the
  * rendezvous-hash winner of its key over the eligible accounts, so a fresh process lands it on the
- * same account. Cooldown uses Retry-After when present, else the reset time of whichever
+ * same account; a session moved off a cooled seat stays bound to its runner-up in that process.
+ * Cooldown uses Retry-After when present, else the reset time of whichever
  * rate-limit window upstream reports as rejected, else a default backoff. 401/403 credential failures should set needsReauth on the store (existing OAuth
  * path) so the account is excluded from eligibility.
  */
@@ -489,6 +490,7 @@ function pruneExpiredAffinity(now: number): void {
 export type AnthropicAccountSelectionReason =
   | "pool-disabled"
   | "affinity"
+  | "hash"
   | "active"
   | "lowest-usage"
   | "only-eligible"
@@ -629,7 +631,7 @@ export function resolveAnthropicAccountForSession(
   const strategy = anthropicPoolStrategy(config);
   // Round-robin's pick is arbitrary, so a keyed session takes its hash seat instead: same in every process.
   const hashed = strategy === "round-robin" ? sessionHashAccount(key, getEligibleAnthropicAccounts(now)) : null;
-  if (hashed) return { accountId: hashed, reason: "affinity" };
+  if (hashed) return { accountId: hashed, reason: "hash" };
   // No session identity (Desktop turns without a sticky key): hold the current
   // active under RR/fill-first instead of treating every turn as a new session.
   // Round-robin only when there is a real new-session key (or active is unusable).
@@ -811,7 +813,7 @@ export function commitAnthropicSelectionRouting(
   const current = captureOAuthAccountSelection(PROVIDER);
   if (current?.accountId !== committed.accountId || current.revision !== committed.revision) return false;
   if (isAnthropicAccountPoolEnabled(options.config)) {
-    if (anthropicPoolStrategy(options.config) === "round-robin" && options.reason !== "affinity") {
+    if (anthropicPoolStrategy(options.config) === "round-robin" && options.reason !== "affinity" && options.reason !== "hash") {
       const limit = stickyLimitForPool(options.config);
       const picked = pickRoundRobinAccount(POOL_KEY_ANTHROPIC, getEligibleAnthropicAccounts(), limit);
       if (picked !== accountId) seedPoolRotationAccount(POOL_KEY_ANTHROPIC, accountId);

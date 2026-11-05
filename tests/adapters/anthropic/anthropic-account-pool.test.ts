@@ -390,7 +390,7 @@ describe("anthropic account pool", () => {
     expect(next).toBeTruthy();
     expect(next).not.toBe(seat);
     // The cooled hash seat fails over to the session's runner-up, and the bystander moves off it too.
-    expect(resolveAnthropicAccountForSession("s0", config)).toEqual({ accountId: next, reason: "affinity" });
+    expect(resolveAnthropicAccountForSession("s0", config)).toEqual({ accountId: next, reason: "hash" });
     expect(resolveAnthropicAccountForSession(bystander, config).accountId).not.toBe(seat);
   });
 
