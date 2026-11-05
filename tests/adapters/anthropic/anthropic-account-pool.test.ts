@@ -368,19 +368,30 @@ describe("anthropic account pool", () => {
     expect(label).not.toContain("deadbeef");
   });
 
-  test("round-robin strategy rotates unbound new sessions", async () => {
-    const { aId, bId, cId } = await seedThreeAccounts();
-    setCachedProviderAccountQuotaForTests("anthropic", aId, { fiveHourPercent: 10 });
-    setCachedProviderAccountQuotaForTests("anthropic", bId, { fiveHourPercent: 10 });
-    setCachedProviderAccountQuotaForTests("anthropic", cId, { fiveHourPercent: 10 });
+  test("round-robin keyed sessions take a stable hash seat; a 429 unbinds only the hitting session", async () => {
+    await seedThreeAccounts();
     const config = cfg(true, 80, { strategy: "round-robin" });
+    const seats = () => Array.from({ length: 60 }, (_, i) => resolveAnthropicAccountForSession(`s${i}`, config).accountId);
 
-    const picks = [
-      (await admitAnthropic("sess-1", config)).accountId,
-      (await admitAnthropic("sess-2", config)).accountId,
-      (await admitAnthropic("sess-3", config)).accountId,
-    ];
-    expect(new Set(picks).size).toBe(3);
+    const first = seats();
+    expect(new Set(first).size).toBe(3);
+    // A fresh process: empty affinity, cooldowns and round-robin ring (its stored selection admitted first).
+    clearAnthropicAccountPoolState();
+    clearPoolRotationState();
+    await admitAnthropic("", cfg(false));
+    expect(seats()).toEqual(first);
+
+    const seat = first[0]!;
+    const bystander = `s${first.indexOf(seat, 1)}`;
+    bindAnthropicSessionAffinity("s0", seat);
+    bindAnthropicSessionAffinity(bystander, seat);
+    const next = rotateAnthropicAccountOn429(config, seat, "60", "s0");
+    expect(anthropicSessionAffinitySizeForTests()).toBe(1);
+    expect(next).toBeTruthy();
+    expect(next).not.toBe(seat);
+    // The cooled hash seat fails over to the session's runner-up, and the bystander moves off it too.
+    expect(resolveAnthropicAccountForSession("s0", config)).toEqual({ accountId: next, reason: "affinity" });
+    expect(resolveAnthropicAccountForSession(bystander, config).accountId).not.toBe(seat);
   });
 
   test("null/empty session key holds active under RR instead of rotating every turn", async () => {
@@ -449,50 +460,6 @@ describe("anthropic account pool", () => {
     expect(resolveAnthropicAccountForSession(null, config).reason).toBe("active");
   });
 
-  test("stickyLimit holds across successive unbound resolves", async () => {
-    const { aId, bId, cId } = await seedThreeAccounts();
-    setCachedProviderAccountQuotaForTests("anthropic", aId, { fiveHourPercent: 10 });
-    setCachedProviderAccountQuotaForTests("anthropic", bId, { fiveHourPercent: 10 });
-    setCachedProviderAccountQuotaForTests("anthropic", cId, { fiveHourPercent: 10 });
-    const config = cfg(true, 80, { strategy: "round-robin", stickyLimit: 3 });
-
-    const first = (await admitAnthropic("s1", config)).accountId;
-    expect(first).toBeTruthy();
-    expect((await admitAnthropic("s2", config)).accountId).toBe(first);
-    expect((await admitAnthropic("s3", config)).accountId).toBe(first);
-    const fourth = (await admitAnthropic("s4", config)).accountId;
-    expect(fourth).not.toBe(first);
-  });
-
-  test("429 / notePoolRotationFailure advances past sticky while account stays eligible", async () => {
-    const { aId, bId, cId } = await seedThreeAccounts();
-    setCachedProviderAccountQuotaForTests("anthropic", aId, { fiveHourPercent: 10 });
-    setCachedProviderAccountQuotaForTests("anthropic", bId, { fiveHourPercent: 10 });
-    setCachedProviderAccountQuotaForTests("anthropic", cId, { fiveHourPercent: 10 });
-    const config = cfg(true, 80, { strategy: "round-robin", stickyLimit: 10 });
-
-    const sticky = (await admitAnthropic("sticky-1", config)).accountId!;
-    expect(resolveAnthropicAccountForSession("sticky-2", config).accountId).toBe(sticky);
-
-    notePoolRotationFailure(POOL_KEY_ANTHROPIC, sticky);
-    const afterClear = (await admitAnthropic("sticky-3", config)).accountId;
-    expect(afterClear).toBeTruthy();
-    expect(afterClear).not.toBe(sticky);
-
-    // Re-establish sticky, then 429-cool the sticky account — failover + ring must leave it.
-    clearPoolRotationState();
-    const again = (await admitAnthropic("again-1", config)).accountId!;
-    expect(resolveAnthropicAccountForSession("again-2", config).accountId).toBe(again);
-    const failover = rotateAnthropicAccountOn429(config, again, "30");
-    expect(failover).toBeTruthy();
-    expect(failover).not.toBe(again);
-    // After cooldown the failed account is unusable; null key holds active only when eligible.
-    await setActiveAccount("anthropic", failover!);
-    const unboundAfter429 = resolveAnthropicAccountForSession("again-3", config).accountId;
-    expect(unboundAfter429).not.toBe(again);
-    expect([bId, cId, aId].filter(id => id !== again)).toContain(unboundAfter429);
-  });
-
   test("fill-first skips drained successors when advancing past threshold", async () => {
     const { aId, bId, cId } = await seedThreeAccounts();
     const ordered = [aId, bId, cId].sort((a, b) => a.localeCompare(b));
@@ -532,7 +499,7 @@ describe("anthropic account pool", () => {
 
     const before = getAccountSet("anthropic")!.activeAccountId;
     const picks = Array.from({ length: 3 }, (_, i) => resolveAnthropicAccountForSession(`promo-${i}`, config));
-    expect(new Set(picks.map(p => p.accountId)).size).toBe(1);
+    expect(picks.every(p => p.accountId)).toBe(true);
     expect(getAccountSet("anthropic")!.activeAccountId).toBe(before);
   });
 
