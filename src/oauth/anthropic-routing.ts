@@ -10,9 +10,11 @@
  * Intentionally narrower than the Codex pool: no mid-session quota rotation,
  * soft-avoid ladders, or probe leases. Anthropic OAuth is ToS-sensitive.
  *
- * Affinity is process-local (lost on restart). Cooldown uses Retry-After when present, else
- * the reset time of whichever rate-limit window upstream reports as rejected, else a default
- * backoff. 401/403 credential failures should set needsReauth on the store (existing OAuth
+ * Affinity is cached per process; under round-robin an unbound keyed session takes the
+ * rendezvous-hash winner of its key over the eligible accounts, so a fresh process lands it on the
+ * same account; a session moved off a cooled seat stays bound to its runner-up in that process.
+ * Cooldown uses Retry-After when present, else the reset time of whichever
+ * rate-limit window upstream reports as rejected, else a default backoff. 401/403 credential failures should set needsReauth on the store (existing OAuth
  * path) so the account is excluded from eligibility.
  */
 import { createHash } from "node:crypto";
@@ -449,6 +451,16 @@ function pickNextFillFirstAnthropicAccount(
   return fallback ?? ordered[0] ?? null;
 }
 
+/** Rendezvous hash: highest sha256(key \0 account) wins, so every process maps a session alike. */
+function sessionHashAccount(key: string, eligible: string[]): string | null {
+  let best: string | null = null, top = "";
+  for (const id of key ? eligible : []) {
+    const h = createHash("sha256").update(`${key}\0${id}`).digest("hex");
+    if (h > top) { top = h; best = id; }
+  }
+  return best;
+}
+
 function pickAlternateAnthropicAccount(
   config: OcxConfig,
   excludeId: string,
@@ -478,6 +490,7 @@ function pruneExpiredAffinity(now: number): void {
 export type AnthropicAccountSelectionReason =
   | "pool-disabled"
   | "affinity"
+  | "hash"
   | "active"
   | "lowest-usage"
   | "only-eligible"
@@ -616,6 +629,9 @@ export function resolveAnthropicAccountForSession(
   }
 
   const strategy = anthropicPoolStrategy(config);
+  // Round-robin's pick is arbitrary, so a keyed session takes its hash seat instead: same in every process.
+  const hashed = strategy === "round-robin" ? sessionHashAccount(key, getEligibleAnthropicAccounts(now)) : null;
+  if (hashed) return { accountId: hashed, reason: "hash" };
   // No session identity (Desktop turns without a sticky key): hold the current
   // active under RR/fill-first instead of treating every turn as a new session.
   // Round-robin only when there is a real new-session key (or active is unusable).
@@ -700,7 +716,7 @@ export function clearAnthropicSessionAffinityForAccount(accountId: string): void
 }
 
 /**
- * Record a 429 for `failedAccountId`, cool it, clear its affinity, and pick a failover
+ * Record a 429 for `failedAccountId`, cool it, unbind the hitting session, and pick a failover
  * account. Does NOT promote the store active account — caller should promote only after a
  * successful retry (or token resolve).
  */
@@ -734,7 +750,9 @@ export function rotateAnthropicAccountOn429(
       : resetDerived !== undefined ? "reset-derived" : "default",
   });
   sweepExpiredOnWrite(now);
-  clearAnthropicSessionAffinityForAccount(failedAccountId);
+  // Unbind only the session that hit the 429; others on the account move on their own next call.
+  const key = normalizeAffinityComponent(sessionKey);
+  sessionAffinity.delete(key);
   notePoolRotationFailure(POOL_KEY_ANTHROPIC, failedAccountId);
   // A rotation means the roster in use just changed; do not answer the next activation question
   // from a count read taken before the failure.
@@ -744,8 +762,11 @@ export function rotateAnthropicAccountOn429(
   // presence-only recovery must not silently reactivate round-robin/fill-first merely
   // because those dormant values remain in config. The quota picker is the neutral
   // recovery policy already used by the default strategy.
+  const hashRunnerUp = isAnthropicAccountPoolEnabled(config) && anthropicPoolStrategy(config) === "round-robin"
+    ? sessionHashAccount(key, getEligibleAnthropicAccounts(now).filter(id => id !== failedAccountId))
+    : null;
   const next = isAnthropicAccountPoolEnabled(config)
-    ? pickAlternateAnthropicAccount(config, failedAccountId, now)
+    ? hashRunnerUp ?? pickAlternateAnthropicAccount(config, failedAccountId, now)
     : pickLowestUsage(config, failedAccountId, now);
   if (!next) {
     console.warn("[anthropic-pool] all eligible Anthropic OAuth accounts are in cooldown; returning 429");
@@ -792,7 +813,7 @@ export function commitAnthropicSelectionRouting(
   const current = captureOAuthAccountSelection(PROVIDER);
   if (current?.accountId !== committed.accountId || current.revision !== committed.revision) return false;
   if (isAnthropicAccountPoolEnabled(options.config)) {
-    if (anthropicPoolStrategy(options.config) === "round-robin" && options.reason !== "affinity") {
+    if (anthropicPoolStrategy(options.config) === "round-robin" && options.reason !== "affinity" && options.reason !== "hash") {
       const limit = stickyLimitForPool(options.config);
       const picked = pickRoundRobinAccount(POOL_KEY_ANTHROPIC, getEligibleAnthropicAccounts(), limit);
       if (picked !== accountId) seedPoolRotationAccount(POOL_KEY_ANTHROPIC, accountId);
