@@ -38,7 +38,7 @@ import { sweepExpiredOnWrite } from "../lib/state-store-sweeper";
 import type { OcxConfig, OcxProviderConfig } from "../types";
 
 /** Cap same-request rotations so a short Retry-After cannot spin. Mirrors the Anthropic bound. */
-export const GENERIC_OAUTH_MAX_FAILOVERS_PER_REQUEST = 3;
+export const GENERIC_OAUTH_MAX_FAILOVERS_PER_REQUEST = 16;
 
 const DEFAULT_COOLDOWN_MS = 60_000;
 

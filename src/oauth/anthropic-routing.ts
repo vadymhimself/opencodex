@@ -55,7 +55,7 @@ const DEFAULT_AUTO_SWITCH_THRESHOLD = 80;
 const DEFAULT_QUOTA_WINDOW: OcxAccountPoolQuotaWindow = "five-hour";
 const VALID_QUOTA_WINDOWS = new Set<OcxAccountPoolQuotaWindow>(["five-hour", "weekly", "max-utilization"]);
 /** Cap same-request 429 rotations so short Retry-After cannot infinite-loop. */
-export const ANTHROPIC_POOL_MAX_FAILOVERS_PER_REQUEST = 3;
+export const ANTHROPIC_POOL_MAX_FAILOVERS_PER_REQUEST = 16;
 
 export interface AnthropicAccountPoolConfig {
   enabled?: boolean;
