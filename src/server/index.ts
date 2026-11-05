@@ -525,13 +525,7 @@ function startServerWithSpendLedgerOwner(port: number | undefined, deps: StartSe
     if (!lease.isTransferred()) {
       lease.release();
     }
-    // Names the stored account that served the turn (an opaque pool id, never an email or token)
-    // so the caller can attribute its cost. Absent when no account was admitted.
-    const served = refusalLog?.logCtx.servedAccountId;
-    if (!served) return response;
-    const headers = new Headers(response.headers);
-    headers.set("x-agentradar-served-account-id", served);
-    return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+    return response;
   }
 
   // Readiness gate: one PRIVATE controller per startServer invocation, captured

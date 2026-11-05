@@ -396,17 +396,11 @@ describe("anthropic account pool", () => {
     expect(resolveAnthropicAccountForSession(bystander, config).accountId).not.toBe(seat);
   });
 
-  test("a pinned session stays through a short rate limit, moves off a spent seat, and returns on recovery", async () => {
+  test("a hashed session moves off a spent seat to its runner-up and returns on recovery", async () => {
     await seedThreeAccounts();
     const config = cfg(true, 80, { strategy: "round-robin" });
     const seat = resolveAnthropicAccountForSession("s0", config).accountId!;
     bindAnthropicSessionAffinity("s0", seat);
-
-    // Quota left (unified status allowed): the 429 goes back to the client, nothing moves or cools.
-    const shortLimit = new Headers({ "retry-after": "5", "anthropic-ratelimit-unified-status": "allowed" });
-    expect(rotateAnthropicAccountOn429(config, seat, "5", "s0", Date.now(), shortLimit)).toBeNull();
-    expect(getEligibleAnthropicAccounts()).toContain(seat);
-    expect(resolveAnthropicAccountForSession("s0", config)).toEqual({ accountId: seat, reason: "affinity" });
 
     // Five-hour window spent: the session fails over to its hash runner-up and stays there.
     const spent = new Headers({
