@@ -462,6 +462,18 @@ export async function prepareResponsesRequest(
     // the key's scope at this one point is what stops a rewrite from reaching
     // a destination the front door would have refused.
     assertRouteAllowedByScope(admissionScope, inboundSelector, candidate);
+    // AgentRadar image patch: a pinned request may only reach its own provider's stored account.
+    const pin = options.agentRadarAccount;
+    if (pin) {
+      const served = !candidate.combo && (pin.provider === "codex"
+        ? candidate.providerName === OPENAI_CODEX_PROVIDER_ID && candidate.codexAccountMode !== undefined
+        : candidate.provider.authMode === "oauth"
+          && candidate.providerName === (pin.provider === "claude" ? "anthropic" : pin.provider === "grok" ? "xai" : "kimi"));
+      if (!served) throw new Error("AgentRadar pinned account cannot serve this route");
+      if (pin.provider === "codex") {
+        Object.assign(candidate, { codexAccountMode: "pool", codexAccountId: pin.accountId, codexAccountNamespace: undefined });
+      }
+    }
     candidate.staticPolicy = captureRouteStaticPolicy(
       candidate.providerName,
       candidate.modelId,
