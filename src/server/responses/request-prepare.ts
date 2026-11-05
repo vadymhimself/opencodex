@@ -1237,6 +1237,7 @@ export async function prepareResponsesRequest(
     ? `${route.providerName}-${route.codexAccountNamespace}`
     : formatCodexProviderForLog(route.providerName, codexLogAccountId(admissionState.authCtx), config);
   logCtx.accountLogLabel = codexAuthContextLogLabel(admissionState.authCtx, config);
+  logCtx.servedAccountId = admissionState.authCtx.kind === "pool" ? admissionState.authCtx.accountId : undefined;
   // A move is the expensive event: it discards the prefix warmed on the previous account. Record
   // it as an event with its cause, so the operator reads it off one line instead of inferring it
   // from account labels across many (#4546).

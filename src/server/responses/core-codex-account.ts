@@ -791,6 +791,7 @@ export async function retryCodexPoolOnAlternateAccount(
     config,
   );
   logCtx.accountLogLabel = codexAuthContextLogLabel(retryAuthCtx, config);
+  logCtx.servedAccountId = retryAuthCtx.kind === "pool" ? retryAuthCtx.accountId : undefined;
   sealRequestAttemptIdentity(
     logCtx.activeAttempt,
     logCtx.provider,

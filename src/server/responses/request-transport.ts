@@ -145,6 +145,7 @@ export async function prepareResponsesTransport(
       if (!row || row.needsReauth || row.credential.expires <= Date.now()
         || credentialGeneration(row.credential) !== candidate.generation) candidate = await pinnedSnapshot();
       servingOAuthSnapshot = candidate;
+      logCtx.servedAccountId = candidate.accountId;
       return candidate;
     }
     const maxSelectionAttempts = 3;
@@ -173,6 +174,7 @@ export async function prepareResponsesTransport(
         )) return null;
         oauthSelection = committed;
         servingOAuthSnapshot = candidate;
+        logCtx.servedAccountId = candidate.accountId;
         forgetGenericFailoverRoster(route.providerName);
         return candidate;
       }
