@@ -962,8 +962,8 @@ function unwrapKimiQuotaPayload(value: unknown): Record<string, unknown> | null 
   // A null/non-usable outer field is a placeholder, not data — an envelope like
   // { usage: null, data: { usage: {...} } } must still unwrap to the nested payload.
   const usable = (field: unknown): boolean => field !== undefined && field !== null;
-  const outerHasUsage = usable(body.usage) || usable(body.limits) || usable(body.totalQuota);
-  const nestedHasUsage = usable(nested.usage) || usable(nested.limits) || usable(nested.totalQuota);
+  const outerHasUsage = usable(body.usage) || usable(body.usages) || usable(body.limits) || usable(body.totalQuota);
+  const nestedHasUsage = usable(nested.usage) || usable(nested.usages) || usable(nested.limits) || usable(nested.totalQuota);
   return !outerHasUsage && nestedHasUsage ? nested : body;
 }
 
@@ -1009,13 +1009,29 @@ function isKimiWeeklyLimit(item: Record<string, unknown>, detail: Record<string,
   return /weekly|7\s*(?:d|day)/.test(kimiLimitLabel(item, detail));
 }
 
+/**
+ * Kimi Code's own client reads `usages.{limit_5h,limit_7d,limit_month_total}`, each `{used_ratio, reset_time}` with the
+ * ratio 0..1 (MoonshotAI/kimi-code packages/oauth/src/managed-usage.ts). Plans that return it may still carry the legacy
+ * `limits[]` block as an unused placeholder (limit 100, remaining 100 = 0%), so when `usages` exists only it is read.
+ */
+function parseKimiUsageRatio(value: unknown): { percent: number; resetAt?: number } | null {
+  const row = asRecord(value);
+  const ratio = toFiniteNumber(row?.used_ratio);
+  if (!row || ratio === undefined) return null;
+  const resetAt = quotaResetAt(row);
+  return { percent: normalizePercent(Math.round(ratio * 10_000) / 100)!, ...(resetAt !== undefined ? { resetAt } : {}) };
+}
+
 function parseKimiQuotaPayload(value: unknown): ProviderQuota | null {
   const body = unwrapKimiQuotaPayload(value);
   if (!body) return null;
-  let weekly = parseKimiQuotaRow(body.usage);
-  const total = parseKimiQuotaRow(body.totalQuota);
-  let fiveHour: { percent: number; resetAt?: number } | null = null;
-  if (Array.isArray(body.limits)) {
+  const usages = asRecord(body.usages);
+  const monthly = parseKimiUsageRatio(usages?.limit_month_total);
+  // With `usages` present the legacy blocks are not read at all: they can be placeholders (see above).
+  let weekly = usages ? parseKimiUsageRatio(usages.limit_7d) : parseKimiQuotaRow(body.usage);
+  const total = usages ? null : parseKimiQuotaRow(body.totalQuota);
+  let fiveHour: { percent: number; resetAt?: number } | null = parseKimiUsageRatio(usages?.limit_5h);
+  if (!usages && Array.isArray(body.limits)) {
     for (const rawItem of body.limits) {
       const item = asRecord(rawItem);
       if (!item) continue;
@@ -1038,6 +1054,10 @@ function parseKimiQuotaPayload(value: unknown): ProviderQuota | null {
     ...(weekly ? {
       weeklyPercent: weekly.percent,
       ...(weekly.resetAt !== undefined ? { weeklyResetAt: weekly.resetAt } : {}),
+    } : {}),
+    ...(monthly ? {
+      monthlyPercent: monthly.percent,
+      ...(monthly.resetAt !== undefined ? { monthlyResetAt: monthly.resetAt } : {}),
     } : {}),
     ...(total ? { customWindows: [{ label: "Total subscription credits", percent: total.percent, ...(total.resetAt !== undefined ? { resetAt: total.resetAt } : {}) }] } : {}),
     updatedAt: Date.now(),
