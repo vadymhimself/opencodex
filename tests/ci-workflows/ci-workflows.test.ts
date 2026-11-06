@@ -3875,6 +3875,34 @@ describe("GitHub Actions hardening", () => {
       expect(result.warnings.some((w) => w.startsWith("setFailed:"))).toBe(true);
     });
 
+    test("a fork release-line base is allowed", async () => {
+      const result = await run({
+        pr: { base: { ref: "release/2.65.0-vadymhimself.16" }, title: "Release fix", draft: false },
+        authorPermission: "write",
+      });
+
+      expect(methodsOf(result)).toEqual(readsAllowedBase());
+      expect(callsTo(result, "pulls.update")).toEqual([]);
+      expect(result.warnings.some((w) => w.startsWith("setFailed:"))).toBe(false);
+    });
+
+    test("a base that only starts with the word release is still wrong-base", async () => {
+      const result = await run({
+        pr: { base: { ref: "releasefoo" }, title: "Not a release", draft: false },
+        authorPermission: "write",
+      });
+
+      expect(methodsOf(result)).toEqual(readsWrongBase([
+        "pulls.update",
+        "issues.createComment",
+        "graphql",
+      ]));
+      expect(callsTo(result, "pulls.update")).toEqual([
+        { owner: "lidge-jun", repo: "opencodex", pull_number: 42, title: "[WRONG BRANCH] Not a release" },
+      ]);
+      expect(result.warnings.some((w) => w.startsWith("setFailed:"))).toBe(true);
+    });
+
     test("a non-dev base with no open parent PR is still wrong-base", async () => {
       const result = await run({
         pr: { base: { ref: "feature/orphan" }, title: "Orphan stack", draft: false },

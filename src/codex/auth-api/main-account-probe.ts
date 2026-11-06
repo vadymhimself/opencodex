@@ -245,9 +245,12 @@ export async function fetchMainAccountInfoWhileOwned(
         markAccountNeedsReauth(MAIN_CODEX_ACCOUNT_ID, writerGeneration);
       }
       // Keep the last-known plan visible: after a plan change revokes the session, the plan the
-      // account HAD is what tells the operator why it stopped working.
+      // account HAD is what tells the operator why it stopped working. A transient failure proves
+      // nothing about the plan, so it stays unknown and stale quota is reported as coverage-only.
       return {
-        info: { ...EMPTY_MAIN_ACCOUNT_INFO, plan: nonEmptyPlan(cached?.plan) ?? nonEmptyPlan(getMainAccountPlan()) },
+        info: terminalAuthFailure
+          ? { ...EMPTY_MAIN_ACCOUNT_INFO, plan: nonEmptyPlan(cached?.plan) ?? nonEmptyPlan(getMainAccountPlan()) }
+          : EMPTY_MAIN_ACCOUNT_INFO,
         credentialChecked: true, hasCredential: true,
         quotaRefresh: { status: "http_error", httpStatus: resp.status,
           ...(authFailure.code ? { code: authFailure.code } : {}) },
