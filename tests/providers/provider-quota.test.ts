@@ -1971,6 +1971,53 @@ describe("fetchProviderQuotaReports", () => {
     expect(seen).toEqual([]);
   });
 
+  test("Kimi quota reads the Kimi Code usages shape: 0..1 ratios, monthly pool, legacy placeholder ignored", async () => {
+    await saveCredential("kimi", { access: "kimi-access-secret", refresh: "kimi-refresh-secret", expires: Date.now() + 3600_000 });
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      if (String(input) !== "https://api.kimi.com/coding/v1/usages") return new Response("not found", { status: 404 });
+      return new Response(JSON.stringify({
+        usages: {
+          limit_5h: { used_ratio: 0.15, reset_time: "2026-11-06T07:46:00.000Z" },
+          limit_month_total: { used_ratio: "0.0082", reset_time: "2026-12-06T03:22:00Z" },
+          limit_month_code: { used_ratio: 0.5, reset_time: "2026-12-06T03:22:00Z" },
+        },
+        limits: [{ window: { duration: 300, timeUnit: "TIME_UNIT_MINUTE" }, detail: { limit: "100", remaining: "100" } }],
+        totalQuota: { limit: "100", remaining: "99" },
+      }), { status: 200 });
+    }) as typeof fetch;
+
+    const result = await fetchProviderQuotaReports(kimiOnlyConfig(), true);
+
+    expect(result.reports[0]?.quota).toEqual({
+      fiveHourPercent: 15,
+      fiveHourResetAt: Date.parse("2026-11-06T07:46:00.000Z"),
+      monthlyPercent: 0.82,
+      monthlyResetAt: Date.parse("2026-12-06T03:22:00Z"),
+      updatedAt: expect.any(Number),
+    });
+  });
+
+  test("Kimi quota usages shape: a 0 ratio is 0%, limit_7d is weekly, a missing ratio is skipped", async () => {
+    await saveCredential("kimi", { access: "kimi-access-secret", refresh: "kimi-refresh-secret", expires: Date.now() + 3600_000 });
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      usages: {
+        limit_5h: { used_ratio: 0, reset_time: "2026-11-06T07:46:00Z" },
+        limit_7d: { used_ratio: "0.5", reset_time: "2026-11-10T00:00:00Z" },
+        limit_month_total: { reset_time: "2026-12-06T03:22:00Z" },
+      },
+    }), { status: 200 })) as typeof fetch;
+
+    const result = await fetchProviderQuotaReports(kimiOnlyConfig(), true);
+
+    expect(result.reports[0]?.quota).toEqual({
+      fiveHourPercent: 0,
+      fiveHourResetAt: Date.parse("2026-11-06T07:46:00Z"),
+      weeklyPercent: 50,
+      weeklyResetAt: Date.parse("2026-11-10T00:00:00Z"),
+      updatedAt: expect.any(Number),
+    });
+  });
+
   test("Kimi quota refreshes an expired OAuth token before calling usages", async () => {
     await saveCredential("kimi", { access: "expired-kimi-access", refresh: "kimi-refresh-secret", expires: Date.now() - 1 });
     const seen: Array<{ url: string; authorization?: string }> = [];
