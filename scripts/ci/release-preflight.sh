@@ -36,7 +36,8 @@ expected_tag=""
 case "$GITHUB_REF" in
   refs/heads/main)
     expected_tag="latest"
-    [[ "$RELEASE_VERSION" != *-* ]] \
+    # The fork's own releases are 2.65.0-vadymhimself.N and ship from main.
+    [[ "$RELEASE_VERSION" != *-* || "$RELEASE_VERSION" == *-vadymhimself.* ]] \
       || fail "main releases must use a stable semver version; got ${RELEASE_VERSION}"
     ;;
   refs/heads/preview)

@@ -2402,7 +2402,7 @@ describe("fetchProviderQuotaReports", () => {
         includedAccounts: 0,
         staleQuotaAccounts: 1,
         missingQuotaAccounts: 1,
-        unknownPlanAccounts: 1,
+        unknownPlanAccounts: 0, // b93f22bbc keeps the main account's last plan when a probe fails
         incomplete: true,
         currentAccount: { plan: "prolite", quota: null },
       });
