@@ -1,0 +1,81 @@
+name: Fork release
+
+# Fork-only (vadymhimself): a `v*-vadymhimself.*` tag publishes a GitHub Release carrying the
+# npm tarball and its sha256. No npm publish. Upstream's release.yml is left untouched so syncs
+# do not conflict. AgentRadar pulls only releases this workflow created.
+on:
+  push:
+    tags: ['v*-vadymhimself.*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require a release branch, its green push CI, and a matching version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          branches="$(git branch -r --contains "$GITHUB_SHA" --format='%(refname:short)' \
+            | sed -n -E 's#^origin/(main|release/.+)$#\1#p')"
+          if [ -z "$branches" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} (${GITHUB_SHA}) is on no release branch (main or release/*)"
+            exit 1
+          fi
+
+          # Same gate as release.yml: a push-event Cross-platform CI success for this exact SHA on
+          # the branch itself. A pull-request run does not qualify.
+          ci_url=""
+          for branch in $branches; do
+            ci_url="$(gh run list --workflow ci.yml --branch "$branch" --commit "$GITHUB_SHA" \
+              --event push --limit 10 --json conclusion,url \
+              --jq '[.[] | select(.conclusion == "success")][0].url // ""')"
+            [ -n "$ci_url" ] && break
+          done
+          if [ -z "$ci_url" ]; then
+            echo "::error::No successful push-event Cross-platform CI run for ${GITHUB_SHA} on: ${branches//$'\n'/ }"
+            exit 1
+          fi
+          echo "Cross-platform CI passed for ${GITHUB_SHA} on ${branch}: ${ci_url}"
+
+          version="$(node -p "require('./package.json').version")"
+          if [ "$version" != "${GITHUB_REF_NAME#v}" ]; then
+            echo "::error::package.json version ${version} does not match tag ${GITHUB_REF_NAME}"
+            exit 1
+          fi
+
+      - name: Setup project Bun
+        uses: ./.github/actions/setup-project-bun
+
+      - name: Build the package
+        run: |
+          set -euo pipefail
+          bun install --frozen-lockfile
+          bun run build:gui
+
+      - name: Pack and publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tgz="$(npm pack --silent | tail -n 1)"
+          sha256sum "$tgz" > "$tgz.sha256"
+          cat "$tgz.sha256"
+          gh release create "$GITHUB_REF_NAME" "$tgz" "$tgz.sha256" --verify-tag \
+            --title "gateway ${GITHUB_REF_NAME#v}" --notes-from-tag

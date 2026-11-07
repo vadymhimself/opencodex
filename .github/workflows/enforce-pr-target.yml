@@ -651,7 +651,8 @@ jobs:
             let behindBase = 0;
             let aheadMain = 0;
             let ancestryLookupFailed = false;
-            const baseAllowed = ALLOWED_BASES.includes(pr.base.ref);
+            // Fork release lines (release/<version>) take PRs too; a tag is cut only from them.
+            const baseAllowed = ALLOWED_BASES.includes(pr.base.ref) || pr.base.ref.startsWith("release/");
 
             // Stacked PR exception: base is another open PR's head branch (same
             // head repo as this PR's base repo). Closed/missing parent stays wrong_base.
@@ -760,7 +761,8 @@ jobs:
 
             let failures = collectPrQualityFailures({
               baseRef: pr.base.ref,
-              allowedBases: ALLOWED_BASES,
+              // pr-quality.cjs is checked out from dev; widen its allow-list for this PR's own base here.
+              allowedBases: baseAllowed ? [pr.base.ref] : ALLOWED_BASES,
               title: pr.title,
               body: pr.body,
               behindMain,

@@ -72,7 +72,7 @@ describe("CI review lanes", () => {
       jobs?: Record<string, Record<string, unknown> | undefined>;
     };
     expect([...(ci.on?.push?.branches ?? [])].sort())
-      .toEqual(["main", "preview"]);
+      .toEqual(["main", "preview", "release/**"]);
 
     // The PR trigger must carry NO base-branch filter, and the two triggers
     // differ on purpose. GitHub matches `branches:` against the BASE ref, so

@@ -94,6 +94,10 @@ const OWN_IS_PREVIEW = OWN_VERSION.includes("-preview.");
 const OWN_REF = OWN_IS_PREVIEW ? "refs/heads/preview" : "refs/heads/main";
 const OWN_TAG = OWN_IS_PREVIEW ? "preview" : "latest";
 const NEXT_CORE = `${MAJOR}.${MINOR + 1}.0`;
+// Fork quarantine (GW-CD-19243; the fork has issues disabled): these scenarios release the checkout's
+// own version through upstream's npm policy (stable semver on main, no version npm already has). A
+// `-vadymhimself.N` tree can never satisfy that and the fork never publishes to npm, so they skip there.
+const FORK = /-vadymhimself\./.test(OWN_VERSION);
 
 const FAKE_GH = [
   "#!/bin/sh",
@@ -180,7 +184,7 @@ function preflight(scenario: Scenario): { status: number | null; output: string;
 }
 
 describe.skipIf(process.platform === "win32")("scripts/ci/release-preflight.sh, executed", () => {
-  test("replays run 35783865160: a higher-core tag refuses the release before packaging", () => {
+  test.skipIf(FORK)("replays run 35783865160: a higher-core tag refuses the release before packaging", () => {
     const blocker = OWN_IS_PREVIEW ? `v${NEXT_CORE}` : `v${NEXT_CORE}-preview.20260923`;
     const result = preflight({ tags: ["v0.0.1", blocker] });
     expect(result.status, result.output).toBe(1);
@@ -189,14 +193,14 @@ describe.skipIf(process.platform === "win32")("scripts/ci/release-preflight.sh, 
     expect(result.summary).toContain(`Release preflight refused ${OWN_VERSION}`);
   }, SPAWN_BUDGET_MS);
 
-  test("passes a release every check can already approve", () => {
+  test.skipIf(FORK)("passes a release every check can already approve", () => {
     const result = preflight({ tags: ["v0.0.1"] });
     expect(result.status, result.output).toBe(0);
     expect(result.output).toContain("Release preflight passed");
     expect(result.summary).toBe("");
   }, SPAWN_BUDGET_MS);
 
-  test("refuses a version npm already has unless the run is a dry run", () => {
+  test.skipIf(FORK)("refuses a version npm already has unless the run is a dry run", () => {
     const real = preflight({ tags: ["v0.0.1"], npm: "present" });
     expect(real.status, real.output).toBe(1);
     expect(real.output).toContain("already exists on npm");
@@ -217,7 +221,7 @@ describe.skipIf(process.platform === "win32")("scripts/ci/release-preflight.sh, 
     expect(result.output).toContain("is not on npm");
   }, SPAWN_BUDGET_MS);
 
-  test("warns rather than blocks when npm cannot be read", () => {
+  test.skipIf(FORK)("warns rather than blocks when npm cannot be read", () => {
     const result = preflight({ tags: ["v0.0.1"], npm: "unreadable" });
     expect(result.status, result.output).toBe(0);
     expect(result.output).toContain("::warning::Could not read npm");
@@ -232,7 +236,7 @@ describe.skipIf(process.platform === "win32")("scripts/ci/release-preflight.sh, 
     expect(missing.output).toContain("refs/remotes/origin/dev");
   }, SPAWN_BUDGET_MS);
 
-  test("reports every problem in one run", () => {
+  test.skipIf(FORK)("reports every problem in one run", () => {
     const wrongTag = OWN_TAG === "latest" ? "preview" : "latest";
     const result = preflight({ tags: ["v0.0.1"], distTag: wrongTag, npm: "present" });
     expect(result.status, result.output).toBe(1);

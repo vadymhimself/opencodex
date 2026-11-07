@@ -28,9 +28,10 @@ on:
     # main and preview MUST stay: release.yml requires a successful
     # push-event Cross-platform CI run for the exact release SHA and states
     # that a pull-request run does not qualify, so removing either branch
-    # breaks publication.
+    # breaks publication. release/** is the fork's release line: fork-release.yml
+    # demands the same push-event run for the tagged SHA on its release branch.
   push:
-    branches: [main, preview]
+    branches: [main, preview, 'release/**']
     paths:
       - "Dockerfile"
       - "compose.yaml"
