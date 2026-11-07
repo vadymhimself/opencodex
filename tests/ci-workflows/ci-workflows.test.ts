@@ -811,6 +811,9 @@ describe("GitHub Actions hardening", () => {
     expect(workflow).toContain("Release must run from main or preview");
     expect(workflow).toContain("main releases must use a stable semver version");
     expect(workflow).toContain("preview releases must use a preview prerelease version");
+    for (const [f, needle] of [["release.ts", '!version.includes("-vadymhimself.")'], ["ci/release-preflight.sh", "== *-vadymhimself.*"]] as const)
+      expect(readFileSync(join(repoRoot(), "scripts", f), "utf8")).toContain(needle); // fork 2.65.0-vadymhimself.N ships from main
+    expect(workflow).toContain('"$RELEASE_VERSION" != *-vadymhimself.*');
 
     const readinessStep = workflow
       .split("- name: Require dev to be ready for this release")[1]

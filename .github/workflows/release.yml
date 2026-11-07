@@ -815,7 +815,8 @@ jobs:
           case "$GITHUB_REF" in
             refs/heads/main)
               expected_tag="latest"
-              if [[ "$RELEASE_VERSION" == *-* ]]; then
+              # The fork's own releases are 2.65.0-vadymhimself.N and ship from main.
+              if [[ "$RELEASE_VERSION" == *-* && "$RELEASE_VERSION" != *-vadymhimself.* ]]; then
                 echo "::error::main releases must use a stable semver version; got ${RELEASE_VERSION}"
                 exit 1
               fi

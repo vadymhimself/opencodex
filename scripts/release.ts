@@ -549,7 +549,8 @@ if (branch === "preview" && !version.includes("-preview.")) {
   console.error(`Preview releases must use a preview prerelease version (got ${version}).`);
   process.exit(1);
 }
-if (branch === "main" && version.includes("-")) {
+// The fork's own releases are 2.65.0-vadymhimself.N and ship from main.
+if (branch === "main" && version.includes("-") && !version.includes("-vadymhimself.")) {
   console.error(`Main releases must use a stable semver version (got ${version}).`);
   process.exit(1);
 }

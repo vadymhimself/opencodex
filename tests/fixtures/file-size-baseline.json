@@ -35,7 +35,7 @@
     "src/server/index.ts": 890,
     "src/server/request-log.ts": 2152,
     "src/server/responses/core.ts": 210,
-    "tests/ci-workflows/ci-workflows.test.ts": 5449,
+    "tests/ci-workflows/ci-workflows.test.ts": 5452,
     "tests/claude-integration/claude-messages-endpoint.test.ts": 6026,
     "tests/claude-integration/claude-outbound.test.ts": 2035,
     "tests/cli/cli-account.test.ts": 2313,
