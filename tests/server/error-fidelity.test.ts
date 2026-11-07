@@ -43,6 +43,12 @@ describe("error fidelity", () => {
       type: "insufficient_quota",
       code: "insufficient_quota",
     });
+    expect(
+      classifyError(400, "invalid_request_error", "Third-party apps now draw from your extra usage, not your plan limits"),
+    ).toMatchObject({
+      type: "insufficient_quota",
+      code: "insufficient_quota",
+    });
     expect(classifyError(429, "upstream_error", "Rate limit reached for model")).toMatchObject({
       type: "rate_limit_error",
       code: "rate_limit_exceeded",
