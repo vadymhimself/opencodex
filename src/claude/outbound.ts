@@ -11,7 +11,7 @@
  *  - errors: {type:"error", error:{type,message}}; may arrive mid-stream after HTTP 200.
  */
 import { createHash } from "node:crypto";
-import { httpStatusFromTerminalError } from "../lib/errors";
+import { httpStatusFromTerminalError, isDefiniteContextOverflowMessage } from "../lib/errors";
 import { isTransientUpstreamStatus } from "../lib/upstream-retry";
 import {
   isTranslatorBudgetExceededError,
@@ -70,8 +70,22 @@ export function anthropicErrorType(status: number): string {
   }
 }
 
+/**
+ * Claude Code recognizes an overflowing prompt only by Anthropic's wording ("prompt is too long"),
+ * and only then runs its reactive compaction and the head-truncating retry inside /compact. A routed
+ * provider's own overflow text ("Your input exceeds the context window of this model") reads to it as
+ * a generic 400, so every later turn and every /compact resends the same oversized history and the
+ * session never recovers. Prefixed, never replaced: the provider text stays the evidence.
+ */
+function claudeCodeOverflowMessage(status: number, message: string, code?: string): string {
+  if (status === 429 || /prompt is too long/i.test(message)) return message;
+  return code === "context_length_exceeded" || isDefiniteContextOverflowMessage(message)
+    ? `prompt is too long: ${message}`
+    : message;
+}
+
 export function anthropicErrorBody(status: number, message: string, type?: string, code?: string): Rec {
-  return { type: "error", error: { type: type ?? anthropicErrorType(status), message, ...(code ? { code } : {}) } };
+  return { type: "error", error: { type: type ?? anthropicErrorType(status), message: claudeCodeOverflowMessage(status, message, code), ...(code ? { code } : {}) } };
 }
 
 export function anthropicErrorResponse(status: number, message: string, type?: string, code?: string): Response {
