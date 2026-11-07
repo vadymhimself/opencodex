@@ -126,8 +126,42 @@ test("non-transient upstream 400 stays 400 invalid_request_error; no retry", asy
     });
     expect(calls).toBe(1);
     expect(response.status).toBe(400);
-    const json = await response.json() as { error?: { type?: string } };
+    const json = await response.json() as { error?: { type?: string; message?: string } };
     expect(json.error?.type).toBe("invalid_request_error");
+    expect(json.error?.message).toBe("bad request shape");
+  } finally {
+    await server.stop(true);
+    await upstream.stop(true);
+  }
+});
+
+// Claude Code runs its reactive compaction and the head-truncating /compact retry only for Anthropic's
+// "prompt is too long" wording. OpenAI's overflow text alone left a hosted session refusing every turn
+// and every /compact (COMPACTION-400-REPRO, 2026-11-07).
+test("upstream context-window 400 reaches Claude Code as prompt is too long, provider text kept", async () => {
+  const upstream = Bun.serve({
+    port: 0,
+    fetch() {
+      return Response.json({ error: {
+        message: "Your input exceeds the context window of this model. Please adjust your input and try again.",
+        type: "invalid_request_error", code: "context_length_exceeded",
+      } }, { status: 400 });
+    },
+  });
+  saveConfig(nativeConfig(`${upstream.url.toString().replace(/\/$/, "")}/v1`));
+  const server = startServer(0);
+  try {
+    const response = await fetch(new URL("/v1/messages", server.url), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: messagesBody(),
+    });
+    expect(response.status).toBe(400);
+    const json = await response.json() as { error?: { type?: string; message?: string } };
+    expect(json.error?.type).toBe("invalid_request_error");
+    expect(json.error?.message).toBe(
+      "prompt is too long: Your input exceeds the context window of this model. Please adjust your input and try again.",
+    );
   } finally {
     await server.stop(true);
     await upstream.stop(true);

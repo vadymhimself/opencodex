@@ -684,3 +684,24 @@ export function httpStatusFromTerminalError(error: {
   }
   return 502;
 }
+
+/**
+ * Phrases a provider emits when the INPUT does not fit this model's context window. Matched
+ * against the innermost provider message only, so an unrelated refusal that merely quotes one
+ * of these tokens in a code field cannot authorize a replay.
+ */
+const DEFINITE_CONTEXT_OVERFLOW_PHRASES = [
+  "exceeds the context window",
+  "exceed the context window",
+  "context window exceeded",
+  "context length exceeded",
+  "maximum context length",
+  "maximum context window",
+  "too many tokens",
+];
+
+export function isDefiniteContextOverflowMessage(text: string): boolean {
+  const normalized = text.toLowerCase();
+  return normalized === "context_length_exceeded"
+    || DEFINITE_CONTEXT_OVERFLOW_PHRASES.some(phrase => normalized.includes(phrase));
+}

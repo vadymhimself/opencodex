@@ -1,5 +1,5 @@
 import { parseResetCooldownMs } from "../codex/routing";
-import { classifyError, isCyberPolicyCode } from "../lib/errors";
+import { classifyError, isCyberPolicyCode, isDefiniteContextOverflowMessage } from "../lib/errors";
 import { isNonReplayableUpstreamCode } from "../lib/upstream-retry";
 import type { OcxComboTarget } from "../types";
 import { targetKey } from "./types";
@@ -616,29 +616,8 @@ function isProviderTargetContextOverflow(
 /** A status can carry a verdict about the REQUEST; 401/403/429 speak about the credential. */
 const CONTEXT_VERDICT_STATUSES: ReadonlySet<number> = new Set([400, 413, 422]);
 
-/**
- * Phrases a provider emits when the INPUT does not fit this model's context window. Matched
- * against the innermost provider message only, so an unrelated refusal that merely quotes one
- * of these tokens in a code field cannot authorize a replay.
- */
-const DEFINITE_CONTEXT_OVERFLOW_PHRASES = [
-  "exceeds the context window",
-  "exceed the context window",
-  "context window exceeded",
-  "context length exceeded",
-  "maximum context length",
-  "maximum context window",
-  "too many tokens",
-];
-
 /** Wrapper envelopes unwrapped before the leaf message is read. */
 const MAX_CONTEXT_OVERFLOW_ENVELOPES = 4;
-
-function isDefiniteContextOverflowMessage(text: string): boolean {
-  const normalized = text.toLowerCase();
-  return normalized === "context_length_exceeded"
-    || DEFINITE_CONTEXT_OVERFLOW_PHRASES.some(phrase => normalized.includes(phrase));
-}
 
 /**
  * Confirm a context overflow from the provider MESSAGE rather than from a code token that
