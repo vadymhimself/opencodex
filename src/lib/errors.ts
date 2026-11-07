@@ -428,7 +428,10 @@ export function classifyError(status: number, type: string, message: string): Oc
     text.includes("quota exhausted") ||
     text.includes("account quota exceeded") ||
     text.includes("monthly quota exceeded") ||
-    text.includes("daily quota exceeded")
+    text.includes("daily quota exceeded") ||
+    // Anthropic answers a spent plan with HTTP 400, not 429; without this it classifies as
+    // invalid_request_error, a hard stop, and a combo never hops to its next tier.
+    text.includes("out of extra usage")
   ) {
     return { message, type: "insufficient_quota", code: "insufficient_quota" };
   }
