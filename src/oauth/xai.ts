@@ -12,6 +12,8 @@ const XAI_OAUTH_CALLBACK_PORT = 56121;
 const XAI_OAUTH_CALLBACK_PATH = "/callback";
 const XAI_OAUTH_REFRESH_SKEW_MS = 2 * 60 * 1000;
 const TOKEN_REQUEST_TIMEOUT_MS = 30_000;
+// A hosted sign-in pastes the final address back by hand, so wait as long as the paste window AgentRadar offers (20115).
+export const XAI_LOGIN_TIMEOUT_MS = 20 * 60_000;
 const RETRY_AFTER_MAX_DELAY_MS = 60_000;
 const JITTER_DELAY_CAP_MS = 2_000;
 const XAI_TRUSTED_AUTH_HOSTS = new Set(["auth.x.ai", "accounts.x.ai"]);
@@ -292,6 +294,7 @@ export class XaiOAuthFlow extends OAuthCallbackFlow {
       callbackHostname: "127.0.0.1",
       callbackBindHostname: "127.0.0.1",
       redirectUri: `http://127.0.0.1:${XAI_OAUTH_CALLBACK_PORT}${XAI_OAUTH_CALLBACK_PATH}`,
+      timeoutMs: XAI_LOGIN_TIMEOUT_MS,
     } satisfies OAuthCallbackFlowOptions);
   }
 
