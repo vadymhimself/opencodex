@@ -267,8 +267,8 @@ const anthropicUsageInflight = new Map<string, Promise<ProviderQuota | null>>();
  *
  * A tier must not be inferred from what is here. Percentages are normalized per account, so a
  * Max x5 seat at 50% is byte-identical to a Max x20 seat at 50%, and the presence of a
- * model-scoped window tracks entitlement rather than seat size. Populate `plan` only when
- * upstream returns the tier itself.
+ * model-scoped window tracks entitlement rather than seat size. The tier comes from
+ * `/api/oauth/profile` instead (`fetchAnthropicPlan`).
  */
 export async function fetchAnthropicUsageQuota(accessToken: string): Promise<ProviderQuota | null> {
   const joinable = anthropicUsageInflight.get(accessToken);
@@ -276,6 +276,7 @@ export async function fetchAnthropicUsageQuota(accessToken: string): Promise<Pro
 
   const probe = (async (): Promise<ProviderQuota | null> => {
     const response = await fetch("https://api.anthropic.com/api/oauth/usage", {
+      redirect: "error",
       headers: {
         Accept: "application/json, text/plain, */*",
         "Content-Type": "application/json",
@@ -327,6 +328,46 @@ export async function fetchAnthropicUsageQuota(accessToken: string): Promise<Pro
   });
   anthropicUsageInflight.set(accessToken, probe);
   return probe;
+}
+
+export interface AnthropicPlan { plan: string | null; planUnknownReason?: string }
+const anthropicPlanCache = new Map<string, { until: number; value: Promise<AnthropicPlan> }>();
+
+/**
+ * Anthropic subscription tier from `/api/oauth/profile`, the endpoint Claude Code reads for its
+ * own subscription type: `organization.organization_type` is `claude_max`, `claude_pro`,
+ * `claude_team`, ..., and `organization.rate_limit_tier` `default_claude_max_20x` marks Max 20x,
+ * now sold as Ultra. Keyed by token, so a re-login or refresh reads afresh. A success holds for an
+ * hour; a failure says why and is retried after five minutes.
+ */
+export function fetchAnthropicPlan(accessToken: string): Promise<AnthropicPlan> {
+  const now = Date.now();
+  const hit = anthropicPlanCache.get(accessToken);
+  if (hit && now < hit.until) return hit.value;
+  // ponytail: cleared wholesale at 500 tokens; a pool never holds that many live logins.
+  if (anthropicPlanCache.size >= 500) anthropicPlanCache.clear();
+  const value = (async (): Promise<AnthropicPlan> => {
+    try {
+      const response = await fetch("https://api.anthropic.com/api/oauth/profile", {
+        redirect: "error",
+        headers: { "Content-Type": "application/json", "User-Agent": CLAUDE_CLI_USER_AGENT, Authorization: `Bearer ${accessToken}` },
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+      if (!response.ok) return { plan: null, planUnknownReason: `the plan lookup failed (HTTP ${response.status})` };
+      const org = asRecord(asRecord(await readQuotaJson(response))?.organization);
+      const type = typeof org?.organization_type === "string" ? org.organization_type : "";
+      if (!/^claude_[a-z0-9_]{1,50}$/.test(type)) return { plan: null, planUnknownReason: "Anthropic did not report a plan" };
+      const plan = type.slice("claude_".length);
+      return { plan: plan === "max" && org?.rate_limit_tier === "default_claude_max_20x" ? "ultra" : plan };
+    } catch {
+      return { plan: null, planUnknownReason: "the plan lookup did not answer" };
+    }
+  })();
+  anthropicPlanCache.set(accessToken, { until: now + 5 * 60_000, value });
+  void value.then(result => {
+    if (result.plan && anthropicPlanCache.get(accessToken)?.value === value) anthropicPlanCache.set(accessToken, { until: now + 60 * 60_000, value });
+  });
+  return value;
 }
 
 export async function fetchAnthropicQuota(provider: string): Promise<ProviderQuotaReport | null> {
