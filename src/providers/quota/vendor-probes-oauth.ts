@@ -276,6 +276,7 @@ export async function fetchAnthropicUsageQuota(accessToken: string): Promise<Pro
 
   const probe = (async (): Promise<ProviderQuota | null> => {
     const response = await fetch("https://api.anthropic.com/api/oauth/usage", {
+      redirect: "error",
       headers: {
         Accept: "application/json, text/plain, */*",
         "Content-Type": "application/json",
@@ -348,6 +349,7 @@ export function fetchAnthropicPlan(accessToken: string): Promise<AnthropicPlan> 
   const value = (async (): Promise<AnthropicPlan> => {
     try {
       const response = await fetch("https://api.anthropic.com/api/oauth/profile", {
+        redirect: "error",
         headers: { "Content-Type": "application/json", "User-Agent": CLAUDE_CLI_USER_AGENT, Authorization: `Bearer ${accessToken}` },
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
