@@ -397,6 +397,7 @@ export function createAdapterContinuations(
           anthropicSessionKey,
           Date.now(),
           response.headers,
+          route.modelId,
         );
         if (nextAccountId) {
           try { void response.body?.cancel().catch(() => {}); } catch { /* already closed */ }

@@ -243,6 +243,7 @@ export async function executeResponsesSidecars(
         anthropicSessionKey,
         Date.now(),
         responseHeaders,
+        route.modelId,
       );
       if (!nextAccountId) {
         hop.permit?.release();
