@@ -289,18 +289,27 @@ describe("warm-up failure policy", () => {
     // convert it into an unbounded wait, so exit starts a reap grace instead.
     const script = [
       'const { spawn } = require("node:child_process");',
-      'spawn(process.execPath, ["--eval", "setTimeout(() => process.exit(0), 8_000)"], { detached: true, stdio: "inherit" }).unref();',
-      'process.stdout.write("ok\\n");',
+      'const descendant = spawn(process.execPath, ["--eval", "setTimeout(() => process.exit(0), 8_000)"], { detached: true, stdio: "inherit" });',
+      "descendant.unref();",
+      'process.stdout.write(`ok ${descendant.pid}\\n`);',
       "process.exit(0);",
     ].join("\n");
     const startedAt = performance.now();
     // The parent exits before its short deadline; the descendant keeps the pipe open
     // past that deadline, so only reap grace should settle the completed child.
     const result = await spawnModuleGraphWarmupChild(script, repoRoot(), undefined, 1_000);
+    // The descendant must not outlive this test. Left alone it ran ~3 s into the next file of
+    // the same Bun process, where shard 1/4 batch 4 of run 42898913860 hung in a Bun.spawnSync
+    // git call on both attempts until the 120 s batch timeout.
+    const descendantPid = Number(/^ok (\d+)$/m.exec(result.stdout)?.[1]);
+    const alive = () => { try { process.kill(descendantPid, 0); return true; } catch { return false; } };
+    if (descendantPid > 0 && alive()) process.kill(descendantPid, "SIGKILL");
+    for (let i = 0; i < 40 && descendantPid > 0 && alive(); i++) await Bun.sleep(50);
     expect(performance.now() - startedAt).toBeLessThan(INTERNAL_DEADLINE_MS);
     expect(result.exitCode).toBe(0);
     expect(result.timedOut).toBe(false);
-    expect(result.stdout).toContain("ok");
+    expect(descendantPid).toBeGreaterThan(0);
+    expect(alive()).toBe(false);
   }, INTERNAL_DEADLINE_MS);
 
   test("a real module graph loads, and reports what it loaded", async () => {
