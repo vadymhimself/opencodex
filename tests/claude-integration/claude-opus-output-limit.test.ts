@@ -42,7 +42,7 @@ function source(maxTokens = 128_000, serverTool = false) {
     output_config: { effort: "medium" },
     context_management: { edits: [{ type: "clear_thinking_20251015", keep: "all" }] },
     metadata: { user_id: "synthetic-replay-test" },
-    system: [{ type: "text", text: "Synthetic system", cache_control: { type: "ephemeral" } }],
+    system: [{ type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude.", cache_control: { type: "ephemeral" } }],
     messages: [
       { role: "user", content: [{ type: "text", text: "Synthetic prompt", cache_control: { type: "ephemeral" } }] },
       { role: "system", content: "Synthetic mid-conversation instruction" },

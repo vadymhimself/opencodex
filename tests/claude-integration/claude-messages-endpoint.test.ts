@@ -1672,7 +1672,7 @@ test("mapped combo count_tokens uses exact canonical Anthropic counting", async 
   } as OcxConfig);
   const source = {
     model: "claude-opus-5",
-    system: [{ type: "text", text: "system", cache_control: { type: "ephemeral", ttl: "1h" } }],
+    system: [{ type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude.", cache_control: { type: "ephemeral", ttl: "1h" } }],
     messages: [{ role: "user", content: [{ type: "text", text: "count this" }] }],
     tools: [{ name: "Read", description: "read", input_schema: { type: "object", properties: {} } }],
     metadata: { user_id: "count-session" },
@@ -2701,7 +2701,7 @@ function routedAnthropicSource(): Record<string, unknown> {
     max_tokens: 64000,
     stream: true,
     system: [
-      { type: "text", text: "identity" },
+      { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
       { type: "text", text: "policy", cache_control: { type: "ephemeral", ttl: "1h" } },
       { type: "text", text: "tools", cache_control: { type: "ephemeral" } },
     ],
