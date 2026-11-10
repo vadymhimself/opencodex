@@ -390,6 +390,51 @@ describe("multiauth accounts API", () => {
     }
   });
 
+  test("GET ?quota=1 reads each Anthropic account's plan from its profile, or says why it can't", async () => {
+    const account = (id: string, access: string) => ({ id, credential: { access, refresh: `r-${id}`, expires: 9999999999999, email: `${id}@example.com`, accountId: `acct-${id}` } });
+    writeFileSync(join(testDir, "auth.json"), JSON.stringify({ anthropic: { activeAccountId: "ultra", accounts: [
+      account("ultra", "plan-t-ultra"), account("max", "plan-t-max"), account("pro", "plan-t-pro"), account("down", "plan-t-down"), account("odd", "plan-t-odd"),
+    ] } }), { mode: 0o600 });
+    const profiles: Record<string, unknown> = {
+      "plan-t-ultra": { organization: { organization_type: "claude_max", rate_limit_tier: "default_claude_max_20x" } },
+      "plan-t-max": { organization: { organization_type: "claude_max", rate_limit_tier: "default_claude_max_5x" } },
+      "plan-t-pro": { organization: { organization_type: "claude_pro" } },
+      "plan-t-odd": { organization: { organization_type: "Max!" } },
+    };
+    const asked: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const raw = input instanceof Request ? input.url : String(input);
+      if (!raw.startsWith("https://api.anthropic.com/")) return originalFetch(input, init);
+      if (raw !== "https://api.anthropic.com/api/oauth/profile") return new Response("{}", { status: 500 });
+      const token = new Headers(init?.headers).get("authorization")!.replace("Bearer ", "");
+      asked.push(token);
+      return token in profiles ? Response.json(profiles[token]) : new Response("{}", { status: 503 });
+    }) as typeof fetch;
+
+    const server = startServer(0);
+    try {
+      const read = async () => {
+        const res = await fetch(new URL("/api/oauth/accounts?provider=anthropic&quota=1", server.url));
+        expect(res.status).toBe(200);
+        const body = await res.json() as { accounts: Array<{ id: string; plan: string | null; planUnknownReason?: string }> };
+        return Object.fromEntries(body.accounts.map(a => [a.id, [a.plan, a.planUnknownReason ?? null]]));
+      };
+      expect(await read()).toEqual({
+        ultra: ["ultra", null], max: ["max", null], pro: ["pro", null],
+        down: [null, "the plan lookup failed (HTTP 503)"], odd: [null, "Anthropic did not report a plan"],
+      });
+      expect(asked.sort()).toEqual(["plan-t-down", "plan-t-max", "plan-t-odd", "plan-t-pro", "plan-t-ultra"]);
+      // Cached per token: a second read asks upstream nothing.
+      await read();
+      expect(asked).toHaveLength(5);
+      // The plain list stays a local read with an explicit null.
+      const plain = await (await fetch(new URL("/api/oauth/accounts?provider=anthropic", server.url))).json() as { accounts: Array<{ plan: unknown }> };
+      expect(plain.accounts.map(a => a.plan)).toEqual([null, null, null, null, null]);
+    } finally {
+      await server.stop(true);
+    }
+  });
+
   test("PUT active switches; unknown account 404; unknown provider 400", async () => {
     const server = startServer(0);
     try {

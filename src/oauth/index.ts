@@ -1780,10 +1780,9 @@ export interface OAuthAccountSummary {
    * version looked and upstream did not say. Omitting it would make those indistinguishable and
    * invite a consumer to assume a tier.
    *
-   * Every OAuth provider reports `null` today. Anthropic's `/api/oauth/usage` returns quota
-   * buckets only — `five_hour`, `seven_day`, the model-scoped weekly windows and `limits[]` —
-   * and carries no subscription/tier field, and its token response carries none either. See
-   * `fetchAnthropicUsageQuota` in `src/providers/quota.ts`.
+   * The plain account list reports `null` for every OAuth provider. With `?quota=1`, Anthropic
+   * accounts carry the tier read from `/api/oauth/profile` (`fetchAnthropicPlan` in
+   * `src/providers/quota/vendor-probes-oauth.ts`), or `null` plus a `planUnknownReason`.
    */
   plan: string | null;
 }
@@ -1810,10 +1809,10 @@ export function getLoginStatus(provider: string, maskEmails = true, flowId?: str
     active: a.id === set.activeAccountId,
     ...(a.needsReauth ? { needsReauth: true } : {}),
     expiresAt: a.credential.expires,
-    // Explicitly null rather than omitted — see OAuthAccountSummary.plan. No OAuth provider
-    // exposes a subscription tier today, so there is nothing truthful to put here; deriving one
-    // from quota percentages is not possible, because they are normalized per account and a
-    // half-consumed small seat is indistinguishable from a half-consumed large one.
+    // Explicitly null rather than omitted — see OAuthAccountSummary.plan. This local read makes no
+    // upstream call; `GET /api/oauth/accounts?quota=1` fills Anthropic's from its profile
+    // (fetchAnthropicPlan). Never derived from quota percentages: they are normalized per account,
+    // so a half-consumed small seat is indistinguishable from a half-consumed large one.
     plan: null,
   }));
 

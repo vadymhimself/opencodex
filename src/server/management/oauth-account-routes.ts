@@ -35,6 +35,8 @@ import { deriveProviderPresets } from "../../providers/derive";
 import { providerCodexAccountMode } from "../../providers/registry";
 import { routedSlug, slugEquals } from "../../providers/slug-codec";
 import { clearAccountQuotaCache, clearProviderQuotaCache, fetchProviderAccountQuotas, fetchProviderApiKeyQuotas, fetchProviderQuotaReports, providerOAuthAccountQuotaMode, providerApiKeyQuotaMode, readPassiveProviderAccountQuotas } from "../../providers/quota";
+import { getTokenForAccountQuotaProbe } from "../../providers/quota/account-cache";
+import { fetchAnthropicPlan } from "../../providers/quota/vendor-probes-oauth";
 import { isCanonicalOpenAiForwardProvider } from "../../providers/openai-tiers";
 import { clearThreadAccountMap } from "../../codex/routing";
 import {
@@ -407,9 +409,17 @@ export async function handleOauthAccountRoutes(ctx: ManagementContext): Promise<
       : await fetchProviderAccountQuotas(provider, forceRefresh, quotaProvider);
     const byId = new Map(rows.map(row => [row.accountId, row]));
     const projected = projectAccounts();
+    // Anthropic's tier is read per account from its profile, with the token the quota probe just
+    // validated; a sign-in that can't be used says so instead of leaving the plan blank.
+    const plans = provider === "anthropic" && wantQuota
+      ? new Map(await Promise.all(projected.accounts.map(async account => [account.id,
+        await getTokenForAccountQuotaProbe(provider, account.id).then(fetchAnthropicPlan,
+          () => ({ plan: null, planUnknownReason: "the sign-in needs renewing" }))] as const)))
+      : null;
     return jsonResponse({
       activeAccountId: projected.activeAccountId,
-      accounts: projected.accounts.map(account => {
+      accounts: projected.accounts.map(planless => {
+        const account = { ...planless, ...plans?.get(planless.id) };
         const row = byId.get(account.id);
         if (!row) return account;
         if (config.providers[provider] !== quotaProvider || row.isCurrent?.() === false) {
