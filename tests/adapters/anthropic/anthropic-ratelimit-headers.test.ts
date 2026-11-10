@@ -152,7 +152,7 @@ describe("a model-scoped weekly 429 cools only that model family", () => {
 });
 
 describe("a request-shape 429 does not cool the account", () => {
-  test("an allowed unified status, or no limit evidence at all, fails only the request", async () => {
+  test("an allowed unified status fails only the request, while a header-less 429 still fails over", async () => {
     const start = Date.now();
     const ids = await seed(2);
     const allowed = new Headers({
@@ -163,12 +163,15 @@ describe("a request-shape 429 does not cool the account", () => {
     const warn = spyOn(console, "warn").mockImplementation(() => {});
     try {
       expect(rotateAnthropicAccountOn429(poolEnabled(), ids[0]!, "30", "s1", start, allowed, "claude-opus-5")).toBeNull();
-      expect(rotateAnthropicAccountOn429(poolEnabled(), ids[1]!, null, "s2", start, new Headers(), "claude-opus-5")).toBeNull();
+      expect(rotateAnthropicAccountOn429(poolEnabled(), ids[1]!, null, "s2", start, allowed, "claude-sonnet-5-5")).toBeNull();
       expect(warn.mock.calls.map(c => String(c[0])).filter(l => l.startsWith("[anthropic-pool] 429 on "))
         .every(l => l.endsWith(" cooldown=none (request refused, account not limited)"))).toBe(true);
     } finally { warn.mockRestore(); }
     expect(ids.map(id => getAnthropicAccountHealthSnapshot(id, start))).toEqual([null, null]);
     expect(getEligibleAnthropicAccounts(start, "opus")).toEqual(ids);
+    // No unified status at all is not evidence of a refusal: the legacy cooldown and failover still apply.
+    expect(rotateAnthropicAccountOn429(poolEnabled(), ids[0]!, null, "s3", start, new Headers(), "claude-opus-5")).toBe(ids[1]!);
+    expect(getAnthropicAccountHealthSnapshot(ids[0]!, start)?.cooldownUntil).toBeGreaterThan(start);
   });
 });
 
