@@ -94,6 +94,7 @@ import type { OcxConfig } from "../types";
 import { readJsonRequestBody, resolveInboundBodyLimitBytes } from "./request-decompress";
 import { addFinalRequestLog, httpStatusForRequestLogTerminal, httpStatusFromTerminalError, recordFirstOutput, recordKeyWireAttemptUsage, type RequestLogContext, type RequestLogEntry } from "./request-log";
 import {
+  agentIdFromHeaders,
   conversationIdFromClaudeMetadata,
   getOrAllocateRequestSessionLane,
   linkRequestSessionLane,
@@ -932,6 +933,8 @@ async function handleClaudeMessagesWithBudget(
       );
       if (claudeConversationId) logCtx.conversationId = claudeConversationId;
     }
+    const agentId = agentIdFromHeaders(req.headers);
+    if (agentId) logCtx.agentId = agentId;
     // A fast row blocks passthrough, unlike the chat case: native passthrough forwards the
     // caller's body with the caller's credential and never runs the Anthropic adapter, so the
     // proxy-owned `speed` + beta (anthropic-speed wire) and its usage.speed observation would be

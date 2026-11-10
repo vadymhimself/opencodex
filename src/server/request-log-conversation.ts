@@ -38,6 +38,16 @@ export function normalizeLogConversationId(raw: string | undefined | null): stri
 }
 
 /**
+ * Claude Code sends `x-claude-code-agent-id` on subagent/teammate requests only; the session id and
+ * metadata.user_id are shared with the parent, so this is the one signal that names the caller.
+ * Shape-checked, since a header is client-controlled and the value reaches usage.jsonl.
+ */
+export function agentIdFromHeaders(headers: Headers): string | undefined {
+  const id = headers.get("x-claude-code-agent-id")?.trim();
+  return id && /^a[\w-]{1,80}$/.test(id) ? id : undefined;
+}
+
+/**
  * Filter match: accept either the persisted digest or the original preimage
  * (so pasting from Logs detail or the client-facing session id both work).
  */

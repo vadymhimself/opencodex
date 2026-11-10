@@ -185,6 +185,33 @@ test("native passthrough persists conversationId from metadata.user_id", async (
   }
 });
 
+test("native passthrough logs agentId from x-claude-code-agent-id, only when well-formed", async () => {
+  const { clearRequestLogsForTests } = await import("../../src/server/request-log");
+  const { readUsageEntries } = await import("../../src/usage/log");
+  clearRequestLogsForTests();
+  const upstream = mockAnthropicUpstream([]);
+  saveConfig(cfg(upstream.url.toString().replace(/\/$/, "")));
+  const server = startServer(0);
+  try {
+    // main agent (no header), a subagent, and a malformed value that must not reach the log
+    for (const agent of [undefined, "a1b2c3d4e5f60718", "a bad value"]) {
+      const res = await fetch(new URL("/v1/messages?beta=true", server.url), {
+        method: "POST",
+        headers: { ...OAUTH_HEADERS, ...(agent ? { "x-claude-code-agent-id": agent } : {}) },
+        body: JSON.stringify(claudeBody()),
+      });
+      expect(res.status).toBe(200);
+      await res.text();
+    }
+    const logs = logsFromApiBody<{ agentId?: string }>(await (await fetch(new URL("/api/logs?tail=3", server.url))).json());
+    expect(logs.map(l => l.agentId)).toEqual([undefined, "a1b2c3d4e5f60718", undefined]);
+    expect(readUsageEntries().map(e => e.agentId)).toEqual([undefined, "a1b2c3d4e5f60718", undefined]);
+  } finally {
+    await server.stop(true);
+    upstream.stop(true);
+  }
+});
+
 test("count_tokens passes through with native credentials", async () => {
   const captured: Captured[] = [];
   const upstream = mockAnthropicUpstream(captured);

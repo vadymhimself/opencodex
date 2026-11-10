@@ -355,6 +355,8 @@ export interface PersistedUsageEntry {
   accountLogLabel?: CodexUsageAccountLogLabel;
   /** Best-effort chat/session correlation for Logs grouping (#330). */
   conversationId?: string;
+  /** Claude Code subagent/teammate id (x-claude-code-agent-id); absent on the main agent. */
+  agentId?: string;
   resolvedModel?: string;
   /** Model the upstream actually served (openai-model header or response body). */
   servedModel?: string;
@@ -1037,6 +1039,7 @@ function normalizeUsageEntry(entry: PersistedUsageEntry): PersistedUsageEntry {
     ...(typeof entry.conversationId === "string" && entry.conversationId.trim()
       ? { conversationId: entry.conversationId.trim().slice(0, 128) }
       : {}),
+    ...(typeof entry.agentId === "string" && entry.agentId.trim() ? { agentId: entry.agentId.trim().slice(0, 128) } : {}),
     ...(resolvedModel ? { resolvedModel } : {}),
     ...(servedModel ? { servedModel } : {}),
     ...(entry.wireModel ? { wireModel: entry.wireModel } : {}),
