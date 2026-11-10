@@ -167,7 +167,7 @@ test("an AgentRadar account pin serves exactly its own stored account (pin.check
     codexAccounts: [1, 2].map(n => ({ id: `acct${n}`, email: `c${n}@example.invalid`, isMain: false, chatgptAccountId: `cga${n}` })),
   });
   const rotations = () => ocx.log.split("[anthropic-pool] credential denial on").length - 1;
-  const failovers429 = () => ocx.log.split("[anthropic-pool] 429 on").length - 1;
+  const failovers429 = () => ocx.log.split("; failing over to").length - 1;
   try {
     // Claude: unpinned control serves the active account; a pin serves exactly its own, both ways, and names it.
     let r = await msg(ocx);

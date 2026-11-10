@@ -23,6 +23,23 @@ const CODE_MODE_TIMEOUT_MS = 10 * 60_000;
 // ── OAuth-request requirements applied by the anthropic adapter when authMode==="oauth" ──
 export const ANTHROPIC_OAUTH_BETA = "claude-code-20250219,oauth-2025-04-20";
 export const CLAUDE_CODE_SYSTEM_INSTRUCTION = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
+
+const CLAUDE_IDENTITY_LINE = /^You are (Claude Code, Anthropic's official CLI for Claude|a Claude agent, built on Anthropic's Claude Agent SDK)/;
+
+/**
+ * OAuth (subscription) credentials expect a Claude Code identity system block. The translated
+ * path always adds it; a replayed source body from a non-Claude-Code client (e.g. Hermes) has
+ * none, and upstream answers it 429 "Error". Claude Code's own bodies already carry the line
+ * (often after its billing-header block), so any identified block counts and nothing is doubled.
+ */
+export function prependClaudeIdentity(body: Record<string, unknown>): void {
+  const system = typeof body.system === "string"
+    ? (body.system ? [{ type: "text", text: body.system }] : [])
+    : Array.isArray(body.system) ? body.system : [];
+  if (system.some(block => typeof block?.text === "string" && CLAUDE_IDENTITY_LINE.test(block.text.trimStart()))) return;
+  body.system = [{ type: "text", text: CLAUDE_CODE_SYSTEM_INSTRUCTION }, ...system];
+}
+
 const CLAUDE_TOOL_PREFIX = "custom_";
 const ANTHROPIC_BUILTIN_TOOLS = new Set(["web_search", "code_execution", "text_editor", "computer"]);
 

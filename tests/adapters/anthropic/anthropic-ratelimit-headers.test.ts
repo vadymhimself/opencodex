@@ -4,10 +4,13 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  anthropicModelFamily,
   clearAnthropicAccountCooldown,
   clearAnthropicAccountPoolState,
   forgetAnthropicFailoverQuorum,
   getAnthropicAccountHealthSnapshot,
+  getAnthropicPoolRetryAfterSeconds,
+  getEligibleAnthropicAccounts,
   rotateAnthropicAccountOn429,
   resetAnthropicRoutingForManualSelection,
   resolveAnthropicAccountForSession,
@@ -103,6 +106,75 @@ function drainedFiveHour(resetEpochSeconds: number): Headers {
   });
 }
 
+describe("a model-scoped weekly 429 cools only that model family", () => {
+  /** A seven_day_opus refusal: the account's Opus allowance is spent, its other models are not. */
+  const opusWeekly = (resetEpochSeconds: number) => new Headers({
+    "anthropic-ratelimit-unified-status": "rejected",
+    "anthropic-ratelimit-unified-representative-claim": "seven_day_opus",
+    "anthropic-ratelimit-unified-reset": String(resetEpochSeconds),
+    "anthropic-ratelimit-unified-5h-status": "allowed",
+    "anthropic-ratelimit-unified-7d-status": "allowed",
+  });
+
+  test("Opus cools per account, Sonnet keeps the account, and every 429 logs its limit headers", async () => {
+    const start = Date.now();
+    const ids = await seed(2);
+    const reset = Math.floor(start / 1000) + 3 * 86_400;
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(rotateAnthropicAccountOn429(poolEnabled(), ids[0]!, null, "s1", start, opusWeekly(reset), "claude-opus-5")).toBe(ids[1]!);
+      expect(warn.mock.calls.map(c => String(c[0])).find(l => l.startsWith("[anthropic-pool] 429 on "))).toEndWith(
+        " model=claude-opus-5 retry-after=- 5h-status=allowed 7d-status=allowed representative-claim=seven_day_opus"
+        + ` reset=${reset} status=rejected cooldown=${3 * 86_400}s until ${new Date(reset * 1000).toISOString()}`
+        + " (reset-derived) scope=opus");
+    } finally { warn.mockRestore(); }
+    expect(getAnthropicAccountHealthSnapshot(ids[0]!, start)).toBeNull();
+    expect(getEligibleAnthropicAccounts(start, "opus")).toEqual([ids[1]!]);
+    expect(getEligibleAnthropicAccounts(start, "sonnet")).toEqual(ids);
+
+    // Both accounts out of Opus: an Opus request is refused with the family's reset, a Sonnet one still routes.
+    rotateAnthropicAccountOn429(poolEnabled(), ids[1]!, null, "s2", start, opusWeekly(reset), "claude-opus-5");
+    expect(resolveAnthropicAccountForSession("s3", poolEnabled(), start, "claude-opus-5").reason).toBe("all-cooled");
+    expect(getAnthropicPoolRetryAfterSeconds(start, anthropicModelFamily("claude-opus-5"))).toBe(3 * 86_400);
+    expect(resolveAnthropicAccountForSession("s4", poolEnabled(), start, "claude-sonnet-5-5").accountId).not.toBeNull();
+    clearAnthropicAccountCooldown(ids[0]!);
+    expect(getEligibleAnthropicAccounts(start, "opus")).toEqual([ids[0]!]);
+  });
+
+  test("a five-hour claim on an Opus request still cools the whole account", async () => {
+    const start = Date.now();
+    const ids = await seed(2);
+    rotateAnthropicAccountOn429(poolEnabled(), ids[0]!, "120", null, start,
+      new Headers({ "anthropic-ratelimit-unified-representative-claim": "five_hour" }), "claude-opus-5");
+    expect(getAnthropicAccountHealthSnapshot(ids[0]!, start)?.cooldownUntil).toBe(start + 120_000);
+    expect(getEligibleAnthropicAccounts(start, "sonnet")).toEqual([ids[1]!]);
+  });
+});
+
+describe("a request-shape 429 does not cool the account", () => {
+  test("an allowed unified status fails only the request, while a header-less 429 still fails over", async () => {
+    const start = Date.now();
+    const ids = await seed(2);
+    const allowed = new Headers({
+      "anthropic-ratelimit-unified-status": "allowed",
+      "anthropic-ratelimit-unified-5h-status": "allowed",
+      "anthropic-ratelimit-unified-7d-status": "allowed",
+    });
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(rotateAnthropicAccountOn429(poolEnabled(), ids[0]!, "30", "s1", start, allowed, "claude-opus-5")).toBeNull();
+      expect(rotateAnthropicAccountOn429(poolEnabled(), ids[1]!, null, "s2", start, allowed, "claude-sonnet-5-5")).toBeNull();
+      expect(warn.mock.calls.map(c => String(c[0])).filter(l => l.startsWith("[anthropic-pool] 429 on "))
+        .every(l => l.endsWith(" cooldown=none (request refused, account not limited)"))).toBe(true);
+    } finally { warn.mockRestore(); }
+    expect(ids.map(id => getAnthropicAccountHealthSnapshot(id, start))).toEqual([null, null]);
+    expect(getEligibleAnthropicAccounts(start, "opus")).toEqual(ids);
+    // No unified status at all is not evidence of a refusal: the legacy cooldown and failover still apply.
+    expect(rotateAnthropicAccountOn429(poolEnabled(), ids[0]!, null, "s3", start, new Headers(), "claude-opus-5")).toBe(ids[1]!);
+    expect(getAnthropicAccountHealthSnapshot(ids[0]!, start)?.cooldownUntil).toBeGreaterThan(start);
+  });
+});
+
 describe("Anthropic cooldown honours the stated window", () => {
   test("a multi-hour Retry-After is not truncated to the guessed-backoff ceiling", async () => {
     const start = Date.now();
@@ -168,10 +240,9 @@ describe("Anthropic cooldown honours the stated window", () => {
       "anthropic-ratelimit-unified-5h-reset": String(Math.floor((start + 3 * 60 * 60_000) / 1000)),
       "anthropic-ratelimit-unified-5h-utilization": "0.04",
     });
+    // A 429 under an allowed status is not a limit at all: the account is not cooled (see the request-shape case).
     rotateAnthropicAccountOn429(poolEnabled(), ids[0]!, null, null, start, healthy);
-    const health = getAnthropicAccountHealthSnapshot(ids[0]!, start);
-    expect(health?.cooldownUntil).toBe(start + 60_000);
-    expect(health?.cooldownSource).toBe("default");
+    expect(getAnthropicAccountHealthSnapshot(ids[0]!, start)).toBeNull();
   });
 
   test("both windows rejected cools until the LAST one reopens", async () => {
