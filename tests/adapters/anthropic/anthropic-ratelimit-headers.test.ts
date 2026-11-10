@@ -151,6 +151,27 @@ describe("a model-scoped weekly 429 cools only that model family", () => {
   });
 });
 
+describe("a request-shape 429 does not cool the account", () => {
+  test("an allowed unified status, or no limit evidence at all, fails only the request", async () => {
+    const start = Date.now();
+    const ids = await seed(2);
+    const allowed = new Headers({
+      "anthropic-ratelimit-unified-status": "allowed",
+      "anthropic-ratelimit-unified-5h-status": "allowed",
+      "anthropic-ratelimit-unified-7d-status": "allowed",
+    });
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      expect(rotateAnthropicAccountOn429(poolEnabled(), ids[0]!, "30", "s1", start, allowed, "claude-opus-5")).toBeNull();
+      expect(rotateAnthropicAccountOn429(poolEnabled(), ids[1]!, null, "s2", start, new Headers(), "claude-opus-5")).toBeNull();
+      expect(warn.mock.calls.map(c => String(c[0])).filter(l => l.startsWith("[anthropic-pool] 429 on "))
+        .every(l => l.endsWith(" cooldown=none (request refused, account not limited)"))).toBe(true);
+    } finally { warn.mockRestore(); }
+    expect(ids.map(id => getAnthropicAccountHealthSnapshot(id, start))).toEqual([null, null]);
+    expect(getEligibleAnthropicAccounts(start, "opus")).toEqual(ids);
+  });
+});
+
 describe("Anthropic cooldown honours the stated window", () => {
   test("a multi-hour Retry-After is not truncated to the guessed-backoff ceiling", async () => {
     const start = Date.now();
@@ -216,10 +237,9 @@ describe("Anthropic cooldown honours the stated window", () => {
       "anthropic-ratelimit-unified-5h-reset": String(Math.floor((start + 3 * 60 * 60_000) / 1000)),
       "anthropic-ratelimit-unified-5h-utilization": "0.04",
     });
+    // A 429 under an allowed status is not a limit at all: the account is not cooled (see the request-shape case).
     rotateAnthropicAccountOn429(poolEnabled(), ids[0]!, null, null, start, healthy);
-    const health = getAnthropicAccountHealthSnapshot(ids[0]!, start);
-    expect(health?.cooldownUntil).toBe(start + 60_000);
-    expect(health?.cooldownSource).toBe("default");
+    expect(getAnthropicAccountHealthSnapshot(ids[0]!, start)).toBeNull();
   });
 
   test("both windows rejected cools until the LAST one reopens", async () => {

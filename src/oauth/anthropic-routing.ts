@@ -775,7 +775,13 @@ export function rotateAnthropicAccountOn429(
     : family ? delayUntil(Number(header("reset")) * 1000, now) : parseRateLimitResetMs(rateLimitHeaders, now);
   const cooldownMs = parsedRetry ?? resetDerived ?? DEFAULT_COOLDOWN_MS;
   const cooldownSource = parsedRetry !== undefined ? "retry-after" : resetDerived !== undefined ? "reset-derived" : "default";
-  const failover = isAnthropicAccountPoolEnabled(config) || hasAnthropicFailoverQuorum(now);
+  // Only a real limit cools the account: a rejected unified window, or a Retry-After with no unified
+  // verdict. A 429 whose unified status says the account is still allowed is a refusal of this request's
+  // shape (e.g. a replay without the Claude Code identity); cooling on it benched every client on the account.
+  const status = header("status");
+  const limited = [status, header("5h-status"), header("7d-status")].includes("rejected")
+    || (status === undefined && parsedRetry !== undefined);
+  const failover = limited && (isAnthropicAccountPoolEnabled(config) || hasAnthropicFailoverQuorum(now));
   // Which limit refused is only in these headers: log every unified one on every 429 (no credential is among them).
   const unified: string[] = [];
   (rateLimitHeaders as Headers | null | undefined)?.forEach?.((value, name) => {
@@ -785,7 +791,7 @@ export function rotateAnthropicAccountOn429(
     + ` retry-after=${retryAfterHeader?.trim() || "-"} ${unified.join(" ") || "unified=-"}`
     + (failover
       ? ` cooldown=${Math.ceil(cooldownMs / 1000)}s until ${new Date(now + cooldownMs).toISOString()} (${cooldownSource}) scope=${family ?? "account"}`
-      : " cooldown=none (no failover pool)"));
+      : ` cooldown=none (${limited ? "no failover pool" : "request refused, account not limited"})`));
   if (!failover) return null;
   upstreamHealth.set(family ? familyKey(failedAccountId, family) : failedAccountId, { cooldownUntil: now + cooldownMs, cooldownSource });
   sweepExpiredOnWrite(now);

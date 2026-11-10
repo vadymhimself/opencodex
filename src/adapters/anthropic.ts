@@ -17,7 +17,7 @@ import type {
   OcxUsage,
 } from "../types";
 import { isAllowedToolChoice, namespacedToolName, resolveToolChoiceWireName, toolChoiceToolPredicate } from "../types";
-import { ANTHROPIC_OAUTH_BETA, CLAUDE_CODE_SYSTEM_INSTRUCTION, applyClaudeToolPrefix, stripClaudeToolPrefix } from "../oauth/anthropic";
+import { ANTHROPIC_OAUTH_BETA, CLAUDE_CODE_SYSTEM_INSTRUCTION, applyClaudeToolPrefix, prependClaudeIdentity, stripClaudeToolPrefix } from "../oauth/anthropic";
 import { parseComboModelId } from "../combos/identifiers";
 import { parseDataUrl } from "./image";
 import { enforceAnthropicImageLimits } from "./anthropic-image-guard";
@@ -702,22 +702,6 @@ function rejectsForcedToolChoice(modelId: string): boolean {
   return parsed?.family === "opus" && parsed.major === 5 && parsed.minor === 5;
 }
 
-const CLAUDE_IDENTITY_LINE = /^You are (Claude Code, Anthropic's official CLI for Claude|a Claude agent, built on Anthropic's Claude Agent SDK)/;
-
-/**
- * OAuth (subscription) credentials expect a Claude Code identity system block. The translated
- * path always adds it; a replayed source body from a non-Claude-Code client (e.g. Hermes) has
- * none, and upstream answers it 429 "Error". Claude Code's own bodies already carry the line
- * (often after its billing-header block), so any identified block counts and nothing is doubled.
- */
-export function prependClaudeIdentity(body: Record<string, unknown>): void {
-  const system = typeof body.system === "string"
-    ? (body.system ? [{ type: "text", text: body.system }] : [])
-    : Array.isArray(body.system) ? body.system : [];
-  if (system.some(block => typeof block?.text === "string" && CLAUDE_IDENTITY_LINE.test(block.text.trimStart()))) return;
-  body.system = [{ type: "text", text: CLAUDE_CODE_SYSTEM_INSTRUCTION }, ...system];
-}
-
 const ANTHROPIC_SOURCE_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
 const DISABLED_THINKING_SOURCE_EFFORTS = new Set(["low", "medium", "high"]);
 
@@ -1229,8 +1213,7 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
       if (source
         && isExactCanonicalAnthropicMessagesUrl(url)
         && canReplayAnthropicSource(source.body, parsed.modelId, provider)) {
-        const body = structuredClone(source.body) as Record<string, unknown>;
-        body.model = parsed.modelId;
+        const body: Record<string, unknown> = { ...structuredClone(source.body) as Record<string, unknown>, model: parsed.modelId };
         if (isOAuth) prependClaudeIdentity(body);
         if (!Array.isArray(body.messages)) {
           throw new Error("validated Anthropic source messages missing");
