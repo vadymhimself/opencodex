@@ -124,8 +124,9 @@ describe("a model-scoped weekly 429 cools only that model family", () => {
     try {
       expect(rotateAnthropicAccountOn429(poolEnabled(), ids[0]!, null, "s1", start, opusWeekly(reset), "claude-opus-5")).toBe(ids[1]!);
       expect(warn.mock.calls.map(c => String(c[0])).find(l => l.startsWith("[anthropic-pool] 429 on "))).toEndWith(
-        " model=claude-opus-5 claim=seven_day_opus status=rejected 5h=allowed 7d=allowed"
-        + ` retry-after=- reset=${reset} cooldown=${3 * 86_400}s (reset-derived) scope=opus`);
+        " model=claude-opus-5 retry-after=- 5h-status=allowed 7d-status=allowed representative-claim=seven_day_opus"
+        + ` reset=${reset} status=rejected cooldown=${3 * 86_400}s until ${new Date(reset * 1000).toISOString()}`
+        + " (reset-derived) scope=opus");
     } finally { warn.mockRestore(); }
     expect(getAnthropicAccountHealthSnapshot(ids[0]!, start)).toBeNull();
     expect(getEligibleAnthropicAccounts(start, "opus")).toEqual([ids[1]!]);

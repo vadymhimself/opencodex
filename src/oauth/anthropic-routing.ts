@@ -776,11 +776,16 @@ export function rotateAnthropicAccountOn429(
   const cooldownMs = parsedRetry ?? resetDerived ?? DEFAULT_COOLDOWN_MS;
   const cooldownSource = parsedRetry !== undefined ? "retry-after" : resetDerived !== undefined ? "reset-derived" : "default";
   const failover = isAnthropicAccountPoolEnabled(config) || hasAnthropicFailoverQuorum(now);
-  // Which limit refused is only in these headers: log them on every 429 (no credential is among them).
+  // Which limit refused is only in these headers: log every unified one on every 429 (no credential is among them).
+  const unified: string[] = [];
+  (rateLimitHeaders as Headers | null | undefined)?.forEach?.((value, name) => {
+    if (name.startsWith("anthropic-ratelimit-unified-")) unified.push(`${name.slice(28)}=${value}`);
+  });
   console.warn(`[anthropic-pool] 429 on ${formatAnthropicAccountOrdinal(failedAccountId)} model=${modelId ?? "-"}`
-    + ` claim=${claim ?? "-"} status=${header("status") ?? "-"} 5h=${header("5h-status") ?? "-"} 7d=${header("7d-status") ?? "-"}`
-    + ` retry-after=${retryAfterHeader?.trim() || "-"} reset=${header("reset") ?? "-"}`
-    + (failover ? ` cooldown=${Math.ceil(cooldownMs / 1000)}s (${cooldownSource}) scope=${family ?? "account"}` : " cooldown=none (no failover pool)"));
+    + ` retry-after=${retryAfterHeader?.trim() || "-"} ${unified.join(" ") || "unified=-"}`
+    + (failover
+      ? ` cooldown=${Math.ceil(cooldownMs / 1000)}s until ${new Date(now + cooldownMs).toISOString()} (${cooldownSource}) scope=${family ?? "account"}`
+      : " cooldown=none (no failover pool)"));
   if (!failover) return null;
   upstreamHealth.set(family ? familyKey(failedAccountId, family) : failedAccountId, { cooldownUntil: now + cooldownMs, cooldownSource });
   sweepExpiredOnWrite(now);
