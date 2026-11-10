@@ -85,6 +85,7 @@ import { captureOAuthAccountSelection } from "../oauth/store";
 import {
   anthropicSessionKeyFromParts,
   getAnthropicPoolAccessSnapshot,
+  anthropicModelFamily,
   getAnthropicPoolRetryAfterSeconds,
   isAnthropicAccountPoolEnabled,
   promoteAnthropicActiveAccount,
@@ -1769,10 +1770,10 @@ export async function handleClaudeCountTokens(
                 : null,
               promptCacheKeyIsSharedCohort: translated.cacheKeySource === "system",
             });
-            const selection = resolveAnthropicAccountForSession(sessionKey, config);
+            const selection = resolveAnthropicAccountForSession(sessionKey, config, Date.now(), route.modelId);
             if (!selection.accountId) {
               if (selection.reason === "all-cooled") {
-                const retryAfter = getAnthropicPoolRetryAfterSeconds();
+                const retryAfter = getAnthropicPoolRetryAfterSeconds(Date.now(), anthropicModelFamily(route.modelId));
                 const response = anthropicErrorResponse(
                   429,
                   "All Anthropic OAuth accounts are temporarily rate-limited",

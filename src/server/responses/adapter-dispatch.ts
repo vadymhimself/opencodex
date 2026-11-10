@@ -876,6 +876,7 @@ export async function prepareAdapterExchange(
           anthropicSessionKey,
           Date.now(),
           upstreamResponse.headers,
+          route.modelId,
         );
         if (!nextAccountId) break;
         try { void upstreamResponse.body?.cancel().catch(() => {}); } catch { /* already consumed/closed */ }
