@@ -152,7 +152,7 @@ describe("a model-scoped weekly 429 cools only that model family", () => {
 });
 
 describe("a request-shape 429 does not cool the account", () => {
-  test("an allowed unified status fails only the request, while a header-less 429 still fails over", async () => {
+  test("an allowed unified status fails the request over without cooling either account, while a header-less 429 still cools", async () => {
     const start = Date.now();
     const ids = await seed(2);
     const allowed = new Headers({
@@ -162,10 +162,12 @@ describe("a request-shape 429 does not cool the account", () => {
     });
     const warn = spyOn(console, "warn").mockImplementation(() => {});
     try {
-      expect(rotateAnthropicAccountOn429(poolEnabled(), ids[0]!, "30", "s1", start, allowed, "claude-opus-5")).toBeNull();
-      expect(rotateAnthropicAccountOn429(poolEnabled(), ids[1]!, null, "s2", start, allowed, "claude-sonnet-5-5")).toBeNull();
-      expect(warn.mock.calls.map(c => String(c[0])).filter(l => l.startsWith("[anthropic-pool] 429 on "))
-        .every(l => l.endsWith(" cooldown=none (request refused, account not limited)"))).toBe(true);
+      // Handed back, a combo would move to its next provider and model; the request moves account instead.
+      expect(rotateAnthropicAccountOn429(poolEnabled(), ids[0]!, "30", "s1", start, allowed, "claude-opus-5")).toBe(ids[1]!);
+      expect(rotateAnthropicAccountOn429(poolEnabled(), ids[1]!, null, "s2", start, allowed, "claude-sonnet-5-5")).toBe(ids[0]!);
+      const lines = warn.mock.calls.map(c => String(c[0])).filter(l => l.startsWith("[anthropic-pool] 429 on "));
+      expect(lines.filter(l => l.includes(" model=")).map(l => l.endsWith(" cooldown=none (request refused, account not limited)"))).toEqual([true, true]);
+      expect(lines.filter(l => l.includes("; failing over to "))).toHaveLength(2);
     } finally { warn.mockRestore(); }
     expect(ids.map(id => getAnthropicAccountHealthSnapshot(id, start))).toEqual([null, null]);
     expect(getEligibleAnthropicAccounts(start, "opus")).toEqual(ids);

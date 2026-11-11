@@ -778,9 +778,13 @@ export function rotateAnthropicAccountOn429(
   // A 429 whose unified status says the account is still allowed is not a limit: upstream refused this
   // request's shape (e.g. a replay without the Claude Code identity). Cooling on it benched every client
   // on the account. A rejected window, or a 429 with no unified status at all, still cools as before.
+  // It still fails THIS request over: handed back, a combo moves to its next provider and model, which
+  // loses more cache than the account switch. ponytail: no per-request tried set, so a refusal every
+  // account repeats alternates accounts up to ANTHROPIC_POOL_MAX_FAILOVERS_PER_REQUEST times before the
+  // 429 returns (refused calls bill no tokens); pass the tried accounts in if that shows up in the logs.
   const status = header("status");
   const limited = status === undefined || [status, header("5h-status"), header("7d-status")].includes("rejected");
-  const failover = limited && (isAnthropicAccountPoolEnabled(config) || hasAnthropicFailoverQuorum(now));
+  const failover = isAnthropicAccountPoolEnabled(config) || hasAnthropicFailoverQuorum(now);
   // Which limit refused is only in these headers: log every unified one on every 429 (no credential is among them).
   const unified: string[] = [];
   (rateLimitHeaders as Headers | null | undefined)?.forEach?.((value, name) => {
@@ -788,12 +792,14 @@ export function rotateAnthropicAccountOn429(
   });
   console.warn(`[anthropic-pool] 429 on ${formatAnthropicAccountOrdinal(failedAccountId)} model=${modelId ?? "-"}`
     + ` retry-after=${retryAfterHeader?.trim() || "-"} ${unified.join(" ") || "unified=-"}`
-    + (failover
+    + (failover && limited
       ? ` cooldown=${Math.ceil(cooldownMs / 1000)}s until ${new Date(now + cooldownMs).toISOString()} (${cooldownSource}) scope=${family ?? "account"}`
       : ` cooldown=none (${limited ? "no failover pool" : "request refused, account not limited"})`));
   if (!failover) return null;
-  upstreamHealth.set(family ? familyKey(failedAccountId, family) : failedAccountId, { cooldownUntil: now + cooldownMs, cooldownSource });
-  sweepExpiredOnWrite(now);
+  if (limited) {
+    upstreamHealth.set(family ? familyKey(failedAccountId, family) : failedAccountId, { cooldownUntil: now + cooldownMs, cooldownSource });
+    sweepExpiredOnWrite(now);
+  }
   // Unbind only the session that hit the 429; others on the account move on their own next call.
   const key = normalizeAffinityComponent(sessionKey);
   sessionAffinity.delete(key);
