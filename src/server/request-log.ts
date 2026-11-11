@@ -132,6 +132,8 @@ export interface RequestLogContext {
   firstOutputMs?: number;
   /** Best-effort chat/session correlation for Logs grouping (#330). Opaque; omit when unknown. */
   conversationId?: string;
+  /** `x-claude-code-agent-id` of a Claude Code subagent/teammate request; absent on the main agent. */
+  agentId?: string;
   surface?: "claude" | "claude-desktop" | "grok";
   /** The matched configured key's id. Set ONLY for admissionKind "configured" —
    *  never a sentinel, so a hand-edited entry whose id happens to be "loopback"
@@ -298,6 +300,8 @@ export interface RequestLogEntry {
   accountLogLabel?: string;
   /** Best-effort chat/session correlation for Logs grouping (#330). */
   conversationId?: string;
+  /** `x-claude-code-agent-id` of a Claude Code subagent/teammate request; absent on the main agent. */
+  agentId?: string;
   requestedModel?: string;
   requestedAlias?: string;
   /** Original bare helper model when the opt-in shadow-call route rewrote this request. */
@@ -458,6 +462,7 @@ export function requestLogEntryFromPersistedUsage(entry: PersistedUsageEntry): R
     ...(entry.firstOutputMs !== undefined ? { firstOutputMs: entry.firstOutputMs } : {}),
     ...(isKnownUsageSurface(entry.surface) ? { surface: entry.surface } : {}),
     ...(entry.conversationId ? { conversationId: entry.conversationId } : {}),
+    ...(entry.agentId ? { agentId: entry.agentId } : {}),
     ...(isCodexUsageAccountLogLabel(entry.accountLogLabel)
       ? { accountLogLabel: entry.accountLogLabel }
       : {}),
@@ -640,6 +645,7 @@ export function addRequestLog(entry: RequestLogEntry) {
         ? { accountLogLabel: entry.accountLogLabel }
         : {}),
       ...(entry.conversationId ? { conversationId: entry.conversationId } : {}),
+      ...(entry.agentId ? { agentId: entry.agentId } : {}),
       ...(entry.resolvedModel ? { resolvedModel: entry.resolvedModel } : {}),
       ...(entry.servedModel ? { servedModel: entry.servedModel } : {}),
       ...(entry.wireModel ? { wireModel: entry.wireModel } : {}),
@@ -1582,6 +1588,7 @@ export function addFinalRequestLog(
       ? { accountLogLabel: logCtx.accountLogLabel }
       : {}),
     ...(logCtx.conversationId ? { conversationId: logCtx.conversationId } : {}),
+    ...(logCtx.agentId ? { agentId: logCtx.agentId } : {}),
     ...(logCtx.requestedModel ? { requestedModel: logCtx.requestedModel } : {}),
     ...(logCtx.requestedAlias ? { requestedAlias: logCtx.requestedAlias } : {}),
     ...(shadowCallRewrittenFrom ? { shadowCallRewrittenFrom } : {}),
