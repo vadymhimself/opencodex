@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { mapReasoningEffort } from "../../src/reasoning-effort";
 import { NoEnabledOpenAiProviderError, routeCompactionModel, routeModel } from "../../src/router";
+import { enrichProviderFromRegistry } from "../../src/providers/derive";
 import type { OcxConfig, OcxProviderConfig } from "../../src/types";
 
 describe("routeModel registry effort defaults", () => {
@@ -770,5 +771,37 @@ describe("routeCompactionModel (#2901)", () => {
       },
     };
     expect(() => routeCompactionModel(openAiDefaultDisabled, "gpt-5.6-sol")).toThrow(NoEnabledOpenAiProviderError);
+  });
+});
+
+describe("AgentRadar: an API key never takes the sign-ins' traffic (AGE-2278)", () => {
+  // Enriched from the registry like a loaded config, so default models and model lists are live.
+  const providers = (entries: Record<string, OcxProviderConfig>): OcxConfig => {
+    for (const [name, prov] of Object.entries(entries)) enrichProviderFromRegistry(name, prov);
+    return { port: 10100, defaultProvider: "anthropic", providers: entries };
+  };
+  const anthropicKey = (): OcxProviderConfig => ({ adapter: "anthropic", baseUrl: "https://api.anthropic.com", apiKey: "sk-test" });
+  const xaiKey = (): OcxProviderConfig => ({ adapter: "openai-chat", baseUrl: "https://api.x.ai/v1", apiKey: "xai-test" });
+  const bare = ["claude-sonnet-5", "claude-opus-5", "grok-4.5", "grok-4.3"];
+
+  test("control: a key alone serves the bare ids", () => {
+    const keysOnly = providers({ "anthropic-apikey": anthropicKey(), "xai-apikey": xaiKey() });
+    expect(bare.map(model => routeModel(keysOnly, model).providerName))
+      .toEqual(["anthropic-apikey", "anthropic-apikey", "xai-apikey", "xai-apikey"]);
+  });
+
+  test("keys written before the sign-ins still leave every bare id on the sign-ins", () => {
+    const config = providers({
+      "anthropic-apikey": anthropicKey(),
+      "xai-apikey": xaiKey(),
+      anthropic: { adapter: "anthropic", baseUrl: "https://api.anthropic.com" },
+      xai: { adapter: "openai-chat", baseUrl: "https://api.x.ai/v1" },
+    });
+    expect(bare.map(model => routeModel(config, model).providerName)).toEqual(["anthropic", "anthropic", "xai", "xai"]);
+    expect(routeModel(config, "xai/grok-4.5").provider.authMode).toBe("oauth");
+    // The key is reached only by its own namespace.
+    expect(routeModel(config, "anthropic-apikey/claude-opus-5").providerName).toBe("anthropic-apikey");
+    const viaKey = routeModel(config, "xai-apikey/grok-4.5");
+    expect([viaKey.providerName, viaKey.provider.authMode ?? "key", viaKey.modelId]).toEqual(["xai-apikey", "key", "grok-4.5"]);
   });
 });
