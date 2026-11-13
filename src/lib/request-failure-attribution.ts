@@ -99,6 +99,7 @@ const STATUS_CONFIRMED_RECOVERY_KINDS: Readonly<Partial<Record<AttemptRecoveryKi
   "opaque-blob-rejection": 400,
   "reasoning-effort-downgrade": 400,
   "anthropic-fast-downgrade": 400,
+  "anthropic-thinking-replay": 400,
 });
 
 function refinedFourHundredCause(

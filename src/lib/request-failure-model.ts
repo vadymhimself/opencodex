@@ -239,6 +239,9 @@ const RECOVERY_KIND_CAUSE = {
   // Anthropic refused `speed: "fast"` (no usage credits, org not enabled, model outside the
   // lane); the same turn succeeds once the parameter is dropped.
   "anthropic-fast-downgrade": "parameter-rejected",
+  // Anthropic rejected a replayed thinking-block signature (minted by another model or account);
+  // the same turn succeeds once the history thinking blocks are dropped.
+  "anthropic-thinking-replay": "ciphertext-refusal",
 } as const satisfies Record<AttemptRecoveryKind, RequestFailureCause>;
 
 export function causeForRecoveryKind(kind: AttemptRecoveryKind): RequestFailureCause {

@@ -917,6 +917,7 @@ export const de: Record<TKey, string> = {
   "logs.detail.attempt.recovery.opaqueBlobRejection": "Veralteter verschlüsselter Zustand verworfen",
   "logs.detail.attempt.recovery.reasoningEffortDowngrade": "Reasoning-Aufwand reduziert",
   "logs.detail.attempt.recovery.anthropicFastDowngrade": "Schnellmodus abgelehnt, erneut mit Standardtempo versucht",
+  "logs.detail.attempt.recovery.anthropicThinkingReplay": "Denk-Signatur abgelehnt, erneut ohne frühere Denkblöcke versucht",
   "logs.detail.outcome.label": "Ergebnis",
   "logs.detail.outcome.completed": "Abgeschlossen",
   "logs.detail.outcome.failed": "Fehlgeschlagen",

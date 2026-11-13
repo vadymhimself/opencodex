@@ -358,6 +358,30 @@ export async function anthropicFastRefused(
   }
 }
 
+/**
+ * Anthropic answers 400 "messages.N.content.M: Invalid `signature` in `thinking` block" when a
+ * replayed thinking block was signed by a different model or account than the one now serving the
+ * turn. A signature carries no readable origin and the raw Messages lane forwards the caller's
+ * history byte for byte, so the proxy cannot tell beforehand; it resends once without the history
+ * thinking blocks. Anthropic's own docs allow omitting them; the adapter handles an open tool loop.
+ */
+const THINKING_SIGNATURE_REJECTION = /Invalid `signature` in `(?:redacted_)?thinking` block/;
+
+export async function anthropicThinkingSignatureRejected(
+  response: Response,
+  adapterName: string,
+  alreadyAttempted: boolean,
+  signal: AbortSignal,
+): Promise<boolean> {
+  if (alreadyAttempted || adapterName !== "anthropic" || response.status !== 400) return false;
+  try {
+    const body = await readBoundedResponseBody(response.clone(), { signal });
+    return body.displaySafe && !body.truncated && THINKING_SIGNATURE_REJECTION.test(body.text);
+  } catch {
+    return false;
+  }
+}
+
 export async function opaqueBlobRejectionBodyForRecovery(
   response: Response,
   outboundBody: string | undefined,

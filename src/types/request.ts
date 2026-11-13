@@ -304,6 +304,8 @@ export interface OcxRequestOptions {
   serviceTier?: string;
   /** Final outbound tier action, resolved after the provider/model wire is settled. */
   tierDecision?: TierDecision;
+  /** Internal: set by the 400 "Invalid `signature` in `thinking` block" recovery; the Anthropic adapter drops history thinking blocks. */
+  dropThinkingHistory?: boolean;
   /** Internal B0 observation inputs; adapters combine these with the wire they actually serialize. */
   tierObservation?: TierObservationContext;
   presencePenalty?: number;

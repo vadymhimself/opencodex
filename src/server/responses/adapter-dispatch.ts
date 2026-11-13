@@ -66,6 +66,7 @@ import {
   CONSOLE_GO_UPLOAD_RETRY_DELAY_MS,
   reasoningEffortRejectionText,
   anthropicFastRefused,
+  anthropicThinkingSignatureRejected,
 } from "./core-opaque-recovery";
 import { shouldAttemptImageTierRetry } from "../image-retry";
 import {
@@ -423,6 +424,7 @@ export async function prepareAdapterExchange(
     // adapter, and imageTierBias — once armed — rides EVERY subsequent rebuild so a
     // 413→429 rotation cannot silently undo the tightening.
     let imageRetryAttempted = false;
+    const thinkingReplayGuard: { attempted: boolean } = { attempted: false };
     const opaqueBlobRecoveryGuard: OpaqueBlobRecoveryGuard = { attempted: false };
     // Console Go answers a transient 400 "Invalid upload request." for bodies it accepts
     // moments later; at most one byte-identical replay is allowed per request.
@@ -1058,6 +1060,24 @@ export async function prepareAdapterExchange(
         invalidateSameTargetRequest();
         try { void upstreamResponse.body?.cancel().catch(() => {}); } catch { /* already consumed/closed */ }
         const result = await rebuildAndRefetch("image-413");
+        if ("failed" in result) return result.failed;
+        upstreamResponse = result;
+        continue recovery;
+      }
+      // Anthropic 400 "Invalid `signature` in `thinking` block": a replayed thinking block was signed
+      // by another model or account. Resend once without the history thinking blocks (spiral guard:
+      // single attempt); the adapter turns thinking off for an open tool loop.
+      if (await anthropicThinkingSignatureRejected(
+        upstreamResponse,
+        transportState.activeAdapter.name,
+        thinkingReplayGuard.attempted,
+        upstream.signal,
+      )) {
+        thinkingReplayGuard.attempted = true;
+        parsed.options.dropThinkingHistory = true;
+        invalidateSameTargetRequest();
+        try { void upstreamResponse.body?.cancel().catch(() => {}); } catch { /* already consumed/closed */ }
+        const result = await rebuildAndRefetch("anthropic-thinking-replay");
         if ("failed" in result) return result.failed;
         upstreamResponse = result;
         continue recovery;
