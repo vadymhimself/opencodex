@@ -752,16 +752,12 @@ describe("Qwen reasoning wire contracts", () => {
     expect(body).not.toHaveProperty("reasoning_effort");
   });
 
-  test("minimal Qwen reasoning maps to a zero budget", () => {
+  test("minimal Qwen reasoning sends no thinking_budget (a zero budget is refused as invalid_parameter)", () => {
     const req = buildChatRequest(budgetProvider, "qwen3.5-397b", { reasoning: "minimal", maxOutputTokens: 10000 });
     const body = JSON.parse(req.body) as Record<string, unknown>;
-    expect(body.thinking_budget).toBe(0);
+    expect(body).not.toHaveProperty("thinking_budget");
     expect(body).not.toHaveProperty("reasoning_effort");
-    expect(req.reasoningLog).toEqual({
-      effectiveEffort: "minimal",
-      wireField: "thinking_budget",
-      wireValue: 0,
-    });
+    expect(req.reasoningLog).toBeUndefined();
   });
 
   test("routed Qwen models advertise five levels and send thinking_budget over openai-chat", () => {

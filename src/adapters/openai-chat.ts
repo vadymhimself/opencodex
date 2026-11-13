@@ -58,7 +58,7 @@ function resolveMaxTokens(provider: OcxProviderConfig, parsed: OcxParsedRequest)
 }
 
 function thinkingBudgetForEffort(parsed: OcxParsedRequest, reasoningEffort: string, maxOutputTokens?: number): number | undefined {
-  if (parsed.options.reasoning === "minimal") return 0;
+  if (parsed.options.reasoning === "minimal") return undefined; // AGE-2004: providers refuse thinking_budget 0 (invalid_parameter); send none
   const maxBudget = maxOutputTokens ?? 32768;
   const fractions: Record<string, number> = {
     low: 0.20,
@@ -167,7 +167,7 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
             if (budget !== undefined) {
               body.thinking_budget = budget;
               reasoningLog = {
-                effectiveEffort: parsed.options.reasoning === "minimal" ? "minimal" : reasoningEffort,
+                effectiveEffort: reasoningEffort,
                 wireField: "thinking_budget",
                 wireValue: budget,
               };
