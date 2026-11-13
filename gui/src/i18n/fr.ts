@@ -942,6 +942,7 @@ export const fr: Record<TKey, string> = {
   "logs.detail.attempt.recovery.opaqueBlobRejection": "État chiffré obsolète abandonné",
   "logs.detail.attempt.recovery.reasoningEffortDowngrade": "Effort de raisonnement réduit",
   "logs.detail.attempt.recovery.anthropicFastDowngrade": "Mode rapide refusé, nouvel essai à vitesse standard",
+  "logs.detail.attempt.recovery.anthropicThinkingReplay": "Signature de réflexion refusée, nouvel essai sans les blocs de réflexion précédents",
   "logs.detail.outcome.label": "Résultat",
   "logs.detail.outcome.completed": "Terminé",
   "logs.detail.outcome.failed": "Échec",

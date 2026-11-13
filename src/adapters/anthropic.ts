@@ -322,6 +322,40 @@ function isLikelyRealAnthropicThinkingSignature(signature: string | undefined): 
 }
 
 /**
+ * 400 recovery for "Invalid `signature` in `thinking` block" (`parsed.options.dropThinkingHistory`):
+ * remove every thinking/redacted_thinking block from the replayed history. Anthropic allows
+ * omitting them, except on the assistant turn of an open tool loop when thinking is on, so the
+ * return value says the LAST assistant turn lost its blocks while holding a tool_use and the
+ * caller must send this one call with thinking off.
+ */
+function dropThinkingFromMessages(messages: unknown[]): boolean {
+  let lostInLoop = false;
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i] as { role?: unknown; content?: unknown } | null;
+    if (message?.role !== "assistant") continue;
+    lostInLoop = false;
+    if (!Array.isArray(message.content)) continue;
+    const kept = message.content.filter(block => {
+      const type = (block as { type?: unknown } | null)?.type;
+      return type !== "thinking" && type !== "redacted_thinking";
+    });
+    if (kept.length === message.content.length) continue;
+    if (kept.length === 0) {
+      messages.splice(i--, 1);
+      continue;
+    }
+    message.content = kept;
+    lostInLoop = kept.some(block => (block as { type?: unknown } | null)?.type === "tool_use");
+  }
+  return lostInLoop;
+}
+
+function turnThinkingOff(body: Record<string, unknown>, modelId: string): void {
+  if (supportsExplicitThinkingDisable(modelId)) body.thinking = { type: "disabled" };
+  else delete body.thinking;
+}
+
+/**
  * Bridge error fidelity (web-search/images loops): extract a display-safe summary from an
  * Anthropic JSON error envelope so `Provider error <status>` carries the upstream reason.
  * JSON-only extraction — HTML/non-JSON bodies yield "" so raw markup is never echoed.
@@ -960,7 +994,10 @@ function orphanToolResultContent(msg: OcxToolResultMessage): string | unknown[] 
 function messagesToAnthropicFormat(
   parsed: OcxParsedRequest,
   toolNames: { toWire: (name: string) => string },
-): { system: string | undefined; messages: unknown[] } {
+): { system: string | undefined; messages: unknown[]; thinkingDroppedInLoop: boolean } {
+  // True when the LAST assistant turn held a tool_use and lost its thinking blocks to the
+  // dropThinkingHistory recovery; the caller then sends the call with thinking off.
+  let thinkingDroppedInLoop = false;
   // One allocator for the whole request: a tool_result must resolve to the SAME wire id its
   // call got, and two distinct raw ids must never collapse into one. Conforming ids are claimed
   // first so a rewritten id can never squat on an id another call legitimately owns.
@@ -1008,12 +1045,17 @@ function messagesToAnthropicFormat(
         const preface: unknown[] = [];
         const toolUses: unknown[] = [];
         const toolUseIds: string[] = [];
+        let droppedThinking = false;
         for (const part of aMsg.content) {
           if (part.type === "text") {
             const text = (part as OcxTextContent).text;
             if (text) preface.push({ type: "text", text });
           } else if (part.type === "thinking") {
             const t = part as OcxThinkingContent;
+            if (parsed.options.dropThinkingHistory) {
+              droppedThinking = true;
+              continue;
+            }
             // Redacted blocks replay verbatim FIRST (they preceded the visible thinking block
             // in the original stream order preserved by the bridge envelope).
             for (const data of t.redacted ?? []) {
@@ -1041,6 +1083,7 @@ function messagesToAnthropicFormat(
         // Anthropic treats text/thinking after tool_use as ending the tool turn, which makes
         // earlier tool_use ids look unpaired (#620 / common multi-step history shape).
         const content = [...preface, ...toolUses];
+        thinkingDroppedInLoop = droppedThinking && toolUses.length > 0;
         if (content.length === 0) break;
         messages.push({ role: "assistant", content });
         if (toolUseIds.length > 0) {
@@ -1098,7 +1141,7 @@ function messagesToAnthropicFormat(
     messages.push({ role: "user", content: "(continue)" });
   }
 
-  return { system, messages };
+  return { system, messages, thinkingDroppedInLoop };
 }
 
 function toolsToAnthropicFormat(parsed: OcxParsedRequest, toolNames: { toWire: (name: string) => string }): unknown[] | undefined {
@@ -1218,6 +1261,9 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
         if (!Array.isArray(body.messages)) {
           throw new Error("validated Anthropic source messages missing");
         }
+        if (parsed.options.dropThinkingHistory && dropThinkingFromMessages(body.messages)) {
+          turnThinkingOff(body, parsed.modelId);
+        }
         await normalizeAnthropicImages(body.messages, { tierBias: incoming?.imageTierBias ?? 0 });
         enforceAnthropicImageLimits(body.messages);
 
@@ -1277,7 +1323,7 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
         };
       }
 
-      const { system, messages } = messagesToAnthropicFormat(parsed, toolNames);
+      const { system, messages, thinkingDroppedInLoop } = messagesToAnthropicFormat(parsed, toolNames);
       // Before image normalization, so the framing block is present for every downstream pass.
       if (isAgentRouterEndpoint(provider.baseUrl)) applyAgentRouterLanguageFraming(messages);
       // Primary image layer: resize/re-encode to fit Anthropic limits without dropping
@@ -1365,6 +1411,7 @@ export function createAnthropicAdapter(provider: OcxProviderConfig, cacheRetenti
         delete body.temperature;
         delete body.top_p;
       }
+      if (thinkingDroppedInLoop) turnThinkingOff(body, parsed.modelId);
 
       const textFormat = parsed.options.textFormat;
       if (textFormat?.type === "json_schema" && textFormat.schema) {

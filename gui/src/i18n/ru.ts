@@ -934,6 +934,7 @@ export const ru: Record<TKey, string> = {
   "logs.detail.attempt.recovery.opaqueBlobRejection": "Устаревшее зашифрованное состояние отброшено",
   "logs.detail.attempt.recovery.reasoningEffortDowngrade": "Уровень рассуждения понижен",
   "logs.detail.attempt.recovery.anthropicFastDowngrade": "Быстрый режим отклонён, повтор со стандартной скоростью",
+  "logs.detail.attempt.recovery.anthropicThinkingReplay": "Подпись блока рассуждений отклонена, повтор без прежних блоков рассуждений",
   "logs.detail.outcome.label": "Итог",
   "logs.detail.outcome.completed": "Завершено",
   "logs.detail.outcome.failed": "Сбой",
