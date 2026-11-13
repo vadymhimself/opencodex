@@ -5,6 +5,7 @@ import type { ResponsesSidecarAuth } from "./request-sidecar-auth";
 import type { ResponsesEffects } from "./response-effects";
 import type { ResponsesSendBudget } from "./request-send-budget";
 import { formatErrorResponse } from "../../bridge";
+import { refuseMediaBridgeOnPin, refuseWebSearchOnPin } from "./pinned-helper-refusal";
 import { planWebSearch, buildWebSearchTool, runWithWebSearch } from "../../web-search";
 import {
   planImageBridge,
@@ -161,8 +162,10 @@ export async function executeResponsesSidecars(
     : undefined;
   const imgPlan = canPlanSidecars ? await planImageBridge(config, parsed, route.provider) : undefined;
   const vidPlan = canPlanSidecars ? await planVideoBridge(config, parsed, route.provider) : undefined;
-  if (options.agentRadarAccount && ((wsPlan && !(options.agentRadarAccount.provider === "claude" && wsPlan.backend === "anthropic"))
-    || imgPlan || vidPlan)) return formatErrorResponse(400, "invalid_request_error", "AgentRadar pinned requests cannot use helper models (vision, image or video bridge, or web search outside a Claude pin)");
+  if (options.agentRadarAccount) {
+    if (wsPlan && !(options.agentRadarAccount.provider === "claude" && wsPlan.backend === "anthropic")) return refuseWebSearchOnPin();
+    if (imgPlan || vidPlan) return refuseMediaBridgeOnPin();
+  }
   const canRunWebSearch = !!wsPlan && !transportState.adapter.runTurn;
   const rotateSidecarProviderOn429 = async (
     retryAfter: string | null,

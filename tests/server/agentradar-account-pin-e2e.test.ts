@@ -207,7 +207,7 @@ test("an AgentRadar account pin serves exactly its own stored account (pin.check
     assert.equal(r.status, 200, r.text);
     assert.ok(inference(r).length >= 2 && !inference(r).at(-1)!.image, `no vision describe planned: ${JSON.stringify(r.upstream)}`);
     r = await call(ocx, "/v1/messages", blindImage, { "anthropic-version": "2023-06-01", "x-api-key": "unused", ...pin("claude", "A") });
-    assert.equal(r.status, 400, `${r.text}\n${JSON.stringify(r.upstream)}`); assert.deepEqual(inference(r), []);
+    assert.equal(r.status, 400, `${r.text}\n${JSON.stringify(r.upstream)}`); assert.match(r.text, /contains an image.*no vision helper was allowed to run/); assert.deepEqual(inference(r), []);
     // Surfaces that do not honour a pin refuse it instead of serving the active account.
     r = await call(ocx, "/v1/responses", { model: "anthropic/claude-stub", input: "hi" }, pin("claude", "A"));
     assert.equal(r.status, 400, r.text); assert.match(r.text, /only honoured on/); assert.deepEqual(inference(r), []);
@@ -222,7 +222,7 @@ test("an AgentRadar account pin serves exactly its own stored account (pin.check
     assert.deepEqual([...new Set(tokens(r, "/v1/messages"))], ["Bearer atA"], JSON.stringify(r.upstream));
     // Grok and Codex have no helper that can run on their pin: still refused.
     r = await call(ocx, "/v1/chat/completions", { model: "xai/grok-stub", messages: [{ role: "user", content: "hi" }], tools: [{ type: "web_search" }] }, pin("grok", "gA"));
-    assert.equal(r.status, 400, r.text); assert.match(r.text, /cannot use helper models/); assert.deepEqual(inference(r), []);
+    assert.equal(r.status, 400, r.text); assert.match(r.text, /web_search tool.*no search helper was allowed to run/); assert.deepEqual(inference(r), []);
     assert.equal((await accounts(ocx, "anthropic")).activeAccountId, "B", "pins never move the active account");
 
     // Claude 429 on the pinned account: returned as is, cooldown recorded, no switch to B.
