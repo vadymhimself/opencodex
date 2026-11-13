@@ -32,7 +32,7 @@ const fake = Bun.serve({
     const tools: any[] = path === "/v1/messages" ? JSON.parse(body).tools ?? [] : [];
     // The helper's own call carries Anthropic's native search tool; the turn it serves carries OCX's web_search function.
     const search = tools.some(t => t.type === "web_search_20250305");
-    if (path === "/v1/messages" || path === "/backend-api/codex/responses" || path.startsWith("/xai/") || path.startsWith("/kimi/")) {
+    if (path === "/v1/messages" || path === "/backend-api/codex/responses" || path.startsWith("/xai/") || path.startsWith("/kimi/") || path.startsWith("/copilot/")) {
       seen.push({ path, auth, account: req.headers.get("chatgpt-account-id"), internal: [...req.headers.keys()].filter(k => k.startsWith("x-agentradar-")), search, image: body.includes('"type":"image"') });
     }
     if (path === "/v1/messages") {
@@ -56,7 +56,7 @@ const fake = Bun.serve({
         ["message_stop", {}],
       ]);
     }
-    if (path.startsWith("/xai/") || path.startsWith("/kimi/")) return rateLimited(retryAfter);
+    if (path.startsWith("/xai/") || path.startsWith("/kimi/") || path.startsWith("/copilot/")) return rateLimited(retryAfter);
     if (path === "/backend-api/codex/responses") {
       const item = { type: "message", id: "msg_fake", role: "assistant", status: "completed", content: [{ type: "output_text", text: "ok", annotations: [] }] };
       const response = { id: "resp_fake", object: "response", model: "gpt-5.5", status: "in_progress", output: [] };
@@ -90,7 +90,7 @@ async function startOcx(auth: object, config: object) {
 globalThis.fetch = ((input: any, init?: any) => {
   const u = new URL(input instanceof Request ? input.url : String(input));
   if (u.hostname === "127.0.0.1" || u.hostname === "localhost") return real(input, init);
-  const base = ${JSON.stringify(FAKE)} + (u.hostname === "api.x.ai" || u.hostname === "cli-chat-proxy.grok.com" ? "/xai" : u.hostname === "api.kimi.com" ? "/kimi" : "");
+  const base = ${JSON.stringify(FAKE)} + (u.hostname === "api.x.ai" || u.hostname === "cli-chat-proxy.grok.com" ? "/xai" : u.hostname === "api.kimi.com" ? "/kimi" : u.hostname === "api.githubcopilot.com" ? "/copilot" : "");
   return real(new Request(base + u.pathname + u.search, new Request(input, init)));
 }) as typeof fetch;
 `);
@@ -153,6 +153,7 @@ test("an AgentRadar account pin serves exactly its own stored account (pin.check
       { id: "D", credential: cred("atD") }, { id: "E", credential: cred("atE") }] },
     xai: { activeAccountId: "gB", accounts: ["gA", "gB", "gC"].map(id => ({ id, credential: cred(`t${id}`) })) },
     kimi: { activeAccountId: "kB", accounts: ["kA", "kB"].map(id => ({ id, credential: cred(`t${id}`) })) },
+    "github-copilot": { activeAccountId: "cB", accounts: ["cA", "cB"].map(id => ({ id, credential: cred(`t${id}`) })) },
   }, {
     defaultProvider: "anthropic", activeCodexAccountId: "acct2",
     clientIntegrations: { codex: false },
@@ -162,6 +163,7 @@ test("an AgentRadar account pin serves exactly its own stored account (pin.check
       anthropic: { adapter: "anthropic", baseUrl: FAKE, authMode: "oauth", allowPrivateNetwork: true, models: ["claude-stub", "claude-blind"], modelCapabilities: { "claude-blind": { inputModalities: ["text"] } } },
       xai: { adapter: "openai-chat", baseUrl: `${FAKE}/xai`, authMode: "oauth", allowPrivateNetwork: true, models: ["grok-stub"] },
       kimi: { adapter: "openai-chat", baseUrl: `${FAKE}/kimi`, authMode: "oauth", allowPrivateNetwork: true, models: ["kimi-stub"] },
+      "github-copilot": { adapter: "openai-chat", baseUrl: "https://api.githubcopilot.com", authMode: "oauth", models: ["copilot-stub"] },
       openai: { adapter: "openai-responses", baseUrl: "https://chatgpt.com/backend-api/codex", authMode: "forward", codexAccountMode: "pool" },
     },
     codexAccounts: [1, 2].map(n => ({ id: `acct${n}`, email: `c${n}@example.invalid`, isMain: false, chatgptAccountId: `cga${n}` })),
@@ -194,7 +196,7 @@ test("an AgentRadar account pin serves exactly its own stored account (pin.check
       assert.equal(r.served, null);
     }
     // A pin cannot be spent on another provider's route.
-    for (const h of [pin("grok", "gA"), pin("kimi", "kA"), pin("codex", "acct1")]) {
+    for (const h of [pin("grok", "gA"), pin("kimi", "kA"), pin("copilot", "cA"), pin("cursor", "cA"), pin("devin", "cA"), pin("codex", "acct1")]) {
       r = await msg(ocx, h);
       assert.equal(r.status, 404, r.text); assert.deepEqual(inference(r), []);
     }
@@ -268,6 +270,13 @@ test("an AgentRadar account pin serves exactly its own stored account (pin.check
     assert.equal(r.status, 429, `${r.text}\n${JSON.stringify(r.upstream)}`); assert.deepEqual(tokens(r, "/kimi/"), ["Bearer tkA"]);
     assert.equal((await accounts(ocx, "kimi")).activeAccountId, "kB");
     r = await chat(ocx, "xai/grok-stub", pin("kimi", "kA"));
+    assert.equal(r.status, 404, r.text); assert.deepEqual(inference(r), []);
+
+    // GitHub Copilot (AGE-2323, every call 429s): the pinned account alone, the active account stays, and its pin buys no other route.
+    r = await chat(ocx, "github-copilot/copilot-stub", pin("copilot", "cA"));
+    assert.equal(r.status, 429, `${r.text}\n${JSON.stringify(r.upstream)}`); assert.deepEqual(tokens(r, "/copilot/"), ["Bearer tcA"]);
+    assert.equal((await accounts(ocx, "github-copilot")).activeAccountId, "cB");
+    r = await chat(ocx, "kimi/kimi-stub", pin("copilot", "cA"));
     assert.equal(r.status, 404, r.text); assert.deepEqual(inference(r), []);
 
     // Codex: OCX's exact-account route serves the pinned account; the active account is untouched.

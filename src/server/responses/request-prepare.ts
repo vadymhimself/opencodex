@@ -1,4 +1,5 @@
 import type { ResponsesRequestContext, ResponsesAdmissionState, ResponsesDispatchers } from "./core-options";
+import { AGENTRADAR_PIN_PROVIDERS } from "./core-options";
 import {
   agentTaskRecoveryConfig,
   restoreCachedEncryptedAgentTasks,
@@ -468,7 +469,7 @@ export async function prepareResponsesRequest(
       const served = !candidate.combo && (pin.provider === "codex"
         ? candidate.providerName === OPENAI_CODEX_PROVIDER_ID && candidate.codexAccountMode !== undefined
         : candidate.provider.authMode === "oauth"
-          && candidate.providerName === (pin.provider === "claude" ? "anthropic" : pin.provider === "grok" ? "xai" : "kimi"));
+          && candidate.providerName === AGENTRADAR_PIN_PROVIDERS[pin.provider]);
       if (!served) throw new Error("AgentRadar pinned account cannot serve this route");
       if (pin.provider === "codex") {
         Object.assign(candidate, { codexAccountMode: "pool", codexAccountId: pin.accountId, codexAccountNamespace: undefined });
