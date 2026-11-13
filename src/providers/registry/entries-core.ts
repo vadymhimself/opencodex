@@ -109,7 +109,7 @@ const ANTHROPIC_FAST_MODELS: Readonly<Record<string, boolean>> = Object.freeze({
 const ANTHROPIC_FAST_TIER_DESCRIPTION =
   "Claude fast mode: faster output at 2x price; needs usage credits (subscription) or fast-mode access (API)";
 
-export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
+export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = withXaiKeyEntry([
   {
     id: "openai",
     label: "OpenAI (Codex login)",
@@ -1408,4 +1408,22 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
     },
     note: "Serverless Inference subscription API. Live discovery exposes only kimi-k2-instruct because Vultr documents it as the sole tool-calling model.",
   },
-];
+]);
+
+/**
+ * AgentRadar image patch (AGE-2278): xAI by API key as its own provider, next to the OpenAI and
+ * Anthropic key rows. A company key on the `xai` row would replace the Grok sign-ins through
+ * allowKeyAuthOverride; here it stays separate. Same lineup and wire metadata as `xai`, and no
+ * default model, so a bare model id still reaches the sign-in.
+ */
+function withXaiKeyEntry(entries: ProviderRegistryEntry[]): ProviderRegistryEntry[] {
+  const {
+    oauthId: _oauthId, allowKeyAuthOverride: _override, keyAuthServiceTier: _keyTier, modelSupportsServiceTier: _oauthTier,
+    featured: _featured, jawcodeBundle: _jawcode, defaultModel: _defaultModel, ...shared
+  } = entries.find(entry => entry.id === "xai")!;
+  entries.splice(entries.findIndex(entry => entry.id === "openai-apikey") + 1, 0, {
+    ...shared, id: "xai-apikey", label: "xAI (API key)", authKind: "key", supportsServiceTier: true,
+    dashboardUrl: "https://console.x.ai", note: "Direct xAI API billing, no Grok subscription",
+  });
+  return entries;
+}

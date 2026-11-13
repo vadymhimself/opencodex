@@ -509,9 +509,12 @@ export function routedProviderConfig(providerName: string, provider: OcxProvider
   return resolved;
 }
 
+// AgentRadar image patch (AGE-2278): a bare model id reaches a signed-in provider before its `-apikey`
+// twin, whatever order the config was written in, so adding an API key never takes the logins' traffic.
 function activeProviderEntries(config: OcxConfig): [string, OcxProviderConfig][] {
-  return Object.entries(config.providers)
+  const active = Object.entries(config.providers)
     .filter(([name, provider]) => name !== LEGACY_CHATGPT_PROVIDER_ID && provider.disabled !== true);
+  return [...active.filter(([name]) => !name.endsWith("-apikey")), ...active.filter(([name]) => name.endsWith("-apikey"))];
 }
 
 export class NoEnabledOpenAiProviderError extends Error {
@@ -960,8 +963,8 @@ export function routeConcreteModel(config: OcxConfig, modelId: string): RouteRes
 function routeByKnownModelPattern(config: OcxConfig, modelId: string): RouteResult | undefined {
   for (const { providerNames, prefixes } of MODEL_PROVIDER_PATTERNS) {
     if (prefixes.some(prefix => modelId.startsWith(prefix))) {
-      const matchingProvider = Object.entries(config.providers).find(
-        ([name, prov]) => prov.disabled !== true && providerNames.some(providerName => name === providerName || name.startsWith(`${providerName}-`))
+      const matchingProvider = activeProviderEntries(config).find(
+        ([name]) => providerNames.some(providerName => name === providerName || name.startsWith(`${providerName}-`))
       );
       if (matchingProvider) {
         const [provName, prov] = matchingProvider;
