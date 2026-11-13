@@ -56,7 +56,9 @@ export interface ConsumedComboFailure {
 
 /** AgentRadar image patch: trusted per-request account pin, set only by the authenticated bridge. */
 export const AGENTRADAR_PIN = Symbol.for("agentradar.accountPin");
-export interface AgentRadarAccountPin { provider: "claude" | "codex" | "grok" | "kimi"; accountId: string }
+/** AgentRadar sign-in provider -> the OCX OAuth provider whose stored account a pin may serve (codex rides its own pool). */
+export const AGENTRADAR_PIN_PROVIDERS = { claude: "anthropic", grok: "xai", kimi: "kimi", copilot: "github-copilot", cursor: "cursor", devin: "devin" } as const;
+export interface AgentRadarAccountPin { provider: keyof typeof AGENTRADAR_PIN_PROVIDERS | "codex"; accountId: string }
 /** undefined = no pin; null = malformed pin, which must be refused rather than served unpinned. */
 export function agentRadarAccountPin(headers: Headers): AgentRadarAccountPin | null | undefined {
   const accountId = headers.get("x-agentradar-account-id");
@@ -65,7 +67,8 @@ export function agentRadarAccountPin(headers: Headers): AgentRadarAccountPin | n
   // Only an AgentRadar gateway (OPENCODEX_AGENTRADAR=1) trusts the pin; elsewhere it is refused, never ignored.
   if (process.env.OPENCODEX_AGENTRADAR !== "1") return null;
   if (!accountId || !/^[!-~]{1,256}$/.test(accountId)) return null; // printable ASCII, no spaces
-  return provider === "claude" || provider === "codex" || provider === "grok" || provider === "kimi" ? { provider, accountId } : null;
+  return provider === "codex" || (provider !== null && Object.hasOwn(AGENTRADAR_PIN_PROVIDERS, provider))
+    ? { provider: provider as AgentRadarAccountPin["provider"], accountId } : null;
 }
 /**
  * Names the stored account that served the turn (an opaque pool id, never an email or token) so
