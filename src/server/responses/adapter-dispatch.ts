@@ -54,6 +54,7 @@ import {
   getAnthropicPoolAccessSnapshot,
   formatAnthropicProviderForLog,
 } from "../../oauth/anthropic-routing";
+import { peekAnthropicPoolRotation } from "../../oauth/anthropic-pool-rotation";
 import {
   GENERIC_OAUTH_MAX_FAILOVERS_PER_REQUEST,
   isGenericOAuthFailoverEnabled,
@@ -864,11 +865,21 @@ export async function prepareAdapterExchange(
 
       // Opt-in Anthropic OAuth account pool (#294): cool the failed account and retry
       // with another eligible OAuth account (bounded per request). Disabled by default.
+      // Also on Anthropic's out-of-extra-usage 400: the account is spent, the pool may not be.
       while (
-        upstreamResponse.status === 429
-        && transportState.anthropicPoolAccountId
+        transportState.anthropicPoolAccountId
         && transportState.anthropicPoolFailovers < ANTHROPIC_POOL_MAX_FAILOVERS_PER_REQUEST
       ) {
+        let poolRotation: Awaited<ReturnType<typeof peekAnthropicPoolRotation>>;
+        try {
+          poolRotation = await peekAnthropicPoolRotation(upstreamResponse, options.abortSignal);
+        } catch {
+          cleanupUpstreamAbort();
+          upstream.abort();
+          return clientCancelledResponse();
+        }
+        upstreamResponse = poolRotation.response;
+        if (!poolRotation.trigger) break;
         const nextAccountId = rotateAnthropicAccountOn429(
           config,
           transportState.anthropicPoolAccountId,
@@ -877,6 +888,7 @@ export async function prepareAdapterExchange(
           Date.now(),
           upstreamResponse.headers,
           route.modelId,
+          poolRotation.trigger,
         );
         if (!nextAccountId) break;
         try { void upstreamResponse.body?.cancel().catch(() => {}); } catch { /* already consumed/closed */ }

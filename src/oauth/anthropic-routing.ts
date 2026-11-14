@@ -36,6 +36,7 @@ import type { OcxAccountPoolQuotaWindow, OcxAccountPoolRotationStrategy, OcxConf
 import { sweepExpiredOnWrite } from "../lib/state-store-sweeper";
 import { setComboPoolEligibilityProbe } from "../combos/failover";
 import { retainedUtf8Bytes } from "../lib/admission";
+import type { AnthropicPoolRotationTrigger } from "./anthropic-pool-rotation";
 
 /**
  * The read side of a `Headers` object, so a caller can pass the live upstream response's
@@ -47,6 +48,14 @@ export type AnthropicRateLimitHeaders = Pick<Headers, "get">;
 const PROVIDER = "anthropic";
 /** Backoff only when upstream supplies no usable deadline. */
 const DEFAULT_COOLDOWN_MS = 60_000;
+/**
+ * Fallback cooldown for an out-of-extra-usage 400 that names no reset (no Retry-After, no rejected
+ * unified window). The account is spent until a human tops up extra usage or the plan window
+ * resets, so the 60s rate-limit default would only re-send to it every minute for another 400.
+ * Ten minutes is the cooldown the combo layer already gives the same `insufficient_quota`
+ * classification (combos/failover.ts MAX_COOLDOWN_MS, provider-scoped), so the two layers agree.
+ */
+const QUOTA_400_FALLBACK_COOLDOWN_MS = 10 * 60_000;
 const AFFINITY_IDLE_TTL_MS = 24 * 60 * 60_000;
 const MAX_AFFINITY_ENTRIES = 2_000;
 const MAX_AFFINITY_COMPONENT_BYTES = 512;
@@ -744,6 +753,10 @@ export function clearAnthropicSessionAffinityForAccount(accountId: string): void
  * Record a 429 for `failedAccountId`, cool it, unbind the hitting session, and pick a failover
  * account. Does NOT promote the store active account — caller should promote only after a
  * successful retry (or token resolve).
+ *
+ * `trigger: "quota-400"` is Anthropic's out-of-extra-usage HTTP 400 (see anthropic-pool-rotation.ts).
+ * It is quota evidence by itself, so the account always cools, for the same reset-derived window a
+ * quota 429 uses, falling back to QUOTA_400_FALLBACK_COOLDOWN_MS instead of the 60s default.
  */
 export function rotateAnthropicAccountOn429(
   config: OcxConfig,
@@ -753,7 +766,10 @@ export function rotateAnthropicAccountOn429(
   now = Date.now(),
   rateLimitHeaders?: AnthropicRateLimitHeaders | null,
   modelId?: string | null,
+  trigger: AnthropicPoolRotationTrigger = "429",
 ): string | null {
+  const quota400 = trigger === "quota-400";
+  const what = quota400 ? "400 out-of-extra-usage" : "429";
   // Reactive 429 failover is NOT gated on the pool flag. That flag buys PROACTIVE routing --
   // session affinity, quota-ranked new-session selection, autoSwitchThreshold, strategy -- all
   // of which move a HEALTHY request and stay opt-in. Rotating away from an account upstream has
@@ -773,7 +789,7 @@ export function rotateAnthropicAccountOn429(
   const parsedRetry = parseRetryAfterMs(retryAfterHeader, now);
   const resetDerived = parsedRetry !== undefined ? undefined
     : family ? delayUntil(Number(header("reset")) * 1000, now) : parseRateLimitResetMs(rateLimitHeaders, now);
-  const cooldownMs = parsedRetry ?? resetDerived ?? DEFAULT_COOLDOWN_MS;
+  const cooldownMs = parsedRetry ?? resetDerived ?? (quota400 ? QUOTA_400_FALLBACK_COOLDOWN_MS : DEFAULT_COOLDOWN_MS);
   const cooldownSource = parsedRetry !== undefined ? "retry-after" : resetDerived !== undefined ? "reset-derived" : "default";
   // A 429 whose unified status says the account is still allowed is not a limit: upstream refused this
   // request's shape (e.g. a replay without the Claude Code identity). Cooling on it benched every client
@@ -783,14 +799,14 @@ export function rotateAnthropicAccountOn429(
   // account repeats alternates accounts up to ANTHROPIC_POOL_MAX_FAILOVERS_PER_REQUEST times before the
   // 429 returns (refused calls bill no tokens); pass the tried accounts in if that shows up in the logs.
   const status = header("status");
-  const limited = status === undefined || [status, header("5h-status"), header("7d-status")].includes("rejected");
+  const limited = quota400 || status === undefined || [status, header("5h-status"), header("7d-status")].includes("rejected");
   const failover = isAnthropicAccountPoolEnabled(config) || hasAnthropicFailoverQuorum(now);
   // Which limit refused is only in these headers: log every unified one on every 429 (no credential is among them).
   const unified: string[] = [];
   (rateLimitHeaders as Headers | null | undefined)?.forEach?.((value, name) => {
     if (name.startsWith("anthropic-ratelimit-unified-")) unified.push(`${name.slice(28)}=${value}`);
   });
-  console.warn(`[anthropic-pool] 429 on ${formatAnthropicAccountOrdinal(failedAccountId)} model=${modelId ?? "-"}`
+  console.warn(`[anthropic-pool] ${what} on ${formatAnthropicAccountOrdinal(failedAccountId)} model=${modelId ?? "-"}`
     + ` retry-after=${retryAfterHeader?.trim() || "-"} ${unified.join(" ") || "unified=-"}`
     + (failover && limited
       ? ` cooldown=${Math.ceil(cooldownMs / 1000)}s until ${new Date(now + cooldownMs).toISOString()} (${cooldownSource}) scope=${family ?? "account"}`
@@ -823,7 +839,7 @@ export function rotateAnthropicAccountOn429(
   if (!next) {
     // Not only cooldowns: an account that needs re-auth or holds no usable credential is not eligible either.
     const others = getAccountSet(PROVIDER)?.accounts.filter(a => a.id !== failedAccountId) ?? [];
-    console.warn("[anthropic-pool] no other eligible Anthropic OAuth account; returning 429"
+    console.warn(`[anthropic-pool] no other eligible Anthropic OAuth account; returning ${quota400 ? "400" : "429"}`
       + ` (others=${others.length} cooled=${others.filter(a => isCooled(a.id, now, requestFamily)).length}`
       + ` reauth=${others.filter(a => a.needsReauth === true).length}`
       + ` unusable=${others.filter(a => !isPoolCredentialUsable(a.id, now)).length})`);
@@ -831,7 +847,7 @@ export function rotateAnthropicAccountOn429(
   }
 
   console.warn(
-    `[anthropic-pool] 429 on ${formatAnthropicAccountOrdinal(failedAccountId)}; failing over to ${formatAnthropicAccountOrdinal(next)}`,
+    `[anthropic-pool] ${what} on ${formatAnthropicAccountOrdinal(failedAccountId)}; failing over to ${formatAnthropicAccountOrdinal(next)}`,
   );
   return next;
 }

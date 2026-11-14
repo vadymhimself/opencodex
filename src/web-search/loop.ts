@@ -22,6 +22,7 @@ import { isTranslatorBudgetExceededError } from "../lib/translator-budget";
 import { formatWebSearchResults } from "./format-result";
 import { parseStreamWithProgress, RoutedModelInactivityError, WebSearchStreamProtocolError } from "./progress-stream";
 import { WEB_SEARCH_TOOL_NAME } from "./synthetic-tool";
+import { peekAnthropicPoolRotation, type AnthropicPoolRotationTrigger } from "../oauth/anthropic-pool-rotation";
 
 const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
@@ -360,6 +361,8 @@ export interface WebSearchLoopDeps {
     retryAfterHeader: string | null,
     responseHeaders?: Headers,
     retryParsed?: OcxParsedRequest,
+    /** "quota-400": Anthropic's out-of-extra-usage 400, which only an Anthropic pool rotation answers. */
+    trigger?: AnthropicPoolRotationTrigger,
   ) => RotatedTarget | null | Promise<RotatedTarget | null>;
   /** Optional fail-closed credential recovery. The callback must inspect a clone and return null for unrecognized responses. */
   onCredentialError?: (response: Response, signal: AbortSignal) =>
@@ -619,8 +622,13 @@ export async function runWithWebSearch(deps: WebSearchLoopDeps): Promise<Respons
       }
       // 429 key-failover parity with the normal routed path: rotate pool keys until one responds
       // or the pool is exhausted (deps.on429 returns null — cooldown map guarantees termination).
-      while (prepared.response.status === 429 && deps.on429) {
-        const rotated = await deps.on429(prepared.response.headers.get("retry-after"), prepared.response.headers, iterParsed);
+      // An Anthropic out-of-extra-usage 400 also reaches the hook; only a 400 body is peeked, and
+      // the peeked response replays it, so a 400 that does not rotate surfaces unchanged.
+      while (deps.on429) {
+        const gate = await peekAnthropicPoolRotation(prepared.response, signal);
+        prepared.response = gate.response;
+        if (!gate.trigger) break;
+        const rotated = await deps.on429(prepared.response.headers.get("retry-after"), prepared.response.headers, iterParsed, gate.trigger);
         if (!rotated) break;
         // Never let a broken body's cancel promise outlive the cumulative header deadline. Observe
         // it, but proceed immediately to the rotated fetch under the SAME deadline signal.

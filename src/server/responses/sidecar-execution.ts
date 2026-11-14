@@ -31,6 +31,7 @@ import {
   getAnthropicPoolAccessSnapshot,
   formatAnthropicProviderForLog,
 } from "../../oauth/anthropic-routing";
+import type { AnthropicPoolRotationTrigger } from "../../oauth/anthropic-pool-rotation";
 import { resolveWireProtocolOverride } from "../adapter-resolve";
 import { bindRouteReasoningReplayScope, adapterNeedsForcedContinuation } from "./core-replay";
 import { rotateAnthropicProviderOnCredentialDenial } from "./anthropic-source-replay";
@@ -168,11 +169,15 @@ export async function executeResponsesSidecars(
     retryAfter: string | null,
     responseHeaders?: Headers,
     retryParsed?: OcxParsedRequest,
+    trigger: AnthropicPoolRotationTrigger = "429",
   ): Promise<{ adapter: ProviderAdapter; recoveryKind: AttemptRecoveryKind } | null> => {
     // Which pool answered decides how the attempt row reads: an account rotation is not a key
     // rotation, and logging one as the other hides which credential a 429 actually moved off.
     let recoveryKind: AttemptRecoveryKind = "oauth-account-429";
-    const rotated = rotateProviderTransportOn429(config, route.providerName, route.provider, {
+    // An out-of-extra-usage 400 moves only the Anthropic pool; key pools and the generic OAuth
+    // roster keep rotating on 429 alone.
+    const quota400 = trigger === "quota-400";
+    const rotated = quota400 ? null : rotateProviderTransportOn429(config, route.providerName, route.provider, {
       retryAfter,
       now: Date.now(),
       attemptedKey: route.provider.apiKey,
@@ -186,7 +191,8 @@ export async function executeResponsesSidecars(
       // unreachable: Anthropic never has a genericFailoverAccountId (isGenericFailoverProvider
       // excludes it), so its sidecar 429s died on this guard before the Anthropic arm below
       // could ever be considered.
-      transportState.genericFailoverAccountId
+      !quota400
+      && transportState.genericFailoverAccountId
       && transportState.genericFailovers < GENERIC_OAUTH_MAX_FAILOVERS_PER_REQUEST
       && isGenericOAuthFailoverEnabled(config, route.providerName)
     ) {
@@ -244,6 +250,7 @@ export async function executeResponsesSidecars(
         Date.now(),
         responseHeaders,
         route.modelId,
+        trigger,
       );
       if (!nextAccountId) {
         hop.permit?.release();
