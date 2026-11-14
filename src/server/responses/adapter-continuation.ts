@@ -39,6 +39,7 @@ import {
   getAnthropicPoolAccessSnapshot,
   formatAnthropicProviderForLog,
 } from "../../oauth/anthropic-routing";
+import { peekAnthropicPoolRotation, type AnthropicPoolRotationTrigger } from "../../oauth/anthropic-pool-rotation";
 import {
   GENERIC_OAUTH_MAX_FAILOVERS_PER_REQUEST,
   hasEligibleGenericOAuthFailoverTarget,
@@ -384,12 +385,23 @@ export function createAdapterContinuations(
           continue;
         }
       }
+      // Anthropic pool: rotate on a 429 and on the out-of-extra-usage 400 (anthropic-pool-rotation.ts).
+      let poolRotationTrigger: AnthropicPoolRotationTrigger | null = null;
      if (
-       response.status === 429
-       && transportState.anthropicPoolAccountId
+       transportState.anthropicPoolAccountId
         && !isNonReplayableResponse(response)
        && transportState.anthropicPoolFailovers < ANTHROPIC_POOL_MAX_FAILOVERS_PER_REQUEST
       ) {
+        try {
+          const peeked = await peekAnthropicPoolRotation(response, upstream.signal);
+          response = peeked.response;
+          poolRotationTrigger = peeked.trigger;
+        } catch {
+          yield { type: "error", message: "client closed request during terminal continuation", status: 499 };
+          return;
+        }
+      }
+     if (poolRotationTrigger && transportState.anthropicPoolAccountId) {
         const nextAccountId = rotateAnthropicAccountOn429(
           config,
           transportState.anthropicPoolAccountId,
@@ -398,6 +410,7 @@ export function createAdapterContinuations(
           Date.now(),
           response.headers,
           route.modelId,
+          poolRotationTrigger,
         );
         if (nextAccountId) {
           try { void response.body?.cancel().catch(() => {}); } catch { /* already closed */ }

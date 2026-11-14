@@ -91,7 +91,7 @@ function replayOnlyResponse(response: Response, chunks: readonly Uint8Array[]): 
 export async function readQuotaResetAt(
   response: Response,
   nowOrOptions: number | QuotaResetReadOptions = {},
-): Promise<{ at: number | undefined; response: Response }> {
+): Promise<{ at: number | undefined; response: Response; text?: string }> {
   if (!response.body) return { at: undefined, response };
   const options = typeof nowOrOptions === "number" ? { now: nowOrOptions } : nowOrOptions;
   const now = options.now ?? Date.now();
@@ -175,7 +175,9 @@ export async function readQuotaResetAt(
       },
     });
     transferred = true;
-    return { at: parseQuotaResetAt(text, now), response: rebuiltResponse(response, rest) };
+    // `text` is the decoded bounded prefix, for callers that classify the body (pool rotation
+    // on an Anthropic out-of-extra-usage 400) without reading it twice.
+    return { at: parseQuotaResetAt(text, now), response: rebuiltResponse(response, rest), text };
   } catch (error) {
     const clientAborted = options.signal?.aborted === true;
     void reader.cancel(error).catch(() => {}).finally(() => {

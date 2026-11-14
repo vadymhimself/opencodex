@@ -39,6 +39,7 @@ import { submitVideoJob } from "./xai-video-client";
 import { downloadVideoToArtifact, createImageBudget, pruneArtifacts } from "./artifacts";
 import { IMAGE_GEN_TOOL_NAME, VIDEO_GEN_TOOL_NAME } from "./synthetic-tool";
 import type { ImageBridgePlan, VideoBridgePlan } from "./types";
+import { peekAnthropicPoolRotation, type AnthropicPoolRotationTrigger } from "../oauth/anthropic-pool-rotation";
 
 const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
@@ -348,6 +349,8 @@ export interface ImageBridgeDeps {
     retryAfterHeader: string | null,
     responseHeaders?: Headers,
     retryParsed?: OcxParsedRequest,
+    /** "quota-400": Anthropic's out-of-extra-usage 400, which only an Anthropic pool rotation answers. */
+    trigger?: AnthropicPoolRotationTrigger,
   ) => RotatedTarget | null | Promise<RotatedTarget | null>;
   /** Optional fail-closed credential recovery. The callback must inspect a clone and return null for unrecognized responses. */
   onCredentialError?: (response: Response, signal: AbortSignal) =>
@@ -707,8 +710,13 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
         prepared = await fetchOnce(adapter, "rate-limit-429");
       }
       // 429 key-failover parity with web-search / normal routed path.
-      while (prepared.response.status === 429 && deps.on429) {
-        const rotated = await deps.on429(prepared.response.headers.get("retry-after"), prepared.response.headers, iterParsed);
+      // An Anthropic out-of-extra-usage 400 also reaches the hook; only a 400 body is peeked, and
+      // the peeked response replays it, so a 400 that does not rotate surfaces unchanged.
+      while (deps.on429) {
+        const gate = await peekAnthropicPoolRotation(prepared.response, signal);
+        prepared.response = gate.response;
+        if (!gate.trigger) break;
+        const rotated = await deps.on429(prepared.response.headers.get("retry-after"), prepared.response.headers, iterParsed, gate.trigger);
         if (!rotated) break;
         try { void prepared.response.body?.cancel().catch(() => {}); } catch { /* already closed */ }
         adapter = rotatedAdapterOf(rotated);
