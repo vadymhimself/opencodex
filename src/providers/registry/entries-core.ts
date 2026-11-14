@@ -417,6 +417,27 @@ export const PROVIDER_REGISTRY_CORE: readonly ProviderRegistryEntry[] = [
     noVisionModels: ["grok-build-0.1", "grok-composer-2.5-fast"],
   },
   {
+    // AgentRadar hosted gateways store an xAI API key under this id (paperclip
+    // services/ocx-provisioner/key-providers.generated.json; login.mjs keeps the Grok
+    // key row by it), so the pinned registry must carry it as a key provider.
+    // Same public API as the "xai" row's key-auth override; Grok OAuth stays on "xai".
+    id: "xai-apikey",
+    label: "xAI Grok (API key)",
+    adapter: "openai-chat",
+    baseUrl: "https://api.x.ai/v1",
+    authKind: "key",
+    dashboardUrl: "https://console.x.ai",
+    jawcodeBundle: "xai",
+    note: "Direct xAI API billing — no Grok subscription",
+    supportsServiceTier: true,
+    chatServiceTier: true,
+    supportsOpenAiWebSearchToolFields: false,
+    supportsResponsesCustomTools: false,
+    parallelToolCalls: true,
+    liveModels: true,
+    models: [...XAI_MODELS],
+  },
+  {
     id: "command-code",
     label: "Command Code - Auth",
     adapter: "command-code",
